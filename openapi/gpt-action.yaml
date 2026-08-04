@@ -1,0 +1,163 @@
+openapi: 3.1.0
+info:
+  title: Growth Tech Morning Brief API
+  description: Read the latest saved Growth Tech morning brief or explicitly refresh its market snapshot.
+  version: 0.3.2
+servers:
+  - url: https://growth-tech-morning-brief.ck-market-tools.workers.dev
+paths:
+  /health:
+    get:
+      operationId: checkBriefServiceHealth
+      summary: Check whether the brief service is online
+      description: Use only for troubleshooting service availability.
+      security: []
+      responses:
+        "200":
+          description: Service is online.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /latest:
+    get:
+      operationId: getLatestBrief
+      summary: Get the latest saved Growth Tech morning brief
+      description: Default action for answering questions about the current brief. Returns compact structured data and ready-to-render Markdown without recomputing the snapshot.
+      responses:
+        "200":
+          description: Latest saved brief.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Brief"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No brief has been generated yet.
+        "503":
+          description: Brief storage is not configured.
+  /run:
+    post:
+      operationId: refreshMorningBrief
+      summary: Refresh and save the Growth Tech morning brief
+      description: Call only when the user explicitly asks to refresh, regenerate, or run today's brief. This performs upstream data collection and may take longer than reading the latest saved brief.
+      responses:
+        "200":
+          description: Newly generated and saved brief.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Brief"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "502":
+          description: Upstream market or filing data prevented snapshot generation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    HealthResponse:
+      type: object
+      required: [ok, service]
+      properties:
+        ok:
+          type: boolean
+        service:
+          type: string
+    Coverage:
+      type: object
+      required: [requested, succeeded, failed]
+      properties:
+        requested:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+    ExecutiveSummary:
+      type: object
+      required: [strongest, weakest, highestValuationPercentile, dataQuality]
+      properties:
+        strongest:
+          type: array
+          items: { type: string }
+        weakest:
+          type: array
+          items: { type: string }
+        highestValuationPercentile:
+          type: array
+          items: { type: string }
+        dataQuality:
+          type: string
+    Valuation:
+      type: object
+      nullable: true
+      properties:
+        trailingPE: { type: [number, "null"] }
+        trailingPS: { type: [number, "null"] }
+        trailingPEPercentile5Y: { type: [number, "null"] }
+        trailingPSPercentile5Y: { type: [number, "null"] }
+        selectedMetric:
+          type: string
+          enum: [trailingPE, trailingPS]
+        selectedPercentile: { type: [number, "null"] }
+        fundamentalAsOf: { type: [string, "null"] }
+    WatchlistRow:
+      type: object
+      required: [symbol, missing]
+      properties:
+        symbol: { type: string }
+        name: { type: [string, "null"] }
+        price: { type: [number, "null"] }
+        changePercent: { type: [number, "null"] }
+        yearLow: { type: [number, "null"] }
+        yearHigh: { type: [number, "null"] }
+        positionIn52WeekRange: { type: [number, "null"] }
+        valuation:
+          $ref: "#/components/schemas/Valuation"
+        missing: { type: boolean }
+        error: { type: string }
+    Brief:
+      type: object
+      required: [schemaVersion, generatedAt, session, coverage, executiveSummary, watchlist, markdown]
+      properties:
+        schemaVersion:
+          type: integer
+          enum: [3]
+        generatedAt:
+          type: string
+          format: date-time
+        session:
+          type: string
+        coverage:
+          $ref: "#/components/schemas/Coverage"
+        executiveSummary:
+          $ref: "#/components/schemas/ExecutiveSummary"
+        watchlist:
+          type: array
+          items:
+            $ref: "#/components/schemas/WatchlistRow"
+        markdown:
+          type: string
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        message: { type: string }
+security:
+  - bearerAuth: []

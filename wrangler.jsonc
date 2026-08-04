@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "growth-tech-morning-brief",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-03",
+  "triggers": {
+    "crons": ["35 13 * * 1-5", "35 14 * * 1-5"]
+  },
+  "vars": {
+    "WATCHLIST": "NVDA,AMZN,MSFT,ANET,CRWV,AVGO,META,GOOGL,ORCL,TSM,VRT,CEG,FTNT",
+    "RUN_TOKEN_REQUIRED": "true"
+  },
+  "r2_buckets": [{ "binding": "BRIEF_BUCKET", "bucket_name": "growth-tech-brief-data" }]
+}

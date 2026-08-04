@@ -1,0 +1,14 @@
+{
+  "name": "growth-tech-morning-brief",
+  "version": "0.3.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "wrangler": "^4.27.0"
+  }
+}
