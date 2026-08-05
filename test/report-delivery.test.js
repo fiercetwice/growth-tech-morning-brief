@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { compactSnapshotForReport, runScheduledBrief, sendReportEmail, sendReportWebhook } from "../src/index.js";
+import worker, { compactSnapshotForReport, runScheduledBrief, sendReportEmail, sendReportWebhook } from "../src/index.js";
 
 function r2(initial = {}) {
   const objects = new Map(Object.entries(initial));
@@ -124,7 +124,7 @@ test("delivery failures are isolated after the R2 report is stored", async () =>
   assert.match(result.report.webhook.error, /Webhook delivery failed \(502\)/);
 });
 
-test("existing dated report prevents duplicate report generation and delivery", async () => {
+test("existing dated report prevents duplicate report generation but still evaluates delivery", async () => {
   const bucket = r2({ "reports/2026-08-05.md": "already sent" });
   const env = { WATCHLIST: "NVDA", GEMINI_API_KEY: "gemini-test-key", BRIEF_BUCKET: bucket };
 
@@ -134,7 +134,14 @@ test("existing dated report prevents duplicate report generation and delivery", 
     throw new Error(`Report generation should have been skipped, got ${url}`);
   }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
 
-  assert.deepEqual(result.report, { skipped: true, reason: "report_already_exists", date: "2026-08-05" });
+  assert.deepEqual(result.report, {
+    date: "2026-08-05",
+    generated: false,
+    stored: true,
+    email: null,
+    webhook: { skipped: true, reason: "webhook_not_configured" },
+    reused: true,
+  });
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), "already sent");
 });
 
@@ -182,6 +189,148 @@ test("Discord webhook delivery also supports Discord URLs in WEBHOOK_URL", async
   }, () => sendReportWebhook(env, "2026-08-05", "Discord fallback"));
 
   assert.deepEqual(result, { sent: true, provider: "discord", messages: 1 });
+});
+
+test("deliver-latest requires authorization", async () => {
+  const response = await worker.fetch(new Request("https://example.test/deliver-latest", { method: "POST" }), {
+    RUN_TOKEN_REQUIRED: "true",
+    RUN_TOKEN: "secret",
+    BRIEF_BUCKET: r2({ "reports/latest.md": "stored markdown" }),
+  });
+
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: "unauthorized" });
+});
+
+test("deliver-latest returns no_report_yet when latest report is missing", async () => {
+  const response = await worker.fetch(new Request("https://example.test/deliver-latest", {
+    method: "POST",
+    headers: { authorization: "Bearer secret" },
+  }), {
+    RUN_TOKEN_REQUIRED: "true",
+    RUN_TOKEN: "secret",
+    BRIEF_BUCKET: r2(),
+  });
+
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), { error: "no_report_yet" });
+});
+
+test("deliver-latest sends the latest stored report to Discord", async () => {
+  const env = {
+    RUN_TOKEN_REQUIRED: "true",
+    RUN_TOKEN: "secret",
+    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token",
+    BRIEF_BUCKET: r2({ "reports/latest.md": "# Stored report" }),
+  };
+
+  const response = await withFetchStub((url, init) => {
+    assert.equal(url, env.DISCORD_WEBHOOK_URL);
+    const body = JSON.parse(init.body);
+    assert.match(body.content, /\*\*Growth Tech Morning Brief — 2026-08-05\*\*/);
+    assert.match(body.content, /# Stored report/);
+    return new Response(null, { status: 204 });
+  }, () => worker.fetch(new Request("https://example.test/deliver-latest", {
+    method: "POST",
+    headers: { authorization: "Bearer secret" },
+  }), env));
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.date, "2026-08-05");
+  assert.deepEqual(body.webhook, { sent: true, provider: "discord", messages: 1 });
+  assert.match(env.BRIEF_BUCKET.objects.get("deliveries/2026-08-05.json"), /"sent": true/);
+});
+
+test("existing report with no delivery receipt retries Discord on scheduled run", async () => {
+  const bucket = r2({ "reports/2026-08-05.md": "stored report" });
+  const env = { WATCHLIST: "NVDA", DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token", BRIEF_BUCKET: bucket };
+
+  const result = await withFetchStub((url, init) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    assert.equal(url, env.DISCORD_WEBHOOK_URL);
+    assert.match(JSON.parse(init.body).content, /stored report/);
+    return new Response(null, { status: 204 });
+  }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
+
+  assert.equal(result.report.reused, true);
+  assert.deepEqual(result.report.webhook, { sent: true, provider: "discord", messages: 1 });
+});
+
+test("existing successful receipt prevents duplicate scheduled Discord delivery", async () => {
+  const bucket = r2({
+    "reports/2026-08-05.md": "stored report",
+    "deliveries/2026-08-05.json": JSON.stringify({ discord: { sent: true, messages: 1, timestamp: "2026-08-05T13:40:00.000Z" } }),
+  });
+  const env = { WATCHLIST: "NVDA", DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token", BRIEF_BUCKET: bucket };
+
+  const result = await withFetchStub((url) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    throw new Error(`Unexpected delivery fetch ${url}`);
+  }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
+
+  assert.deepEqual(result.report.webhook, {
+    skipped: true,
+    reason: "discord_already_delivered",
+    receipt: { sent: true, messages: 1, timestamp: "2026-08-05T13:40:00.000Z" },
+  });
+});
+
+test("run-report forceDelivery retries delivery without another Gemini API call", async () => {
+  const bucket = r2({ "reports/2026-08-05.md": "stored report" });
+  const env = {
+    RUN_TOKEN_REQUIRED: "true",
+    RUN_TOKEN: "secret",
+    WATCHLIST: "NVDA",
+    GEMINI_API_KEY: "gemini-test-key",
+    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token",
+    BRIEF_BUCKET: bucket,
+  };
+
+  const response = await withFetchStub((url, init) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    if (url.startsWith("https://generativelanguage.googleapis.com")) throw new Error("Gemini should not be called");
+    assert.equal(url, env.DISCORD_WEBHOOK_URL);
+    assert.match(JSON.parse(init.body).content, /stored report/);
+    return new Response(null, { status: 204 });
+  }, () => worker.fetch(new Request("https://example.test/run-report", {
+    method: "POST",
+    headers: { authorization: "Bearer secret", "content-type": "application/json" },
+    body: JSON.stringify({ forceDelivery: true }),
+  }), env));
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.report.generated, false);
+  assert.equal(body.report.reused, true);
+  assert.deepEqual(body.report.webhook, { sent: true, provider: "discord", messages: 1 });
+  assert.equal(bucket.objects.get("reports/2026-08-05.md"), "stored report");
+});
+
+test("Discord errors return useful diagnostics without exposing the webhook URL", async () => {
+  const env = {
+    RUN_TOKEN_REQUIRED: "true",
+    RUN_TOKEN: "secret",
+    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/secret-token",
+    BRIEF_BUCKET: r2({ "reports/latest.md": "stored report" }),
+  };
+
+  const response = await withFetchStub((url) => {
+    assert.equal(url, env.DISCORD_WEBHOOK_URL);
+    return new Response("invalid webhook", { status: 404 });
+  }, () => worker.fetch(new Request("https://example.test/deliver-latest", {
+    method: "POST",
+    headers: { authorization: "Bearer secret" },
+  }), env));
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.webhook.failed, true);
+  assert.match(body.webhook.error, /Discord webhook delivery failed \(1\/1\) \(404\): invalid webhook/);
+  assert.doesNotMatch(JSON.stringify(body), /secret-token/);
 });
 
 
