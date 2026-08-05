@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.5.2 — deterministic research decisions
+# Growth Tech Morning Brief v0.5.3 — trade opportunity and news intelligence
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -7,12 +7,14 @@ Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/N
 - Yahoo Finance's unofficial chart endpoint: current price, daily move, 52-week position and five years of split-adjusted daily history.
 - Yahoo Finance's unofficial chart endpoint: S&P 500, Nasdaq 100, Dow and Russell 2000 futures; U.S. 10-year yield; U.S. Dollar Index; WTI and Brent crude, including daily moves and quote timestamps.
 - Nasdaq public calendar endpoints: today's economic releases and earnings schedule, including available event times, actual/consensus/previous values, EPS forecasts and covered-watchlist matches.
+- Federal Reserve official monetary-policy RSS: fresh rate decisions, FOMC statements, projections, and Chair commentary published during the prior seven days.
+- Yahoo Finance's unofficial search-news endpoint: fresh company headlines for covered symbols, including publisher, URL, publication time, and symbol association.
 - SEC EDGAR CompanyFacts: reported revenue, diluted EPS and diluted shares.
 - Local calculation: reported TTM and latest-quarter revenue/EPS growth, point-in-time trailing P/E and P/S history, and five-year valuation percentiles. A historical date uses only SEC filings published by that date, avoiding look-ahead bias.
-- Deterministic research framework: sector fundamentals, valuation, momentum, actions, watchlist actions, catalysts, and quantified risks are computed before AI generation. The model explains these decisions but cannot override them.
+- Absolute opportunity gate: only verified fresh events, same-day earnings, moves of at least 3%, or extreme valuation/range trim setups reach AI review. The model may return at most three names and defaults to no trade.
 - R2 caches SEC responses for seven days, keeps full dated calculation snapshots, stores compact dated briefs, and saves Gemini-generated Markdown reports.
 
-Yahoo and Nasdaq calendar endpoints are unofficial public web endpoints and can change or rate-limit access. Every context category therefore carries `available`, `stale`, or `unavailable` status, its source, and an as-of timestamp. A failure is isolated to that category and never blocks the equity snapshot. Macro events are filtered to U.S. releases and globally relevant central-bank/growth/inflation events. SEC data is authoritative but issuers use differing XBRL tags; unavailable fields remain null rather than being invented. Analyst-consensus forward valuation and estimate revisions are not included and remain explicitly unavailable.
+Yahoo and Nasdaq endpoints are unofficial public web endpoints and can change or rate-limit access. Every context category carries source and freshness metadata, and a category failure never blocks the equity snapshot. The Federal Reserve feed is official, but its inclusion does not by itself imply that a policy item caused a stock move. SEC data is authoritative but issuers use differing XBRL tags; unavailable fields remain null rather than being invented. Analyst-consensus forward valuation and estimate revisions are not included and remain explicitly unavailable.
 
 ## One-time R2 setup and deployment
 
@@ -102,7 +104,9 @@ On the valid 09:35 AM ET scheduled run, the Worker writes the stock snapshot, re
 
 Gemini defaults to `gemini-3.5-flash` with low thinking. DeepSeek uses its official OpenAI-compatible Chat Completions endpoint, defaults to `deepseek-v4-flash`, and disables thinking for concise report generation. Neither route sets an application-level output-token ceiling. Generic OpenAI-compatible endpoints are available only through a preconfigured HTTPS base URL and secret.
 
-Every provider must return a normally completed response. The Worker validates an exact institutional report schema before storage: five labeled Executive Summary bullets; sourced facts separated from analysis; labeled Futures, Rates, USD, Oil, Macro Events and Earnings fields; all five AI Cycle rows; all eight Sector Scorecard rows with Fundamentals, Valuation, Momentum, and Action; and one complete Watchlist row per retrieved symbol with price, daily move, 52-week position, forward-valuation availability, historical valuation percentile, catalyst, risk, and action. It also rejects model output that contradicts deterministic ratings/actions or makes unsupported demand, CapEx-cycle, or institutional-flow claims. A report is rejected if it marks a supplied context category unavailable. Missing metrics must be marked unavailable instead of invented. Session labels distinguish premarket, regular trading, after-hours, and closed markets. An existing dated report prevents duplicate generation, but delivery is retried until `deliveries/YYYY-MM-DD.json` records a successful Discord receipt.
+Every provider must return a normally completed response. The Worker validates a short four-section schema: Today's Verdict, at most three Opportunities, Market and AI-Cycle Context, and What Could Change the Call. Each opportunity must state strategic position, today's action, confidence, entry/exit condition, verified catalyst, downside, and invalidation. Buy/Sell calls require a verified fresh event or same-day earnings; a large price move without verified news is Watch-only. Trim calls require verified evidence or an extreme valuation/range setup. The validator also rejects unsupported demand, CapEx-cycle, or institutional-flow claims.
+
+The default report deliberately omits the sector scorecard, AI dashboard, and full watchlist. Those calculations remain in the stored snapshot for diagnostics; the delivered report includes only facts that can change today's trade decision.
 
 AI-cycle demand and CapEx rows intentionally remain `Insufficient Data / Unclear` until the snapshot contains direct indicators such as hyperscaler CapEx guidance, backlog, utilization, or analyst estimate revisions. Daily stock returns are momentum inputs, not evidence of end demand.
 
@@ -152,6 +156,7 @@ R2 object layout:
 - `SEC_USER_AGENT`: optional descriptive SEC user agent with a contact email.
 - `YAHOO_USER_AGENT`: optional user agent for Yahoo quote and market-context requests.
 - `NASDAQ_USER_AGENT`: optional browser-compatible user agent for Nasdaq calendar requests.
+- `NEWS_USER_AGENT`: optional user agent for Federal Reserve news requests.
 - `AI_PROVIDER`: `gemini`, `deepseek`, or `openai-compatible`; defaults to `gemini`.
 - `AI_MODEL`: optional scheduled-route model override.
 - `GEMINI_API_KEY`, `GEMINI_MODEL`: Gemini credentials and optional model override.

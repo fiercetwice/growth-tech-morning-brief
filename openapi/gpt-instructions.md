@@ -5,8 +5,10 @@ Use `getLatestBrief` as the default data action for the Growth Tech Morning Brie
 When a brief is returned:
 
 - Treat `generatedAt` as the data timestamp and state it when freshness matters.
-- Use `executiveSummary` for the opening summary and `watchlist` for stock-level analysis.
+- Use `opportunityGate.candidates` to explain why a name reached AI review. Do not treat a candidate as a recommendation; the generated report contains the final verdict.
 - Render `markdown` when the user asks to see the full brief.
+- Keep the default answer decision-focused: today's verdict, no more than three opportunities, material market/AI-cycle context, and what could change the call.
+- If no setup clears the absolute threshold, state `No high-conviction trade today` instead of selecting the highest-ranked stock.
 - Never describe missing or null values as zero.
 - Clearly label the valuation metric as trailing P/E or trailing P/S according to `selectedMetric`.
 - Historical valuation percentile is point-in-time and based on SEC filings available on each observation date.
@@ -18,7 +20,7 @@ When a brief is returned:
 Recommended smoke-test prompts:
 
 1. Show me the latest Growth Tech Morning Brief.
-2. Which three stocks were strongest in the latest snapshot?
-3. Compare NVDA and ANET valuation percentiles.
+2. Is there a high-conviction buy, sell, or trim opportunity today?
+3. Why did each candidate clear the absolute setup gate?
 4. What time was this data generated, and is coverage complete?
 5. Refresh today's brief now.

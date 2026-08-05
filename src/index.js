@@ -1,5 +1,7 @@
 const YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart";
 const NASDAQ_API_BASE = "https://api.nasdaq.com/api/calendar";
+const FED_MONETARY_RSS = "https://www.federalreserve.gov/feeds/press_monetary.xml";
+const YAHOO_SEARCH = "https://query2.finance.yahoo.com/v1/finance/search";
 const SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts";
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
@@ -9,15 +11,14 @@ const DEFAULT_AI_PROVIDER = "gemini";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
-  "Executive Summary",
-  "Overnight and Market Context",
-  "AI Cycle Dashboard",
-  "Sector Scorecard",
-  "Watchlist",
+  "Today's Verdict",
+  "Opportunities",
+  "Market and AI-Cycle Context",
+  "What Could Change the Call",
 ];
-const REQUIRED_EXECUTIVE_LABELS = ["AI Cycle", "Catalyst", "Risk", "Best Opportunity", "Avoid"];
-const REQUIRED_AI_CYCLE_ROWS = ["Hyperscaler AI CapEx", "GPU Demand", "AI Cloud", "Enterprise AI", "Inference"];
-const REQUIRED_SECTOR_ROWS = ["GPU", "AI Cloud", "GPU Cloud", "Networking", "Cooling", "Power", "Cybersecurity", "Cloud Software"];
+const REQUIRED_VERDICT_LABELS = ["Verdict", "Confidence", "Why Today"];
+const REQUIRED_CONTEXT_LABELS = ["AI Cycle", "Market Regime", "Material News"];
+const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Trim", "Sell", "Watch", "No action"];
 const ALLOWED_AI_PROVIDERS = new Set(["gemini", "deepseek", "openai-compatible"]);
 const MARKET_CONTEXT_GROUPS = {
   futures: [
@@ -33,7 +34,6 @@ const MARKET_CONTEXT_GROUPS = {
     { symbol: "BZ=F", label: "Brent crude" },
   ],
 };
-const REQUIRED_CONTEXT_LABELS = ["Futures", "Rates", "USD", "Oil", "Macro Events", "Earnings"];
 const SECTOR_MEMBERS = {
   GPU: ["NVDA", "TSM", "AVGO"],
   "AI Cloud": ["AMZN", "MSFT", "GOOGL", "ORCL"],
@@ -187,7 +187,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
   }
 
   const symbols = parseSymbols(env.WATCHLIST);
-  const [results, marketContext, calendars] = await Promise.all([
+  const [results, marketContext, calendars, news] = await Promise.all([
     Promise.allSettled(symbols.map(async (symbol) => {
     const chart = await fetchYahooChart(symbol, now, env);
     const fundamentals = await fetchSecFundamentals(symbol, env, now).catch((error) => ({
@@ -197,6 +197,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
     })),
     buildMarketContext(env, now),
     buildCalendarContext(env, now, symbols),
+    buildNewsContext(env, now, symbols),
   ]);
 
   const watchlist = results.map((result, index) => result.status === "fulfilled"
@@ -206,7 +207,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
   if (!succeeded) throw new Error("All Yahoo chart requests failed");
 
   const snapshot = {
-    schemaVersion: 3,
+    schemaVersion: 5,
     generatedAt: now.toISOString(),
     session: marketSession(now),
     sources: {
@@ -214,11 +215,14 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
       fundamentals: "SEC EDGAR CompanyFacts",
       marketContext: "Yahoo Finance chart endpoint (unofficial)",
       calendars: "Nasdaq public calendar endpoints (unofficial)",
+      monetaryPolicyNews: "Federal Reserve monetary policy RSS (official)",
+      companyNews: "Yahoo Finance search news (unofficial)",
       methodology: "Point-in-time TTM multiples use only filings available by each price date",
     },
     coverage: { requested: symbols.length, succeeded, failed: symbols.length - succeeded },
     marketContext,
     calendars,
+    news,
     watchlist,
   };
 
@@ -264,6 +268,102 @@ export async function buildCalendarContext(env, now = new Date(), symbols = []) 
       .catch((error) => unavailableCalendar("Nasdaq public earnings calendar (unofficial)", date, error)),
   ]);
   return { macroEvents: macro, earnings };
+}
+
+export async function buildNewsContext(env, now = new Date(), symbols = []) {
+  const [monetaryPolicy, companySettled] = await Promise.all([
+    fetchFedMonetaryPolicy(env).then((xml) => normalizeFedMonetaryNews(xml, now))
+      .catch((error) => unavailableNews("Federal Reserve monetary policy RSS (official)", error)),
+    Promise.allSettled(symbols.map(async (symbol) => {
+      const body = await fetchYahooNews(symbol, env);
+      return normalizeYahooNews(body, symbol, now);
+    })),
+  ]);
+  const companyItems = companySettled.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  const failures = companySettled.filter((result) => result.status === "rejected");
+  const deduped = companyItems.filter((item, index, all) => all.findIndex((candidate) => candidate.url === item.url) === index)
+    .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt)).slice(0, 30);
+  return {
+    monetaryPolicy,
+    company: {
+      status: deduped.length ? "available" : failures.length === symbols.length ? "unavailable" : "available",
+      source: "Yahoo Finance search news (unofficial)",
+      asOf: now.toISOString(),
+      items: deduped,
+      ...(failures.length ? { failed: failures.length, reason: failures.map((result) => errorMessage(result.reason)).join("; ") } : {}),
+    },
+  };
+}
+
+async function fetchFedMonetaryPolicy(env) {
+  const response = await fetch(FED_MONETARY_RSS, { headers: { "user-agent": env.NEWS_USER_AGENT || "growth-tech-morning-brief/0.5.3" } });
+  if (!response.ok) throw new Error(`Federal Reserve feed failed (${response.status})`);
+  return response.text();
+}
+
+async function fetchYahooNews(symbol, env) {
+  const url = new URL(YAHOO_SEARCH);
+  url.searchParams.set("q", symbol);
+  url.searchParams.set("quotesCount", "0");
+  url.searchParams.set("newsCount", "5");
+  const response = await fetch(url, { headers: yahooHeaders(env) });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || !body) throw new Error(`Yahoo news failed for ${symbol} (${response.status})`);
+  return body;
+}
+
+export function normalizeFedMonetaryNews(xml, now = new Date()) {
+  const cutoff = now.getTime() - 7 * 24 * 60 * 60 * 1000;
+  const items = [...String(xml).matchAll(/<item>([\s\S]*?)<\/item>/gi)].map((match) => {
+    const item = match[1];
+    const title = xmlValue(item, "title");
+    const url = xmlValue(item, "link");
+    const publishedAt = isoDate(xmlValue(item, "pubDate"));
+    return {
+      title,
+      url,
+      publishedAt,
+      source: "Federal Reserve",
+      kind: fedEventKind(title),
+      symbols: [],
+      verified: true,
+    };
+  }).filter((item) => item.title && item.url && item.publishedAt && Date.parse(item.publishedAt) >= cutoff);
+  return { status: "available", source: "Federal Reserve monetary policy RSS (official)", asOf: now.toISOString(), items };
+}
+
+export function normalizeYahooNews(body, symbol, now = new Date()) {
+  const cutoff = now.getTime() - 48 * 60 * 60 * 1000;
+  return (Array.isArray(body?.news) ? body.news : []).map((item) => ({
+    title: cleanText(item.title),
+    url: cleanText(item.link),
+    publishedAt: isoDate(item.providerPublishTime),
+    source: cleanText(item.publisher) || "Yahoo Finance",
+    kind: "company_news",
+    symbols: [symbol],
+    verified: Boolean(item.link && item.title),
+  })).filter((item) => item.title && item.url && item.publishedAt && Date.parse(item.publishedAt) >= cutoff);
+}
+
+function xmlValue(xml, tag) {
+  const match = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i").exec(xml);
+  return match ? cleanText(match[1].replace(/^<!\[CDATA\[|\]\]>$/g, "")) : null;
+}
+
+function isoDate(value) {
+  const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function fedEventKind(title = "") {
+  if (/federal funds|interest rate|monetary policy|FOMC statement/i.test(title)) return "rate_decision";
+  if (/projection|summary of economic projections|dot plot/i.test(title)) return "projections";
+  if (/press conference|Powell/i.test(title)) return "chair_commentary";
+  return "monetary_policy";
+}
+
+function unavailableNews(source, error) {
+  return { status: "unavailable", source, asOf: null, items: [], reason: errorMessage(error) };
 }
 
 function marketContextRow(instrument, chart, now) {
@@ -483,40 +583,40 @@ function median(values) {
 export function toBrief(snapshot) {
   const rows = snapshot.watchlist.map(compactRow);
   const earningsBySymbol = new Map((snapshot.calendars?.earnings?.events ?? []).map((event) => [event.symbol, event]));
+  const companyNews = snapshot.news?.company?.items ?? [];
   for (const row of rows) {
     if (row.missing) continue;
     row.catalyst = catalystFor(row, earningsBySymbol.get(row.symbol));
     row.risk = riskFor(row);
-    row.action = stockAction(row);
+    row.strategicAction = stockAction(row);
+    row.action = row.strategicAction;
+    row.news = companyNews.filter((item) => item.symbols?.includes(row.symbol)).slice(0, 3);
+    row.setup = todaySetup(row, earningsBySymbol.get(row.symbol));
   }
   const valid = rows.filter((row) => !row.missing);
-  const ranked = [...valid].filter((row) => Number.isFinite(row.changePercent)).sort((a, b) => b.changePercent - a.changePercent);
-  const expensive = [...valid].filter((row) => Number.isFinite(row.valuation?.selectedPercentile))
-    .sort((a, b) => b.valuation.selectedPercentile - a.valuation.selectedPercentile);
-  const buyCandidates = [...valid].filter((row) => row.action === "Buy")
-    .sort((a, b) => (b.reportedGrowth?.revenueTtmYoY ?? -Infinity) - (a.reportedGrowth?.revenueTtmYoY ?? -Infinity));
-  const avoidCandidates = [...valid].filter((row) => row.action === "Avoid")
-    .sort((a, b) => (a.reportedGrowth?.revenueTtmYoY ?? Infinity) - (b.reportedGrowth?.revenueTtmYoY ?? Infinity));
   const dataQuality = snapshotDataQuality(snapshot);
+  const candidates = valid.filter((row) => row.setup.eligible)
+    .sort((a, b) => b.setup.score - a.setup.score).slice(0, 8);
   const brief = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     generatedAt: snapshot.generatedAt,
     session: snapshot.session,
     coverage: snapshot.coverage,
     dataQuality,
     marketContext: snapshot.marketContext ?? unavailableMarketContext("not in snapshot"),
     calendars: snapshot.calendars ?? unavailableCalendars("not in snapshot"),
-    executiveSummary: {
-      strongest: ranked.slice(0, 3).map((row) => `${row.symbol} ${signed(row.changePercent)}%`),
-      weakest: ranked.slice(-3).reverse().map((row) => `${row.symbol} ${signed(row.changePercent)}%`),
-      highestValuationPercentile: expensive.slice(0, 3).map((row) => `${row.symbol} ${row.valuation.selectedPercentile} percentile`),
-      aiCycle: "Insufficient Data — direct demand, backlog, CapEx guidance, utilization, and estimate revisions are not in the snapshot",
-      catalyst: valid.filter((row) => !row.catalyst.startsWith("n/a")).map((row) => `${row.symbol}: ${row.catalyst}`).join("; ") || "None in snapshot",
-      bestOpportunity: buyCandidates[0]?.symbol ?? "None — no stock meets the deterministic Buy rule",
-      avoid: avoidCandidates[0]?.symbol ?? "None — no stock meets the deterministic Avoid rule",
-      dataQuality: `${snapshot.coverage.failed ? `${snapshot.coverage.failed} symbol(s) failed` : "All requested symbols available"}; market context ${dataQuality.available}/${dataQuality.total} current`,
+    news: snapshot.news ?? {
+      monetaryPolicy: unavailableNews("Federal Reserve monetary policy RSS (official)", "not in snapshot"),
+      company: unavailableNews("Yahoo Finance search news (unofficial)", "not in snapshot"),
     },
     decisionFramework: buildDecisionFramework(valid),
+    opportunityGate: {
+      rule: "No actionable trade merely because it ranks highest. Action requires a verified fresh event, same-day earnings, a >=3% dislocation, or an extreme valuation/range trim setup.",
+      maximumOpportunities: 3,
+      allowedTodayActions: TODAY_ACTIONS,
+      defaultVerdict: "No high-conviction trade today",
+      candidates,
+    },
     watchlist: rows,
   };
   brief.markdown = renderMarkdown(brief);
@@ -525,12 +625,6 @@ export function toBrief(snapshot) {
 
 export function compactSnapshotForReport(snapshot) {
   const brief = toBrief(snapshot);
-  const ranked = [...brief.watchlist].filter((row) => !row.missing && Number.isFinite(row.changePercent))
-    .sort((a, b) => b.changePercent - a.changePercent);
-  const volumeLeaders = [...snapshot.watchlist].filter((row) => !row.missing && Number.isFinite(row.history?.at(-1)?.volume))
-    .map((row) => ({ symbol: row.symbol, volume: row.history.at(-1).volume }))
-    .sort((a, b) => b.volume - a.volume)
-    .slice(0, 5);
   return {
     schemaVersion: brief.schemaVersion,
     generatedAt: brief.generatedAt,
@@ -539,12 +633,29 @@ export function compactSnapshotForReport(snapshot) {
     dataQuality: brief.dataQuality,
     marketContext: brief.marketContext,
     calendars: brief.calendars,
-    executiveSummary: brief.executiveSummary,
+    news: brief.news,
     decisionFramework: brief.decisionFramework,
-    majorGainers: ranked.slice(0, 5),
-    majorLosers: ranked.slice(-5).reverse(),
-    volumeLeaders,
-    watchlist: brief.watchlist,
+    opportunityGate: brief.opportunityGate,
+  };
+}
+
+function todaySetup(row, earnings) {
+  const verifiedNews = (row.news ?? []).filter((item) => item.verified);
+  const dislocation = Number.isFinite(row.changePercent) && Math.abs(row.changePercent) >= 3;
+  const extremeTrim = (row.valuation?.selectedPercentile ?? 0) >= 90 && (row.positionIn52WeekRange ?? 0) >= 90;
+  const earningsToday = Boolean(earnings);
+  const reasons = [];
+  if (verifiedNews.length) reasons.push(`${verifiedNews.length} fresh company headline(s)`);
+  if (earningsToday) reasons.push("earnings scheduled today");
+  if (dislocation) reasons.push(`${signed(row.changePercent)}% price dislocation`);
+  if (extremeTrim) reasons.push("valuation and range position both at/above 90th threshold");
+  return {
+    eligible: reasons.length > 0,
+    score: verifiedNews.length * 3 + (earningsToday ? 3 : 0) + (dislocation ? 2 : 0) + (extremeTrim ? 2 : 0),
+    reasons,
+    verifiedCatalyst: verifiedNews.length > 0 || earningsToday,
+    dislocation,
+    extremeTrim,
   };
 }
 
@@ -552,7 +663,7 @@ export async function generateAiReport(env, snapshot, override = null) {
   const route = selectedAiRoute(env, override);
   const { provider, model } = route;
   const compact = compactSnapshotForReport(snapshot);
-  const requiredSymbols = compact.watchlist.filter((row) => !row.missing).map((row) => row.symbol);
+  const requiredSymbols = (snapshot.watchlist ?? []).filter((row) => !row.missing).map((row) => row.symbol);
   const prompts = [
     reportPrompt(compact),
     reportPrompt(compact, { retry: true }),
@@ -705,84 +816,51 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
     if (!sectionBody(markdown, section)) errors.push(`missing section: ${section}`);
   }
 
-  const executive = sectionBody(markdown, "Executive Summary");
-  const executiveBullets = executive.split("\n").filter((line) => /^\s*[-*]\s+/.test(line));
-  if (executiveBullets.length !== 5) errors.push("Executive Summary must contain exactly five bullets");
-  for (const label of REQUIRED_EXECUTIVE_LABELS) {
-    if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(executive)) {
-      errors.push(`missing Executive Summary field: ${label}`);
+  const verdict = sectionBody(markdown, "Today's Verdict");
+  for (const label of REQUIRED_VERDICT_LABELS) {
+    if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(verdict)) {
+      errors.push(`missing Today's Verdict field: ${label}`);
     }
   }
-  validateExecutiveDecisions(executive, compact, errors);
-
-  const overnight = sectionBody(markdown, "Overnight and Market Context");
-  for (const label of ["Sourced Facts", "Analysis"]) {
-    if (!new RegExp(escapeRegExp(label), "i").test(overnight)) errors.push(`missing Overnight field: ${label}`);
-  }
+  const context = sectionBody(markdown, "Market and AI-Cycle Context");
   for (const label of REQUIRED_CONTEXT_LABELS) {
-    if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(overnight)) {
-      errors.push(`missing Overnight context field: ${label}`);
+    if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(context)) {
+      errors.push(`missing Market Context field: ${label}`);
     }
   }
-  validateAvailableContextIsUsed(overnight, compact, errors);
-
-  const dashboard = sectionBody(markdown, "AI Cycle Dashboard");
-  for (const header of ["Rating", "Trend", "Sourced Facts", "Analysis"]) {
-    if (!new RegExp(escapeRegExp(header), "i").test(dashboard)) errors.push(`missing AI Cycle Dashboard column: ${header}`);
-  }
-  for (const row of REQUIRED_AI_CYCLE_ROWS) {
-    const cells = markdownTableRow(dashboard, row, { allowLabelFormatting: true });
-    const expected = compact?.decisionFramework?.aiCycle?.[row];
-    if (!cells) errors.push(`missing AI Cycle Dashboard row: ${row}`);
-    else if (cells.length < 5) errors.push(`incomplete AI Cycle Dashboard row: ${row}`);
-    else if (expected && (normalizeCell(cells[1]) !== normalizeCell(expected.rating) || normalizeCell(cells[2]) !== normalizeCell(expected.trend))) {
-      errors.push(`AI Cycle rating/trend contradicts deterministic framework: ${row}`);
-    }
-  }
-
-  const scorecard = sectionBody(markdown, "Sector Scorecard");
-  for (const header of ["Fundamentals", "Valuation", "Momentum", "Action", "Sourced Facts", "Analysis"]) {
-    if (!new RegExp(escapeRegExp(header), "i").test(scorecard)) errors.push(`missing Sector Scorecard column: ${header}`);
-  }
-  for (const row of REQUIRED_SECTOR_ROWS) {
-    const cells = markdownTableRow(scorecard, row, { allowLabelFormatting: true });
-    const expected = compact?.decisionFramework?.sectorScorecard?.[row];
-    if (!cells) errors.push(`missing Sector Scorecard row: ${row}`);
-    else if (cells.length < 7 || !validAction(cells[4])) errors.push(`invalid Sector Scorecard fields: ${row}`);
-    else if (expected && [expected.fundamentals, expected.valuation, expected.momentum, expected.action]
-      .some((value, index) => normalizeCell(cells[index + 1]) !== normalizeCell(value))) {
-      errors.push(`Sector Scorecard contradicts deterministic framework: ${row}`);
-    }
-  }
-
-  const watchlist = sectionBody(markdown, "Watchlist");
-  for (const header of ["Price", "Daily Change", "52W Position", "Forward P/E or P/S", "Historical Valuation Percentile", "Catalyst", "Risk", "Action"]) {
-    if (!new RegExp(escapeRegExp(header), "i").test(watchlist)) errors.push(`missing Watchlist column: ${header}`);
-  }
-  for (const symbol of symbols) {
-    const cells = markdownTableRow(watchlist, symbol, { allowLabelFormatting: true, allowDollar: true });
-    const expected = compact?.watchlist?.find((row) => row.symbol === symbol);
-    if (!cells) errors.push(`missing watchlist symbol: ${symbol}`);
-    else if (cells.length < 9 || !validAction(cells[8])) errors.push(`incomplete watchlist fields: ${symbol}`);
-    else if (expected && normalizeCell(cells[8]) !== normalizeCell(expected.action)) errors.push(`Watchlist action contradicts deterministic framework: ${symbol}`);
-    if (cells && expected && /\b(?:buy|hold|wait|avoid)\b/i.test(cells[6])) errors.push(`Watchlist catalyst contains an action: ${symbol}`);
-  }
+  validateOpportunities(markdown, symbols, compact, errors);
   validateUnsupportedClaims(markdown, compact, errors);
-  if (markdown.length < 500) errors.push("report is shorter than the minimum complete length");
+  if (markdown.length < 350) errors.push("report is shorter than the minimum complete length");
   if (endsIncomplete(markdown)) errors.push("report ends with an incomplete sentence");
   return { ok: errors.length === 0, errors };
 }
 
-function validateExecutiveDecisions(executive, compact, errors) {
-  if (!compact?.executiveSummary) return;
-  for (const [label, key] of [["Best Opportunity", "bestOpportunity"], ["Avoid", "avoid"]]) {
-    const line = executive.split("\n").find((candidate) => new RegExp(`${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(candidate));
-    const expected = compact.executiveSummary[key];
-    const expectedSymbol = /^[A-Z]{1,6}$/.test(expected) ? expected : null;
-    if (expectedSymbol && (!line || !new RegExp(`\\b${escapeRegExp(expectedSymbol)}\\b`).test(line))) {
-      errors.push(`Executive Summary ${label} contradicts deterministic framework`);
+function validateOpportunities(markdown, symbols, compact, errors) {
+  const opportunities = sectionBody(markdown, "Opportunities");
+  const matches = [...opportunities.matchAll(/^###\s+([A-Z.]{1,8})\s+[—-]\s+(.+)$/gm)];
+  if (matches.length > 3) errors.push("Opportunities must contain at most three names");
+  const candidates = new Map((compact?.opportunityGate?.candidates ?? []).map((row) => [row.symbol, row]));
+  const required = ["Strategic Position", "Today's Action", "Confidence", "Entry/Exit Condition", "Verified Catalyst", "Downside", "Invalidation"];
+  for (const match of matches) {
+    const [heading, symbol, headingAction] = match;
+    const next = opportunities.slice(match.index + heading.length);
+    const block = next.slice(0, next.search(/^###\s+/m) < 0 ? undefined : next.search(/^###\s+/m));
+    const action = TODAY_ACTIONS.find((value) => normalizeCell(value) === normalizeCell(headingAction));
+    if (!action) errors.push(`invalid today's action: ${symbol}`);
+    if (!symbols?.includes(symbol)) errors.push(`opportunity is outside watchlist: ${symbol}`);
+    if (!candidates.has(symbol)) errors.push(`opportunity did not clear absolute setup gate: ${symbol}`);
+    for (const label of required) if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(block)) {
+      errors.push(`missing opportunity field for ${symbol}: ${label}`);
     }
-    if (!expectedSymbol && line && !/\bnone\b/i.test(line)) errors.push(`Executive Summary ${label} must state none`);
+    if (["Buy now", "Buy on weakness", "Sell"].includes(action) && !candidates.get(symbol)?.setup?.verifiedCatalyst) {
+      errors.push(`actionable call lacks verified catalyst: ${symbol}`);
+    }
+    if (action === "Trim" && !candidates.get(symbol)?.setup?.verifiedCatalyst && !candidates.get(symbol)?.setup?.extremeTrim) {
+      errors.push(`trim call lacks verified catalyst or extreme setup: ${symbol}`);
+    }
+  }
+  if (!matches.length && !/no high-conviction trade|no actionable opportunity/i.test(opportunities)) {
+    errors.push("Opportunities must state that no setup clears the threshold");
   }
 }
 
@@ -793,9 +871,6 @@ function validateUnsupportedClaims(markdown, compact, errors) {
     [/\binstitutional (?:buying|selling|volume|flows?)\b/i, "unsupported institutional-flow claim"],
   ];
   for (const [pattern, label] of unsupported) if (pattern.test(markdown)) errors.push(label);
-  if (!compact?.watchlist?.some((row) => Number.isFinite(row?.reportedGrowth?.revenueTtmYoY)) && /fundamentals?\s+(?:are |is )?(?:strong|weak|improving|deteriorating)/i.test(markdown)) {
-    errors.push("fundamental claim made without reported growth data");
-  }
 }
 
 function normalizeCell(value) {
@@ -861,39 +936,32 @@ function escapeRegExp(value) {
 
 function reportPrompt(compact, options = {}) {
   return [
-    "Produce a concise institutional sell-side Growth Tech Morning Brief in Markdown using the exact schema below.",
-    "Do not add, remove, or rename top-level sections, table columns, required rows, or Executive Summary labels.",
-    "Use only supplied data as sourced facts. Never describe volume as institutional, claim an earnings/macro catalyst, or infer demand from price action as fact.",
-    "When a supplied context category has status available, cite its values and as-of time; do not call it unavailable. When its status is stale, cite it and explicitly flag it stale. Only write unavailable when its supplied status is unavailable.",
-    "The decisionFramework object is authoritative and deterministic. Copy every supplied AI-cycle rating/trend, sector Fundamentals/Valuation/Momentum/Action, and watchlist Action exactly; explain them but never override them.",
-    "Reported growth comes from SEC filings and is backward-looking. Do not call it an analyst estimate, guidance, demand, backlog, or forward growth.",
-    "When forward estimates are not supplied, write 'n/a — not in snapshot'. Use each watchlist row's supplied catalyst, risk, and action verbatim or as a faithful concise paraphrase.",
-    "Keep sourced facts separate from analysis. Price action may describe momentum only; it cannot establish demand, CapEx, institutional flows, or fundamental strength.",
+    "Produce a short, decision-focused Growth Tech Morning Brief in Markdown using the exact four-section schema below.",
+    "Answer one question: is there a sufficiently strong, time-sensitive reason to buy, sell, or trim a covered stock today?",
+    "Do not recommend a trade merely because a stock ranks highest. Default to 'No high-conviction trade today' unless an absolute setup threshold is cleared.",
+    "Use only opportunityGate.candidates. Include at most three names. A >=3% move without verified news may be Watch only, never Buy/Sell.",
+    "Buy now, Buy on weakness, and Sell require a verified fresh company event or same-day earnings. Trim requires either that evidence or the supplied extremeTrim flag.",
+    "For each call, distinguish Strategic Position from Today's Action and provide a concrete entry/exit condition, confidence, downside, and falsifiable invalidation.",
+    "News metadata is evidence, not automatically causal. Attribute a price move to an event only when relevance is direct; otherwise call the move unverified.",
+    "Federal Reserve items are from the official monetary-policy feed. Use them as market-regime inputs only when fresh and material to today's decision.",
+    "Reported growth is backward-looking SEC data. Price action cannot establish demand, CapEx, adoption, institutional flows, or fundamental strength.",
     `Label market context as ${compact.session}; do not call regular-trading quotes overnight futures or premarket indications.`,
-    "Allowed stock and sector actions are Buy, Hold, Wait, or Avoid.",
-    "In table Action cells, write one action only; do not add qualifiers in the same cell.",
+    `Allowed Today's Actions: ${TODAY_ACTIONS.join(", ")}.`,
+    "Keep the entire report concise. Do not add sector, dashboard, or full-watchlist tables.",
     "",
-    "# Executive Summary",
-    "Exactly five bullets labeled: **AI Cycle:**; **Catalyst:**; **Risk:**; **Best Opportunity:**; **Avoid:**.",
-    "Use executiveSummary.aiCycle, catalyst, bestOpportunity, and avoid exactly; do not promote a Hold/Wait name to Best Opportunity or invent an Avoid.",
+    "# Today's Verdict",
+    "Exactly three bullets labeled **Verdict:**, **Confidence:**, and **Why Today:**.",
     "",
-    "# Overnight and Market Context",
-    "Include **Sourced Facts:** and **Analysis:** followed by six separate bullet lines labeled: **Futures:**, **Rates:**, **USD:**, **Oil:**, **Macro Events:**, and **Earnings:**.",
-    "For each field, state the supplied source status and as-of time. Use actual/consensus/previous for macro events and time/EPS forecast for earnings when supplied. Do not invent news or event causality.",
+    "# Opportunities",
+    "If no candidate merits action, write one sentence: No actionable opportunity clears the threshold.",
+    "Otherwise use `### SYMBOL — Today's Action` and seven bullets labeled **Strategic Position:**, **Today's Action:**, **Confidence:**, **Entry/Exit Condition:**, **Verified Catalyst:**, **Downside:**, and **Invalidation:** for each name.",
     "",
-    "# AI Cycle Dashboard",
-    "Markdown table columns: Segment | Rating | Trend | Sourced Facts | Analysis. Copy Rating and Trend exactly from decisionFramework.aiCycle.",
-    `Required rows: ${REQUIRED_AI_CYCLE_ROWS.join("; ")}.`,
+    "# Market and AI-Cycle Context",
+    "Exactly three concise bullets labeled **AI Cycle:**, **Market Regime:**, and **Material News:**. Mention only facts that change conviction today; omit low-value calendar items.",
     "",
-    "# Sector Scorecard",
-    "Markdown table columns: Sector | Fundamentals | Valuation | Momentum | Action | Sourced Facts | Analysis. Copy the four decision fields exactly from decisionFramework.sectorScorecard.",
-    `Required rows: ${REQUIRED_SECTOR_ROWS.join("; ")}.`,
-    "",
-    "# Watchlist",
-    "Markdown table columns: Symbol | Price | Daily Change | 52W Position | Forward P/E or P/S | Historical Valuation Percentile | Catalyst | Risk | Action.",
-    "Include one row for every successfully retrieved symbol. Use n/a for forward valuation because the snapshot contains reported and trailing metrics only. Copy each supplied watchlist Action exactly.",
-    "Do not substitute trailing P/E or P/S into the Forward P/E or P/S column. Historical valuation percentile may use the supplied trailing valuation history.",
-    options.retry ? "Retry instruction: the previous response was incomplete. Produce a shorter but complete report. Keep every required section and watchlist symbol while reducing commentary." : "",
+    "# What Could Change the Call",
+    "Use no more than four bullets with the specific earnings, macro event, price level, verified news, or data gap that could change today's calls.",
+    options.retry ? "Retry instruction: the previous response failed validation. Be shorter, preserve all four sections, and follow the opportunity gate exactly." : "",
     "",
     "Compact snapshot JSON:",
     JSON.stringify(compact),
@@ -1252,29 +1320,16 @@ function compactRow(row) {
 }
 
 function renderMarkdown(brief) {
+  const candidates = brief.opportunityGate.candidates;
   const lines = [
     `# Growth Tech Morning Brief — ${brief.generatedAt.slice(0, 10)}`,
     "",
-    `Coverage: ${brief.coverage.succeeded}/${brief.coverage.requested}. Market context: ${brief.dataQuality.available}/${brief.dataQuality.total} current. Session: 9:35 AM ET.`,
+    `Coverage: ${brief.coverage.succeeded}/${brief.coverage.requested}. Session: ${brief.session}.`,
     "",
-    `Strongest: ${brief.executiveSummary.strongest.join(", ") || "n/a"}`,
-    `Weakest: ${brief.executiveSummary.weakest.join(", ") || "n/a"}`,
-    `Highest valuation percentile: ${brief.executiveSummary.highestValuationPercentile.join(", ") || "n/a"}`,
-    "",
-    "| Symbol | Price | Day | 52W position | TTM P/E | TTM P/S | 5Y valuation percentile |",
-    "|---|---:|---:|---:|---:|---:|---:|",
+    candidates.length ? "Candidate setups requiring AI review:" : "No stock cleared the absolute setup gate.",
   ];
-  for (const row of brief.watchlist) {
-    if (row.missing) {
-      lines.push(`| ${row.symbol} | n/a | n/a | n/a | n/a | n/a | failed |`);
-      continue;
-    }
-    const percentileLabel = Number.isFinite(row.valuation?.selectedPercentile)
-      ? `${fmt(row.valuation.selectedPercentile)} percentile (${row.valuation.selectedMetric === "trailingPE" ? "P/E" : "P/S"})`
-      : "n/a";
-    lines.push(`| ${row.symbol} | ${fmt(row.price)} | ${signed(row.changePercent)}% | ${fmt(row.positionIn52WeekRange)}% | ${fmt(row.valuation?.trailingPE)} | ${fmt(row.valuation?.trailingPS)} | ${percentileLabel} |`);
-  }
-  lines.push("", "Valuation history is point-in-time and uses only SEC filings available on each observation date. Yahoo price data is unofficial.");
+  for (const row of candidates) lines.push(`- ${row.symbol}: ${row.setup.reasons.join("; ")}`);
+  lines.push("", "This diagnostic is not the AI trade verdict; use the generated report for the final call.");
   return lines.join("\n");
 }
 
