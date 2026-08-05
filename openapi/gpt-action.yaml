@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Growth Tech Morning Brief API
   description: Read the latest saved Growth Tech morning brief or explicitly refresh its market snapshot.
-  version: 0.5.3
+  version: 0.5.4
 servers:
   - url: https://growth-tech-morning-brief.ck-market-tools.workers.dev
 paths:
@@ -72,11 +72,13 @@ components:
   schemas:
     HealthResponse:
       type: object
-      required: [ok, service]
+      required: [ok, service, version]
       properties:
         ok:
           type: boolean
         service:
+          type: string
+        version:
           type: string
     Coverage:
       type: object
@@ -98,6 +100,19 @@ components:
           type: array
           items: { type: string }
         defaultVerdict: { type: string }
+        candidates:
+          type: array
+          items:
+            $ref: "#/components/schemas/WatchlistRow"
+    Discovery:
+      type: object
+      required: [status, source, scanned, eligibleAfterLiquidityAndRelevance, candidates]
+      properties:
+        status: { type: string }
+        source: { type: string }
+        scanned: { type: integer }
+        eligibleAfterLiquidityAndRelevance: { type: integer }
+        filters: { type: [object, "null"] }
         candidates:
           type: array
           items:
@@ -132,11 +147,11 @@ components:
         error: { type: string }
     Brief:
       type: object
-      required: [schemaVersion, generatedAt, session, coverage, opportunityGate, watchlist, markdown]
+      required: [schemaVersion, generatedAt, session, coverage, discovery, opportunityGate, watchlist, markdown]
       properties:
         schemaVersion:
           type: integer
-          enum: [5]
+          enum: [6]
         generatedAt:
           type: string
           format: date-time
@@ -146,6 +161,8 @@ components:
           $ref: "#/components/schemas/Coverage"
         opportunityGate:
           $ref: "#/components/schemas/OpportunityGate"
+        discovery:
+          $ref: "#/components/schemas/Discovery"
         watchlist:
           type: array
           items:

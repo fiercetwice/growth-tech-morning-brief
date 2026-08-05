@@ -2,23 +2,32 @@ const YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart";
 const NASDAQ_API_BASE = "https://api.nasdaq.com/api/calendar";
 const FED_MONETARY_RSS = "https://www.federalreserve.gov/feeds/press_monetary.xml";
 const YAHOO_SEARCH = "https://query2.finance.yahoo.com/v1/finance/search";
+const NASDAQ_STOCK_SCREENER = "https://api.nasdaq.com/api/screener/stocks";
 const SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts";
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
+const SERVICE_VERSION = "0.5.4";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
   "Today's Verdict",
+  "Decision Reasoning",
   "Opportunities",
+  "Rejected Candidates",
   "Market and AI-Cycle Context",
   "What Could Change the Call",
 ];
 const REQUIRED_VERDICT_LABELS = ["Verdict", "Confidence", "Why Today"];
 const REQUIRED_CONTEXT_LABELS = ["AI Cycle", "Market Regime", "Material News"];
+const REQUIRED_REASONING_LABELS = ["Universe Searched", "Opportunity Gate", "Conclusion"];
 const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Trim", "Sell", "Watch", "No action"];
+const DEFAULT_DISCOVERY_LIMIT = 6;
+const DEFAULT_MIN_MARKET_CAP = 250_000_000;
+const DEFAULT_MIN_DOLLAR_VOLUME = 5_000_000;
+const DEFAULT_SEC_REFRESH_LIMIT = 3;
 const ALLOWED_AI_PROVIDERS = new Set(["gemini", "deepseek", "openai-compatible"]);
 const MARKET_CONTEXT_GROUPS = {
   futures: [
@@ -64,7 +73,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
-    if (path === "/health") return json({ ok: true, service: "growth-tech-morning-brief" });
+    if (path === "/health") return json({ ok: true, service: "growth-tech-morning-brief", version: SERVICE_VERSION });
     if (path === "/latest" && request.method === "GET") {
       if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
       if (!env.BRIEF_BUCKET?.get) return json({ error: "r2_not_configured" }, 503);
@@ -187,10 +196,11 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
   }
 
   const symbols = parseSymbols(env.WATCHLIST);
-  const [results, marketContext, calendars, news] = await Promise.all([
+  const secNetworkBudget = { remaining: Math.min(10, Math.round(nonNegativeNumber(env.SEC_REFRESH_LIMIT, DEFAULT_SEC_REFRESH_LIMIT))) };
+  const [results, marketContext, calendars, coreNews, discovery] = await Promise.all([
     Promise.allSettled(symbols.map(async (symbol) => {
     const chart = await fetchYahooChart(symbol, now, env);
-    const fundamentals = await fetchSecFundamentals(symbol, env, now).catch((error) => ({
+    const fundamentals = await fetchSecFundamentals(symbol, env, now, { networkBudget: secNetworkBudget }).catch((error) => ({
       available: false, reason: error.message,
     }));
     return assembleSymbol(symbol, chart, fundamentals);
@@ -198,6 +208,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
     buildMarketContext(env, now),
     buildCalendarContext(env, now, symbols),
     buildNewsContext(env, now, symbols),
+    buildDiscoveryContext(env, now, symbols),
   ]);
 
   const watchlist = results.map((result, index) => result.status === "fulfilled"
@@ -206,8 +217,20 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
   const succeeded = watchlist.filter((row) => !row.missing).length;
   if (!succeeded) throw new Error("All Yahoo chart requests failed");
 
+  const discoverySymbols = (discovery.candidates ?? []).map((row) => row.symbol);
+  const discoveryNews = discovery.news?.items ?? [];
+  const news = {
+    ...coreNews,
+    company: {
+      ...coreNews.company,
+      items: [...(coreNews.company?.items ?? []), ...discoveryNews]
+        .filter((item, index, all) => all.findIndex((candidate) => candidate.url === item.url) === index)
+        .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt)).slice(0, 50),
+    },
+  };
+
   const snapshot = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     generatedAt: now.toISOString(),
     session: marketSession(now),
     sources: {
@@ -217,12 +240,14 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
       calendars: "Nasdaq public calendar endpoints (unofficial)",
       monetaryPolicyNews: "Federal Reserve monetary policy RSS (official)",
       companyNews: "Yahoo Finance search news (unofficial)",
+      discovery: "Nasdaq full-market stock screener (unofficial public endpoint)",
       methodology: "Point-in-time TTM multiples use only filings available by each price date",
     },
     coverage: { requested: symbols.length, succeeded, failed: symbols.length - succeeded },
     marketContext,
     calendars,
     news,
+    discovery: { ...discovery, symbols: discoverySymbols },
     watchlist,
   };
 
@@ -295,8 +320,110 @@ export async function buildNewsContext(env, now = new Date(), symbols = []) {
   };
 }
 
+export async function buildDiscoveryContext(env, now = new Date(), coreSymbols = []) {
+  if (String(env.DISCOVERY_ENABLED ?? "true").toLowerCase() === "false") {
+    return { status: "disabled", source: "Nasdaq full-market stock screener (unofficial public endpoint)", asOf: null, scanned: 0, candidates: [], news: { items: [] } };
+  }
+  try {
+    const body = await fetchNasdaqStockUniverse(env);
+    const rows = normalizeNasdaqStockUniverse(body);
+    const core = new Set(coreSymbols);
+    const minMarketCap = positiveNumber(env.DISCOVERY_MIN_MARKET_CAP, DEFAULT_MIN_MARKET_CAP);
+    const minDollarVolume = positiveNumber(env.DISCOVERY_MIN_DOLLAR_VOLUME, DEFAULT_MIN_DOLLAR_VOLUME);
+    const limit = Math.min(25, Math.max(1, Math.round(positiveNumber(env.DISCOVERY_LIMIT, DEFAULT_DISCOVERY_LIMIT))));
+    const candidates = rows.filter((row) => !core.has(row.symbol))
+      .filter((row) => row.marketCap >= minMarketCap && row.dollarVolume >= minDollarVolume)
+      .filter(growthTechDiscoveryRelevant)
+      .filter((row) => Math.abs(row.changePercent ?? 0) >= 3)
+      .map((row) => ({ ...row, discoveryScore: discoveryScore(row), sourceType: "discovery" }))
+      .sort((a, b) => b.discoveryScore - a.discoveryScore).slice(0, limit);
+    const newsSettled = await Promise.allSettled(candidates.map(async (row) => normalizeYahooNews(await fetchYahooNews(row.symbol, env), row.symbol, now).slice(0, 3)));
+    const newsItems = newsSettled.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+    for (const row of candidates) row.news = newsItems.filter((item) => item.symbols?.includes(row.symbol)).slice(0, 3);
+    return {
+      status: "available",
+      source: "Nasdaq full-market stock screener (unofficial public endpoint)",
+      asOf: body?.data?.asOf ?? now.toISOString(),
+      scanned: rows.length,
+      eligibleAfterLiquidityAndRelevance: candidates.length,
+      filters: { minMarketCap, minDollarVolume, maximumCandidates: limit },
+      candidates,
+      news: { items: newsItems },
+    };
+  } catch (error) {
+    return { status: "unavailable", source: "Nasdaq full-market stock screener (unofficial public endpoint)", asOf: null, scanned: 0, candidates: [], news: { items: [] }, reason: errorMessage(error) };
+  }
+}
+
+async function fetchNasdaqStockUniverse(env) {
+  const url = new URL(NASDAQ_STOCK_SCREENER);
+  url.searchParams.set("tableonly", "true");
+  url.searchParams.set("limit", "10000");
+  url.searchParams.set("offset", "0");
+  url.searchParams.set("download", "true");
+  const response = await fetch(url, { headers: nasdaqHeaders(env) });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || !body?.data?.rows) throw new Error(`Nasdaq stock discovery failed (${response.status})`);
+  return body;
+}
+
+export function normalizeNasdaqStockUniverse(body) {
+  const rows = Array.isArray(body?.data?.rows) ? body.data.rows : [];
+  return rows.map((row) => {
+    const price = marketNumber(row.lastsale);
+    const volume = marketNumber(row.volume);
+    return {
+      symbol: cleanText(row.symbol)?.toUpperCase() ?? null,
+      name: cleanText(row.name),
+      country: cleanText(row.country),
+      sector: cleanText(row.sector),
+      industry: cleanText(row.industry),
+      price: round(price),
+      changePercent: round(marketNumber(row.pctchange)),
+      marketCap: marketNumber(row.marketCap),
+      volume,
+      dollarVolume: finitePair(price, volume) ? round(price * volume) : null,
+      relativeVolume: null,
+      screen: "nasdaq_full_market",
+      valuation: null,
+      reportedGrowth: null,
+      missing: false,
+    };
+  }).filter((row) => row.symbol && Number.isFinite(row.price));
+}
+
+function growthTechDiscoveryRelevant(row) {
+  const text = `${row.sector ?? ""} ${row.industry ?? ""} ${row.name ?? ""}`;
+  if (/technology/i.test(row.sector ?? "")) return true;
+  return /semiconductor|software|cloud|cyber|network|optical|photon|data.?center|server|comput|electronic|power|energy storage|cooling|thermal|automation|robot|digital|AI\b|artificial intelligence/i.test(text);
+}
+
+function discoveryScore(row) {
+  const move = Math.min(20, Math.abs(row.changePercent ?? 0));
+  const liquidity = Math.min(5, Math.log10(Math.max(1, row.dollarVolume ?? 1) / 1_000_000 + 1));
+  const smallCompanyBonus = row.marketCap < 10_000_000_000 ? 2 : 0;
+  return round(move + liquidity + smallCompanyBonus);
+}
+
+function positiveNumber(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function nonNegativeNumber(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function marketNumber(value) {
+  if (value === undefined || value === null) return null;
+  const parsed = Number(String(value).replace(/[$,%\s]/g, "").replaceAll(",", ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 async function fetchFedMonetaryPolicy(env) {
-  const response = await fetch(FED_MONETARY_RSS, { headers: { "user-agent": env.NEWS_USER_AGENT || "growth-tech-morning-brief/0.5.3" } });
+  const response = await fetch(FED_MONETARY_RSS, { headers: { "user-agent": env.NEWS_USER_AGENT || `growth-tech-morning-brief/${SERVICE_VERSION}` } });
   if (!response.ok) throw new Error(`Federal Reserve feed failed (${response.status})`);
   return response.text();
 }
@@ -304,7 +431,7 @@ async function fetchFedMonetaryPolicy(env) {
 async function fetchYahooNews(symbol, env) {
   const url = new URL(YAHOO_SEARCH);
   url.searchParams.set("q", symbol);
-  url.searchParams.set("quotesCount", "0");
+  url.searchParams.set("quotesCount", "1");
   url.searchParams.set("newsCount", "5");
   const response = await fetch(url, { headers: yahooHeaders(env) });
   const body = await response.json().catch(() => null);
@@ -342,7 +469,12 @@ export function normalizeYahooNews(body, symbol, now = new Date()) {
     kind: "company_news",
     symbols: [symbol],
     verified: Boolean(item.link && item.title),
+    material: materialCompanyHeadline(item.title),
   })).filter((item) => item.title && item.url && item.publishedAt && Date.parse(item.publishedAt) >= cutoff);
+}
+
+function materialCompanyHeadline(title = "") {
+  return /earnings|revenue|profit|guidance|forecast|outlook|contract|customer|partnership|acqui|merger|offering|buyback|dividend|layoff|restructur|FDA|SEC|investigation|lawsuit|regulat|ban|export|launch|announc|order|backlog|capacity|data.?center|AI\b|artificial intelligence/i.test(title);
 }
 
 function xmlValue(xml, tag) {
@@ -464,9 +596,16 @@ function snapshotDataQuality(snapshot) {
     oil: snapshot.marketContext?.oil?.status ?? "unavailable",
     macroEvents: snapshot.calendars?.macroEvents?.status ?? "unavailable",
     earnings: snapshot.calendars?.earnings?.status ?? "unavailable",
+    discovery: snapshot.discovery?.status ?? "unavailable",
   };
   const available = Object.values(categories).filter((status) => status === "available").length;
-  return { categories, available, total: Object.keys(categories).length, complete: available === Object.keys(categories).length };
+  const fundamentalCache = { fresh: 0, refreshed: 0, stale: 0, missing: 0 };
+  for (const row of snapshot.watchlist ?? []) {
+    const status = row.fundamentals?.cacheStatus;
+    if (status && status in fundamentalCache) fundamentalCache[status] += 1;
+    else fundamentalCache.missing += 1;
+  }
+  return { categories, available, total: Object.keys(categories).length, complete: available === Object.keys(categories).length, fundamentalCache };
 }
 
 function latestTimestamp(values) {
@@ -570,6 +709,7 @@ function riskFor(row) {
   if ((row.reportedGrowth?.revenueTtmYoY ?? 0) < 0) risks.push("reported TTM revenue contraction");
   if ((row.positionIn52WeekRange ?? 0) >= 90) risks.push("price near 52-week high");
   if (momentumScore(row) < 0) risks.push("negative rule-based momentum");
+  if (row.fundamentalCacheStatus === "stale") risks.push("SEC fundamentals are from an expired cache entry pending refresh");
   return risks.join("; ") || "no quantified risk flag in snapshot";
 }
 
@@ -582,6 +722,7 @@ function median(values) {
 
 export function toBrief(snapshot) {
   const rows = snapshot.watchlist.map(compactRow);
+  const discoveredRows = (snapshot.discovery?.candidates ?? []).map(compactDiscoveryRow);
   const earningsBySymbol = new Map((snapshot.calendars?.earnings?.events ?? []).map((event) => [event.symbol, event]));
   const companyNews = snapshot.news?.company?.items ?? [];
   for (const row of rows) {
@@ -593,12 +734,21 @@ export function toBrief(snapshot) {
     row.news = companyNews.filter((item) => item.symbols?.includes(row.symbol)).slice(0, 3);
     row.setup = todaySetup(row, earningsBySymbol.get(row.symbol));
   }
-  const valid = rows.filter((row) => !row.missing);
+  for (const row of discoveredRows) {
+    row.catalyst = catalystFor(row, earningsBySymbol.get(row.symbol));
+    row.risk = discoveryRiskFor(row);
+    row.strategicAction = "Research pending";
+    row.action = "Watch";
+    row.setup = todaySetup(row, earningsBySymbol.get(row.symbol));
+    row.setup.reasons.unshift(`discovered by ${row.screen}`);
+    row.setup.score = round(row.setup.score + Math.min(10, row.discoveryScore ?? 0) / 2);
+  }
+  const valid = [...rows, ...discoveredRows].filter((row) => !row.missing);
   const dataQuality = snapshotDataQuality(snapshot);
   const candidates = valid.filter((row) => row.setup.eligible)
-    .sort((a, b) => b.setup.score - a.setup.score).slice(0, 8);
+    .sort((a, b) => b.setup.score - a.setup.score).slice(0, 15);
   const brief = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     generatedAt: snapshot.generatedAt,
     session: snapshot.session,
     coverage: snapshot.coverage,
@@ -610,12 +760,20 @@ export function toBrief(snapshot) {
       company: unavailableNews("Yahoo Finance search news (unofficial)", "not in snapshot"),
     },
     decisionFramework: buildDecisionFramework(valid),
+    discovery: {
+      status: snapshot.discovery?.status ?? "unavailable",
+      source: snapshot.discovery?.source ?? "Nasdaq full-market stock screener (unofficial public endpoint)",
+      scanned: snapshot.discovery?.scanned ?? 0,
+      eligibleAfterLiquidityAndRelevance: snapshot.discovery?.eligibleAfterLiquidityAndRelevance ?? 0,
+      filters: snapshot.discovery?.filters ?? null,
+      candidates: discoveredRows,
+    },
     opportunityGate: {
-      rule: "No actionable trade merely because it ranks highest. Action requires a verified fresh event, same-day earnings, a >=3% dislocation, or an extreme valuation/range trim setup.",
-      maximumOpportunities: 3,
+      rule: "No actionable trade merely because it ranks highest. Action requires a verified fresh event, same-day earnings, a >=3% dislocation, or an extreme valuation/range trim setup. Discovery names require explicit liquidity and data-quality review.",
+      maximumOpportunities: 8,
       allowedTodayActions: TODAY_ACTIONS,
       defaultVerdict: "No high-conviction trade today",
-      candidates,
+      candidates: candidates.slice(0, 15),
     },
     watchlist: rows,
   };
@@ -636,11 +794,44 @@ export function compactSnapshotForReport(snapshot) {
     news: brief.news,
     decisionFramework: brief.decisionFramework,
     opportunityGate: brief.opportunityGate,
+    discovery: brief.discovery,
   };
 }
 
+function compactDiscoveryRow(row) {
+  return {
+    symbol: row.symbol,
+    name: row.name,
+    price: row.price,
+    changePercent: row.changePercent,
+    yearLow: row.yearLow,
+    yearHigh: row.yearHigh,
+    positionIn52WeekRange: row.positionIn52WeekRange,
+    marketCap: row.marketCap,
+    dollarVolume: row.dollarVolume,
+    relativeVolume: row.relativeVolume,
+    sector: row.sector,
+    industry: row.industry,
+    screen: row.screen,
+    discoveryScore: row.discoveryScore,
+    sourceType: "discovery",
+    valuation: null,
+    reportedGrowth: null,
+    news: row.news ?? [],
+    missing: false,
+  };
+}
+
+function discoveryRiskFor(row) {
+  const risks = ["discovery candidate; fundamentals and valuation not yet verified"];
+  if ((row.marketCap ?? Infinity) < 1_000_000_000) risks.push("sub-$1B market capitalization");
+  if ((row.dollarVolume ?? Infinity) < 20_000_000) risks.push("limited daily dollar liquidity");
+  if (!row.news?.length) risks.push("no fresh verified headline");
+  return risks.join("; ");
+}
+
 function todaySetup(row, earnings) {
-  const verifiedNews = (row.news ?? []).filter((item) => item.verified);
+  const verifiedNews = (row.news ?? []).filter((item) => item.verified && item.material !== false);
   const dislocation = Number.isFinite(row.changePercent) && Math.abs(row.changePercent) >= 3;
   const extremeTrim = (row.valuation?.selectedPercentile ?? 0) >= 90 && (row.positionIn52WeekRange ?? 0) >= 90;
   const earningsToday = Boolean(earnings);
@@ -663,7 +854,10 @@ export async function generateAiReport(env, snapshot, override = null) {
   const route = selectedAiRoute(env, override);
   const { provider, model } = route;
   const compact = compactSnapshotForReport(snapshot);
-  const requiredSymbols = (snapshot.watchlist ?? []).filter((row) => !row.missing).map((row) => row.symbol);
+  const requiredSymbols = [
+    ...(snapshot.watchlist ?? []).filter((row) => !row.missing).map((row) => row.symbol),
+    ...(snapshot.discovery?.candidates ?? []).filter((row) => !row.missing).map((row) => row.symbol),
+  ];
   const prompts = [
     reportPrompt(compact),
     reportPrompt(compact, { retry: true }),
@@ -828,9 +1022,17 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
       errors.push(`missing Market Context field: ${label}`);
     }
   }
+  const reasoning = sectionBody(markdown, "Decision Reasoning");
+  for (const label of REQUIRED_REASONING_LABELS) {
+    if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(reasoning)) {
+      errors.push(`missing Decision Reasoning field: ${label}`);
+    }
+  }
+  const rejected = sectionBody(markdown, "Rejected Candidates");
+  if (!rejected) errors.push("Rejected Candidates must explain the strongest failed setups");
   validateOpportunities(markdown, symbols, compact, errors);
   validateUnsupportedClaims(markdown, compact, errors);
-  if (markdown.length < 350) errors.push("report is shorter than the minimum complete length");
+  if (markdown.length < 700) errors.push("report is shorter than the minimum insight length");
   if (endsIncomplete(markdown)) errors.push("report ends with an incomplete sentence");
   return { ok: errors.length === 0, errors };
 }
@@ -838,16 +1040,17 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
 function validateOpportunities(markdown, symbols, compact, errors) {
   const opportunities = sectionBody(markdown, "Opportunities");
   const matches = [...opportunities.matchAll(/^###\s+([A-Z.]{1,8})\s+[—-]\s+(.+)$/gm)];
-  if (matches.length > 3) errors.push("Opportunities must contain at most three names");
+  const maximum = compact?.opportunityGate?.maximumOpportunities ?? 8;
+  if (matches.length > maximum) errors.push(`Opportunities must contain at most ${maximum} names`);
   const candidates = new Map((compact?.opportunityGate?.candidates ?? []).map((row) => [row.symbol, row]));
-  const required = ["Strategic Position", "Today's Action", "Confidence", "Entry/Exit Condition", "Verified Catalyst", "Downside", "Invalidation"];
+  const required = ["Why Considered", "Mispricing Thesis", "Evidence For", "Evidence Against", "Strategic Position", "Today's Action", "Confidence", "Entry/Exit Condition", "Verified Catalyst", "Risk/Reward", "Invalidation"];
   for (const match of matches) {
     const [heading, symbol, headingAction] = match;
     const next = opportunities.slice(match.index + heading.length);
     const block = next.slice(0, next.search(/^###\s+/m) < 0 ? undefined : next.search(/^###\s+/m));
     const action = TODAY_ACTIONS.find((value) => normalizeCell(value) === normalizeCell(headingAction));
     if (!action) errors.push(`invalid today's action: ${symbol}`);
-    if (!symbols?.includes(symbol)) errors.push(`opportunity is outside watchlist: ${symbol}`);
+    if (!symbols?.includes(symbol)) errors.push(`opportunity is outside research universe: ${symbol}`);
     if (!candidates.has(symbol)) errors.push(`opportunity did not clear absolute setup gate: ${symbol}`);
     for (const label of required) if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(block)) {
       errors.push(`missing opportunity field for ${symbol}: ${label}`);
@@ -936,32 +1139,39 @@ function escapeRegExp(value) {
 
 function reportPrompt(compact, options = {}) {
   return [
-    "Produce a short, decision-focused Growth Tech Morning Brief in Markdown using the exact four-section schema below.",
-    "Answer one question: is there a sufficiently strong, time-sensitive reason to buy, sell, or trim a covered stock today?",
+    "Produce an evidence-rich, decision-focused Growth Tech Morning Brief in Markdown using the exact six-section schema below.",
+    "Answer one question: after screening both the core watchlist and a broader movers universe, is there a sufficiently strong, time-sensitive reason to buy, sell, trim, or investigate a stock today?",
     "Do not recommend a trade merely because a stock ranks highest. Default to 'No high-conviction trade today' unless an absolute setup threshold is cleared.",
-    "Use only opportunityGate.candidates. Include at most three names. A >=3% move without verified news may be Watch only, never Buy/Sell.",
+    `Use only opportunityGate.candidates. Include at most ${compact.opportunityGate.maximumOpportunities} names. A >=3% move without verified news may be Watch only, never Buy/Sell.`,
     "Buy now, Buy on weakness, and Sell require a verified fresh company event or same-day earnings. Trim requires either that evidence or the supplied extremeTrim flag.",
-    "For each call, distinguish Strategic Position from Today's Action and provide a concrete entry/exit condition, confidence, downside, and falsifiable invalidation.",
+    "Show the reasoning chain. For each call explain why it was considered, what the market may be mispricing, evidence for and against, strategic position, today's action, confidence, entry/exit condition, catalyst, risk/reward, and falsifiable invalidation.",
+    "Discovery candidates are not pre-approved investments. Explicitly discuss market cap, dollar liquidity, missing fundamental/valuation data, and source quality before any actionable call.",
     "News metadata is evidence, not automatically causal. Attribute a price move to an event only when relevance is direct; otherwise call the move unverified.",
     "Federal Reserve items are from the official monetary-policy feed. Use them as market-regime inputs only when fresh and material to today's decision.",
     "Reported growth is backward-looking SEC data. Price action cannot establish demand, CapEx, adoption, institutional flows, or fundamental strength.",
     `Label market context as ${compact.session}; do not call regular-trading quotes overnight futures or premarket indications.`,
     `Allowed Today's Actions: ${TODAY_ACTIONS.join(", ")}.`,
-    "Keep the entire report concise. Do not add sector, dashboard, or full-watchlist tables.",
+    "Depth is preferred over brevity when it adds decision value. Do not add exhaustive sector, dashboard, or full-watchlist tables.",
     "",
     "# Today's Verdict",
     "Exactly three bullets labeled **Verdict:**, **Confidence:**, and **Why Today:**.",
     "",
+    "# Decision Reasoning",
+    "Use three labeled paragraphs: **Universe Searched:** with core and discovery coverage counts, **Opportunity Gate:** explaining which signals admitted candidates and the evidence standard, and **Conclusion:** explaining why the strongest setups passed or failed today.",
+    "",
     "# Opportunities",
     "If no candidate merits action, write one sentence: No actionable opportunity clears the threshold.",
-    "Otherwise use `### SYMBOL — Today's Action` and seven bullets labeled **Strategic Position:**, **Today's Action:**, **Confidence:**, **Entry/Exit Condition:**, **Verified Catalyst:**, **Downside:**, and **Invalidation:** for each name.",
+    "Otherwise use `### SYMBOL — Today's Action` and eleven bullets labeled **Why Considered:**, **Mispricing Thesis:**, **Evidence For:**, **Evidence Against:**, **Strategic Position:**, **Today's Action:**, **Confidence:**, **Entry/Exit Condition:**, **Verified Catalyst:**, **Risk/Reward:**, and **Invalidation:** for each name.",
+    "",
+    "# Rejected Candidates",
+    "Discuss up to five of the strongest candidates that failed the action threshold. For each, state the admission signal, missing evidence or conflicting evidence, and what would promote it to an actionable setup. If none exist, say so explicitly.",
     "",
     "# Market and AI-Cycle Context",
     "Exactly three concise bullets labeled **AI Cycle:**, **Market Regime:**, and **Material News:**. Mention only facts that change conviction today; omit low-value calendar items.",
     "",
     "# What Could Change the Call",
-    "Use no more than four bullets with the specific earnings, macro event, price level, verified news, or data gap that could change today's calls.",
-    options.retry ? "Retry instruction: the previous response failed validation. Be shorter, preserve all four sections, and follow the opportunity gate exactly." : "",
+    "Use specific earnings, macro events, price levels, verified news, or data gaps that could change today's calls.",
+    options.retry ? "Retry instruction: the previous response failed validation. Preserve all six sections and every required label; reduce repetition but retain the reasoning chain." : "",
     "",
     "Compact snapshot JSON:",
     JSON.stringify(compact),
@@ -1315,6 +1525,8 @@ function compactRow(row) {
       fundamentalAsOf: row.valuation.fundamentalAsOf,
     } : null,
     reportedGrowth: row.reportedGrowth ?? null,
+    fundamentalCacheStatus: row.fundamentals?.cacheStatus ?? null,
+    fundamentalCachedAt: row.fundamentals?.cachedAt ?? null,
     missing: false,
   };
 }
@@ -1388,27 +1600,50 @@ export function normalizeYahooChart(result) {
   };
 }
 
-async function fetchSecFundamentals(symbol, env, now) {
+async function fetchSecFundamentals(symbol, env, now, options = {}) {
   const cik = CIKS[symbol];
   if (!cik) return { available: false, reason: "CIK not configured" };
   const cacheKey = `sec/companyfacts/${cik}.json`;
   let body = null;
+  let cachedBody = null;
+  let cacheStatus = "miss";
+  let cachedAt = null;
   if (env.BRIEF_BUCKET?.get) {
     const cached = await env.BRIEF_BUCKET.get(cacheKey);
     if (cached) {
       const uploaded = cached.uploaded ? new Date(cached.uploaded).getTime() : 0;
-      if (now.getTime() - uploaded < 7 * 86400_000) body = await cached.json();
+      cachedAt = uploaded ? new Date(uploaded).toISOString() : null;
+      cachedBody = await cached.json();
+      if (now.getTime() - uploaded < 7 * 86400_000) {
+        body = cachedBody;
+        cacheStatus = "fresh";
+      } else {
+        cacheStatus = "stale";
+      }
     }
   }
   if (!body) {
-    const response = await fetch(`${SEC_FACTS}/CIK${cik}.json`, {
-      headers: { accept: "application/json", "user-agent": env.SEC_USER_AGENT || "growth-tech-morning-brief research@example.com" },
-    });
-    if (!response.ok) throw new Error(`SEC CompanyFacts failed (${response.status})`);
-    body = await response.json();
-    if (env.BRIEF_BUCKET?.put) await env.BRIEF_BUCKET.put(cacheKey, JSON.stringify(body), { httpMetadata: { contentType: "application/json" } });
+    const budget = options.networkBudget;
+    if (budget && budget.remaining <= 0) {
+      if (cachedBody) body = cachedBody;
+      else return { available: false, reason: "SEC refresh budget exhausted; no cached CompanyFacts", cacheStatus: "miss" };
+    } else {
+      if (budget) budget.remaining -= 1;
+      const response = await fetch(`${SEC_FACTS}/CIK${cik}.json`, {
+        headers: { accept: "application/json", "user-agent": env.SEC_USER_AGENT || "growth-tech-morning-brief research@example.com" },
+      });
+      if (!response.ok) {
+        if (cachedBody) body = cachedBody;
+        else throw new Error(`SEC CompanyFacts failed (${response.status})`);
+      } else {
+        body = await response.json();
+        cacheStatus = "refreshed";
+        cachedAt = now.toISOString();
+        if (env.BRIEF_BUCKET?.put) await env.BRIEF_BUCKET.put(cacheKey, JSON.stringify(body), { httpMetadata: { contentType: "application/json" } });
+      }
+    }
   }
-  return extractSecFundamentals(body);
+  return { ...extractSecFundamentals(body), cacheStatus, cachedAt };
 }
 
 export function extractSecFundamentals(body) {
@@ -1501,6 +1736,8 @@ function assembleSymbol(symbol, chart, fundamentals) {
       quarterlyRevenue: fundamentals.quarterlyRevenue,
       quarterlyEps: fundamentals.quarterlyEps,
       quarterlyShares: fundamentals.quarterlyShares,
+      cacheStatus: fundamentals.cacheStatus ?? null,
+      cachedAt: fundamentals.cachedAt ?? null,
     } : fundamentals,
     valuationHistory,
     missing: false,

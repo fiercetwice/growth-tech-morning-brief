@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.5.3 — trade opportunity and news intelligence
+# Growth Tech Morning Brief v0.5.4 — dynamic discovery and auditable reasoning
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -9,9 +9,10 @@ Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/N
 - Nasdaq public calendar endpoints: today's economic releases and earnings schedule, including available event times, actual/consensus/previous values, EPS forecasts and covered-watchlist matches.
 - Federal Reserve official monetary-policy RSS: fresh rate decisions, FOMC statements, projections, and Chair commentary published during the prior seven days.
 - Yahoo Finance's unofficial search-news endpoint: fresh company headlines for covered symbols, including publisher, URL, publication time, and symbol association.
+- Nasdaq's unofficial public full-market stock screener: roughly 7,000 listed companies, including sector, industry, market capitalization, price move, and volume. Growth-Tech equities outside the core watchlist are filtered by market capitalization, dollar liquidity, theme relevance, and abnormal move before Yahoo news enrichment and AI review.
 - SEC EDGAR CompanyFacts: reported revenue, diluted EPS and diluted shares.
 - Local calculation: reported TTM and latest-quarter revenue/EPS growth, point-in-time trailing P/E and P/S history, and five-year valuation percentiles. A historical date uses only SEC filings published by that date, avoiding look-ahead bias.
-- Absolute opportunity gate: only verified fresh events, same-day earnings, moves of at least 3%, or extreme valuation/range trim setups reach AI review. The model may return at most three names and defaults to no trade.
+- Absolute opportunity gate: only material fresh events, same-day earnings, moves of at least 3%, or extreme valuation/range trim setups reach AI review. The model may return up to eight genuinely actionable names and defaults to no trade; discovery candidates receive explicit liquidity and missing-data warnings.
 - R2 caches SEC responses for seven days, keeps full dated calculation snapshots, stores compact dated briefs, and saves Gemini-generated Markdown reports.
 
 Yahoo and Nasdaq endpoints are unofficial public web endpoints and can change or rate-limit access. Every context category carries source and freshness metadata, and a category failure never blocks the equity snapshot. The Federal Reserve feed is official, but its inclusion does not by itself imply that a policy item caused a stock move. SEC data is authoritative but issuers use differing XBRL tags; unavailable fields remain null rather than being invented. Analyst-consensus forward valuation and estimate revisions are not included and remain explicitly unavailable.
@@ -95,18 +96,18 @@ curl "https://growth-tech-morning-brief.ck-market-tools.workers.dev/latest" \
 
 ## GitHub Actions deployment
 
-The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets.
+The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets. Before the post-deploy report test, the workflow waits until `/health` reports the exact release version so a still-propagating older Worker cannot create a false failure.
 
 
 ## AI provider router, report generation, and delivery
 
 On the valid 09:35 AM ET scheduled run, the Worker writes the stock snapshot, reads `snapshots/latest.json` back from R2, routes a compact snapshot to the selected AI provider, and stores the generated Markdown report at both `reports/YYYY-MM-DD.md` and `reports/latest.md`. `AI_PROVIDER` selects `gemini` (default), `deepseek`, or `openai-compatible`. Scheduled runs use environment configuration; authenticated `/run-report` requests may temporarily override `provider` and `model` only when `forceRegenerate` is true. Request bodies cannot set base URLs, so the Worker cannot be used as an arbitrary outbound proxy.
 
-Gemini defaults to `gemini-3.5-flash` with low thinking. DeepSeek uses its official OpenAI-compatible Chat Completions endpoint, defaults to `deepseek-v4-flash`, and disables thinking for concise report generation. Neither route sets an application-level output-token ceiling. Generic OpenAI-compatible endpoints are available only through a preconfigured HTTPS base URL and secret.
+Gemini defaults to `gemini-3.5-flash` with low thinking. DeepSeek uses its official OpenAI-compatible Chat Completions endpoint, defaults to `deepseek-v4-flash`, and disables thinking. Neither route sets an application-level output-token ceiling. Generic OpenAI-compatible endpoints are available only through a preconfigured HTTPS base URL and secret.
 
-Every provider must return a normally completed response. The Worker validates a short four-section schema: Today's Verdict, at most three Opportunities, Market and AI-Cycle Context, and What Could Change the Call. Each opportunity must state strategic position, today's action, confidence, entry/exit condition, verified catalyst, downside, and invalidation. Buy/Sell calls require a verified fresh event or same-day earnings; a large price move without verified news is Watch-only. Trim calls require verified evidence or an extreme valuation/range setup. The validator also rejects unsupported demand, CapEx-cycle, or institutional-flow claims.
+Every provider must return a normally completed response. The Worker validates a six-section schema: Today's Verdict, Decision Reasoning, Opportunities, Rejected Candidates, Market and AI-Cycle Context, and What Could Change the Call. The reasoning section must disclose the universe searched, gate, and conclusion. Each opportunity must explain admission, possible mispricing, evidence for and against, strategic position, today's action, confidence, entry/exit condition, catalyst, risk/reward, and invalidation. Buy/Sell calls require a material fresh event or same-day earnings; a large price move without material news is Watch-only. Trim calls require that evidence or an extreme valuation/range setup. The validator also rejects unsupported demand, CapEx-cycle, or institutional-flow claims.
 
-The default report deliberately omits the sector scorecard, AI dashboard, and full watchlist. Those calculations remain in the stored snapshot for diagnostics; the delivered report includes only facts that can change today's trade decision.
+The report omits exhaustive sector and full-watchlist tables, but it is not length-constrained when additional reasoning improves the decision. It includes the strongest rejected setups so a No-Trade verdict remains auditable.
 
 AI-cycle demand and CapEx rows intentionally remain `Insufficient Data / Unclear` until the snapshot contains direct indicators such as hyperscaler CapEx guidance, backlog, utilization, or analyst estimate revisions. Daily stock returns are momentum inputs, not evidence of end demand.
 
@@ -151,7 +152,12 @@ R2 object layout:
 
 ## Configuration
 
-- `WATCHLIST`: comma-separated tickers.
+- `WATCHLIST`: comma-separated core holdings and priority tickers. It is always researched but no longer defines the complete discovery universe.
+- `DISCOVERY_ENABLED`: set to `false` to disable automatic movers discovery; defaults to `true`.
+- `DISCOVERY_LIMIT`: maximum liquid, relevant full-market movers enriched with news and sent to the opportunity gate; defaults to 6 and is capped at 25.
+- `DISCOVERY_MIN_MARKET_CAP`: minimum market capitalization for discovery; defaults to $250 million.
+- `DISCOVERY_MIN_DOLLAR_VOLUME`: minimum current-session price × volume; defaults to $5 million.
+- `SEC_REFRESH_LIMIT`: maximum uncached or expired SEC network refreshes per invocation; defaults to 3. Fresh cache entries are reused, and an expired entry remains available as stale data when the refresh budget is exhausted. Together with the default discovery limit, this keeps the full report pipeline within the Workers Free 50-external-subrequest ceiling.
 - `RUN_TOKEN_REQUIRED`: keep `true` for public workers.dev deployments.
 - `SEC_USER_AGENT`: optional descriptive SEC user agent with a contact email.
 - `YAHOO_USER_AGENT`: optional user agent for Yahoo quote and market-context requests.

@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildCalendarContext, buildMarketContext, buildValuationHistory, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
-  normalizeNasdaqMacroCalendar, normalizeYahooNews, marketSession, normalizeYahooChart, percentile, quarterlyFacts,
+  buildCalendarContext, buildDiscoveryContext, buildMarketContext, buildSnapshot, buildValuationHistory, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
+  normalizeNasdaqMacroCalendar, normalizeNasdaqStockUniverse, normalizeYahooNews, marketSession, normalizeYahooChart, percentile, quarterlyFacts,
   reportedGrowth, toBrief, zonedParts,
 } from "../src/index.js";
 
@@ -67,6 +67,70 @@ test("company news keeps only fresh symbol-linked headlines", () => {
   assert.equal(news.length, 1);
   assert.deepEqual(news[0].symbols, ["NVDA"]);
   assert.equal(news[0].source, "Reuters");
+  assert.equal(news[0].material, true);
+});
+
+test("Nasdaq discovery normalizes lesser-known liquid technology stocks", () => {
+  const rows = normalizeNasdaqStockUniverse({ data: { rows: [{
+    symbol: "LITE", name: "Lumentum Holdings", country: "United States", sector: "Technology",
+    industry: "Communication Equipment", lastsale: "$80.00", pctchange: "7.5%",
+    volume: "2,000,000", marketCap: "5,000,000,000",
+  }] } });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].symbol, "LITE");
+  assert.equal(rows[0].dollarVolume, 160_000_000);
+  assert.equal(rows[0].changePercent, 7.5);
+});
+
+test("discovery excludes the core watchlist and enforces liquidity", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/screener/stocks")) return new Response(JSON.stringify({ data: { asOf: "2026-08-05", rows: [
+      { symbol: "NVDA", name: "NVIDIA", sector: "Technology", industry: "Semiconductors", lastsale: "$200", pctchange: "4%", volume: "5000000", marketCap: "5000000000000" },
+      { symbol: "LITE", name: "Lumentum", sector: "Technology", industry: "Communication Equipment", lastsale: "$80", pctchange: "8%", volume: "2000000", marketCap: "5000000000" },
+      { symbol: "TINY", name: "Tiny Software", sector: "Technology", industry: "Software", lastsale: "$1", pctchange: "30%", volume: "10000", marketCap: "50000000" },
+    ] } }), { headers: { "content-type": "application/json" } });
+    if (url.includes("/finance/search")) return new Response(JSON.stringify({ news: [{ title: "Lumentum announces AI optics contract", link: "https://example.test/lite", publisher: "Reuters", providerPublishTime: 1785930000 }] }), { headers: { "content-type": "application/json" } });
+    throw new Error(`Unexpected fetch ${url}`);
+  };
+  try {
+    const discovery = await buildDiscoveryContext({}, new Date("2026-08-05T13:35:00Z"), ["NVDA"]);
+    assert.deepEqual(discovery.candidates.map((row) => row.symbol), ["LITE"]);
+    assert.equal(discovery.candidates[0].news[0].material, true);
+    assert.equal(discovery.filters.minMarketCap, 250_000_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("cold SEC cache obeys the per-invocation external refresh budget", async () => {
+  const originalFetch = globalThis.fetch;
+  let secCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.startsWith("https://query1.finance.yahoo.com")) return new Response(JSON.stringify({ chart: { result: [{
+      meta: { regularMarketPrice: 100, regularMarketPreviousClose: 99, currency: "USD" },
+      timestamp: [1785849300, 1785935700], indicators: { quote: [{ close: [99, 100], volume: [1000, 2000] }] },
+    }] } }), { headers: { "content-type": "application/json" } });
+    if (url.startsWith("https://query2.finance.yahoo.com")) return new Response(JSON.stringify({ news: [] }), { headers: { "content-type": "application/json" } });
+    if (url.startsWith("https://data.sec.gov")) {
+      secCalls += 1;
+      return new Response(JSON.stringify({ facts: { "us-gaap": {} } }), { headers: { "content-type": "application/json" } });
+    }
+    if (url.startsWith("https://api.nasdaq.com")) return new Response(JSON.stringify({ data: { rows: [] } }), { headers: { "content-type": "application/json" } });
+    if (url.startsWith("https://www.federalreserve.gov")) return new Response("<rss><channel></channel></rss>");
+    throw new Error(`Unexpected fetch ${url}`);
+  };
+  try {
+    const snapshot = await buildSnapshot({
+      WATCHLIST: "NVDA,AMZN,MSFT,ANET,AVGO", DISCOVERY_ENABLED: "false", SEC_REFRESH_LIMIT: "2",
+    }, new Date("2026-08-05T13:35:00Z"), { force: true });
+    assert.equal(secCalls, 2);
+    assert.equal(snapshot.watchlist.filter((row) => row.fundamentals?.reason?.includes("refresh budget exhausted")).length, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("market session labels premarket, regular trading, after-hours, and closed", () => {
@@ -217,4 +281,27 @@ test("brief computes deterministic stock and sector actions from supplied metric
   assert.equal(brief.decisionFramework.sectorScorecard.GPU.action, "Buy");
   assert.equal(brief.decisionFramework.aiCycle["GPU Demand"].rating, "Insufficient Data");
   assert.equal(brief.opportunityGate.candidates.length, 0);
+});
+
+test("brief admits a liquid discovery name with a material event outside the core watchlist", () => {
+  const brief = toBrief({
+    generatedAt: "2026-08-05T15:00:00.000Z", session: "regular_trading",
+    coverage: { requested: 1, succeeded: 1, failed: 0 },
+    watchlist: [{ symbol: "NVDA", price: 100, changePercent: 0.5, yearLow: 50, yearHigh: 110, positionIn52WeekRange: 83, missing: false, valuation: null }],
+    discovery: {
+      status: "available", source: "Nasdaq full-market stock screener (unofficial public endpoint)", scanned: 7000,
+      eligibleAfterLiquidityAndRelevance: 1, filters: { minMarketCap: 250_000_000, minDollarVolume: 5_000_000 },
+      candidates: [{
+        symbol: "LITE", name: "Lumentum", price: 80, changePercent: 8, yearLow: 40, yearHigh: 100,
+        positionIn52WeekRange: 66.67, marketCap: 5_000_000_000, dollarVolume: 160_000_000,
+        relativeVolume: null, sector: "Technology", industry: "Communication Equipment", screen: "nasdaq_full_market",
+        discoveryScore: 14, news: [{ title: "Lumentum announces AI optics contract", url: "https://example.test/lite", verified: true, material: true, symbols: ["LITE"] }], missing: false,
+      }],
+    },
+    news: { company: { items: [] } },
+  });
+  assert.equal(brief.discovery.candidates[0].symbol, "LITE");
+  assert.equal(brief.opportunityGate.candidates[0].symbol, "LITE");
+  assert.equal(brief.opportunityGate.candidates[0].setup.verifiedCatalyst, true);
+  assert.match(brief.opportunityGate.candidates[0].risk, /fundamentals and valuation not yet verified/);
 });
