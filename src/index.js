@@ -228,13 +228,55 @@ export async function sendReportEmail(env, reportDate, markdown) {
 
 export async function sendReportWebhook(env, reportDate, markdown) {
   if (!env.WEBHOOK_URL) return { skipped: true, reason: "webhook_not_configured" };
-  const response = await fetch(env.WEBHOOK_URL, {
+  if (isDiscordWebhook(env.WEBHOOK_URL)) {
+    const chunks = discordMessageChunks(reportDate, markdown);
+    for (const [index, content] of chunks.entries()) {
+      await postWebhookJson(env.WEBHOOK_URL, { content }, `Discord webhook delivery failed (${index + 1}/${chunks.length})`);
+    }
+    return { sent: true, provider: "discord", messages: chunks.length };
+  }
+  await postWebhookJson(env.WEBHOOK_URL, { date: reportDate, markdown }, "Webhook delivery failed");
+  return { sent: true, provider: "generic" };
+}
+
+async function postWebhookJson(url, payload, label) {
+  const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ date: reportDate, markdown }),
+    body: JSON.stringify(payload),
   });
-  if (!response.ok) throw new Error(`Webhook delivery failed (${response.status})`);
-  return { sent: true };
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`${label} (${response.status})${body ? `: ${body}` : ""}`);
+  }
+}
+
+function isDiscordWebhook(url) {
+  try {
+    const { hostname, pathname } = new URL(url);
+    return (hostname === "discord.com" || hostname === "discordapp.com")
+      && pathname.startsWith("/api/webhooks/");
+  } catch {
+    return false;
+  }
+}
+
+function discordMessageChunks(reportDate, markdown) {
+  const prefix = `**Growth Tech Morning Brief — ${reportDate}**\n`;
+  const maxLength = 1900;
+  const text = `${prefix}${markdown}`.trim();
+  if (text.length <= maxLength) return [text];
+  const chunks = [];
+  let remaining = markdown.trim();
+  while (remaining) {
+    const available = maxLength - prefix.length;
+    let chunk = remaining.slice(0, available);
+    const breakAt = chunk.lastIndexOf("\n\n");
+    if (breakAt > 200) chunk = chunk.slice(0, breakAt);
+    chunks.push(`${prefix}${chunk}`.trim());
+    remaining = remaining.slice(chunk.length).trim();
+  }
+  return chunks;
 }
 
 async function settleDelivery(delivery) {

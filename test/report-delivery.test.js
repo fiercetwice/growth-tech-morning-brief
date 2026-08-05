@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { compactSnapshotForReport, runScheduledBrief, sendReportEmail } from "../src/index.js";
+import { compactSnapshotForReport, runScheduledBrief, sendReportEmail, sendReportWebhook } from "../src/index.js";
 
 function r2(initial = {}) {
   const objects = new Map(Object.entries(initial));
@@ -90,7 +90,7 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
   assert.equal(result.report.generated, true);
   assert.equal(result.report.stored, true);
   assert.deepEqual(result.report.email, { sent: true, id: "email_123" });
-  assert.deepEqual(result.report.webhook, { sent: true });
+  assert.deepEqual(result.report.webhook, { sent: true, provider: "generic" });
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), "# Growth Tech Morning Brief\n\nAction: Hold NVDA.");
   assert.equal(bucket.objects.get("reports/latest.md"), "# Growth Tech Morning Brief\n\nAction: Hold NVDA.");
 });
@@ -150,6 +150,25 @@ test("off-time daylight-saving cron trigger skips snapshots and reports", async 
 test("email delivery is skipped unless all Resend settings are present", async () => {
   const result = await sendReportEmail({ RESEND_API_KEY: "key" }, "2026-08-05", "markdown");
   assert.deepEqual(result, { skipped: true, reason: "email_not_configured" });
+});
+
+test("Discord webhooks receive content messages instead of generic JSON", async () => {
+  const longMarkdown = `# Report\n\n${"AI-cycle signal. ".repeat(150)}`;
+  const env = { WEBHOOK_URL: "https://discord.com/api/webhooks/123/token" };
+
+  const result = await withFetchStub((url, init) => {
+    assert.equal(url, env.WEBHOOK_URL);
+    const body = JSON.parse(init.body);
+    assert.equal("content" in body, true);
+    assert.equal("markdown" in body, false);
+    assert.match(body.content, /^\*\*Growth Tech Morning Brief — 2026-08-05\*\*/);
+    assert.ok(body.content.length <= 1900);
+    return new Response(null, { status: 204 });
+  }, () => sendReportWebhook(env, "2026-08-05", longMarkdown));
+
+  assert.equal(result.sent, true);
+  assert.equal(result.provider, "discord");
+  assert.ok(result.messages > 1);
 });
 
 test("compact report payload excludes raw history while retaining volume leaders", () => {

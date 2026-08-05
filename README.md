@@ -53,7 +53,7 @@ Configure these secrets or environment variables outside the repository:
 
 - `GEMINI_API_KEY`: required for AI report generation.
 - `RESEND_API_KEY`, `REPORT_TO_EMAIL`, `REPORT_FROM_EMAIL`: optional email delivery through Resend.
-- `WEBHOOK_URL`: optional webhook delivery; retained alongside email delivery.
+- `WEBHOOK_URL`: optional webhook delivery; Discord webhook URLs receive Markdown as Discord `content`, while other URLs receive `{ date, markdown }` JSON.
 
 Report storage is independent from delivery. Email or webhook failures are logged and returned in scheduled-run diagnostics without deleting or invalidating the stored R2 report.
 
@@ -82,7 +82,7 @@ R2 object layout:
 - `RESEND_API_KEY`: optional Resend API key for email delivery.
 - `REPORT_TO_EMAIL`: optional report recipient email address.
 - `REPORT_FROM_EMAIL`: optional verified sender address for Resend.
-- `WEBHOOK_URL`: optional endpoint that receives the generated Markdown report.
+- `WEBHOOK_URL`: optional endpoint that receives the generated Markdown report. Discord webhook URLs are supported directly.
 
 Two UTC cron expressions cover daylight-saving time. The Worker checks New York local time, so only the 09:35 ET trigger runs.
 
