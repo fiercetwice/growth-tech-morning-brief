@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { compactSnapshotForReport, runScheduledBrief, sendReportEmail, sendReportWebhook } from "../src/index.js";
+import worker, { compactSnapshotForReport, runScheduledBrief, sendReportEmail, sendReportWebhook, validateReportCompleteness } from "../src/index.js";
 
 function r2(initial = {}) {
   const objects = new Map(Object.entries(initial));
@@ -44,22 +44,42 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
   return [
     "# Growth Tech Morning Brief",
     "",
-    "## Executive Summary",
-    `${symbolText} remains the focus. The setup is concise, complete, and suitable for review. ${detail}`,
+    "# Executive Summary",
+    "- **AI Cycle:** Positive and stable based on supplied price and valuation data.",
+    "- **Catalyst:** unavailable — not in snapshot.",
+    "- **Risk:** Elevated valuation and adverse price momentum are the principal observable risks.",
+    `- **Best Opportunity:** ${symbols[0]} merits monitoring. ${detail}`,
+    "- **Avoid:** Avoid chasing unsupported narratives or unavailable catalysts.",
     "",
-    "## Overnight and Market Context",
-    `Market context is mixed with available data only. ${symbolText} is discussed with no invented macro claims.`,
+    "# Overnight and Market Context",
+    `- **Sourced Facts:** ${symbolText} has supplied price, daily change, volume, range, and trailing valuation data. Futures, rates, USD, oil, macro events, and earnings are unavailable.`,
+    "- **Analysis:** Market context is mixed; no unsupported macro or earnings claim is made.",
     "",
-    "## AI Cycle Dashboard",
-    `AI cycle signals are summarized from the supplied watchlist. ${symbolText} has observable price and volume inputs.`,
+    "# AI Cycle Dashboard",
+    "| Segment | Rating | Trend | Sourced Facts | Analysis |",
+    "|---|---|---|---|---|",
+    "| Hyperscaler AI CapEx | n/a | n/a | unavailable | No inference without capex data. |",
+    "| GPU Demand | Positive | Stable | Supplied watchlist price data | Price action is a limited demand proxy. |",
+    "| AI Cloud | Neutral | Stable | Supplied watchlist price data | Mixed setup. |",
+    "| Enterprise AI | n/a | n/a | unavailable | No inference. |",
+    "| Inference | n/a | n/a | unavailable | No inference. |",
     "",
-    "## Sector Scorecard",
-    `Sector scorecard highlights leadership, laggards, and valuation discipline. ${symbolText} is covered in this assessment.`,
+    "# Sector Scorecard",
+    "| Sector | Fundamentals | Valuation | Momentum | Action | Sourced Facts | Analysis |",
+    "|---|---|---|---|---|---|---|",
+    "| GPU | n/a | Mixed | Positive | Hold | Supplied watchlist data | Momentum is constructive. |",
+    "| AI Cloud | n/a | Mixed | Neutral | Wait | Supplied watchlist data | Await more evidence. |",
+    "| GPU Cloud | n/a | Mixed | Neutral | Wait | Supplied watchlist data | Await more evidence. |",
+    "| Networking | n/a | Mixed | Neutral | Hold | Supplied watchlist data | Balanced. |",
+    "| Cooling | n/a | Mixed | Neutral | Hold | Supplied watchlist data | Balanced. |",
+    "| Power | n/a | Mixed | Neutral | Wait | Supplied watchlist data | Balanced. |",
+    "| Cybersecurity | n/a | Mixed | Neutral | Hold | Supplied watchlist data | Balanced. |",
+    "| Cloud Software | n/a | Mixed | Neutral | Wait | Supplied watchlist data | Balanced. |",
     "",
-    "## Watchlist",
-    ...symbols.map((symbol) => `- ${symbol}: Review price move, valuation percentile, and available volume context before acting.`),
-    "",
-    "Conclusion: The report is intentionally concise but complete.",
+    "# Watchlist",
+    "| Symbol | Price | Daily Change | 52W Position | Forward P/E or P/S | Historical Valuation Percentile | Catalyst | Risk | Action |",
+    "|---|---:|---:|---:|---:|---:|---|---|---|",
+    ...symbols.map((symbol) => `| ${symbol} | $110 | +10% | 50% | n/a — not in snapshot | n/a | unavailable | Valuation and momentum risk | Hold |`),
   ].join("\n");
 }
 
@@ -107,8 +127,8 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
       assert.equal(geminiUrl.searchParams.get("key"), "gemini-test-key");
       assert.equal(init.headers["x-goog-api-key"], undefined);
       const body = JSON.parse(init.body);
-      assert.match(body.contents[0].parts[0].text, /institutional-style Growth Tech Morning Brief/);
-      assert.match(body.contents[0].parts[0].text, /volume spikes/);
+      assert.match(body.contents[0].parts[0].text, /institutional sell-side Growth Tech Morning Brief/);
+      assert.match(body.contents[0].parts[0].text, /Forward P\/E or P\/S/);
       assert.equal("maxOutputTokens" in body.generationConfig, false);
       assert.deepEqual(body.generationConfig.thinkingConfig, { thinkingLevel: "low" });
       return responseJson(geminiReport(markdown, "STOP", { candidatesTokenCount: 8192, thoughtsTokenCount: 12, totalTokenCount: 8204 }));
@@ -203,6 +223,124 @@ test("Gemini model can be overridden with GEMINI_MODEL", async () => {
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
 });
 
+test("DeepSeek route uses the official OpenAI-compatible endpoint without an output ceiling", async () => {
+  const bucket = r2();
+  const markdown = completeReport(["NVDA"], "DeepSeek generated this complete report.");
+  const env = {
+    WATCHLIST: "NVDA",
+    AI_PROVIDER: "deepseek",
+    DEEPSEEK_API_KEY: "deepseek-test-key",
+    BRIEF_BUCKET: bucket,
+  };
+
+  const result = await withFetchStub((url, init) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    assert.equal(url, "https://api.deepseek.com/chat/completions");
+    assert.equal(init.headers.authorization, "Bearer deepseek-test-key");
+    const body = JSON.parse(init.body);
+    assert.equal(body.model, "deepseek-v4-flash");
+    assert.deepEqual(body.thinking, { type: "disabled" });
+    assert.equal("max_tokens" in body, false);
+    assert.match(body.messages[0].content, /Hyperscaler AI CapEx/);
+    return responseJson({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: markdown } }],
+      usage: { completion_tokens: 1400, total_tokens: 3200 },
+    });
+  }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
+
+  assert.equal(result.report.generated, true);
+  assert.equal(result.report.aiProvider, "deepseek");
+  assert.equal(result.report.aiModel, "deepseek-v4-flash");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.aiProvider, "deepseek");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.aiModel, "deepseek-v4-flash");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.outputTokenCount, "1400");
+});
+
+test("authenticated run-report can route a forced regeneration to a selected DeepSeek model", async () => {
+  const bucket = r2({ "reports/2026-08-05.md": "old report", "reports/latest.md": "old report" });
+  const markdown = completeReport(["NVDA"], "One-off DeepSeek route completed.");
+  const env = {
+    RUN_TOKEN_REQUIRED: "true",
+    RUN_TOKEN: "secret",
+    WATCHLIST: "NVDA",
+    GEMINI_API_KEY: "gemini-key",
+    DEEPSEEK_API_KEY: "deepseek-key",
+    BRIEF_BUCKET: bucket,
+  };
+
+  const response = await withFetchStub((url, init) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    assert.equal(url, "https://api.deepseek.com/chat/completions");
+    assert.equal(JSON.parse(init.body).model, "deepseek-v4-pro");
+    return responseJson({ choices: [{ finish_reason: "stop", message: { content: markdown } }] });
+  }, () => worker.fetch(new Request("https://example.test/run-report", {
+    method: "POST",
+    headers: { authorization: "Bearer secret", "content-type": "application/json" },
+    body: JSON.stringify({ forceRegenerate: true, provider: "deepseek", model: "deepseek-v4-pro" }),
+  }), env));
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.report.aiProvider, "deepseek");
+  assert.equal(body.report.aiModel, "deepseek-v4-pro");
+  assert.equal(bucket.objects.get("reports/latest.md"), markdown);
+});
+
+test("run-report rejects provider/model overrides unless regeneration is explicit", async () => {
+  const response = await worker.fetch(new Request("https://example.test/run-report", {
+    method: "POST",
+    headers: { authorization: "Bearer secret", "content-type": "application/json" },
+    body: JSON.stringify({ provider: "deepseek", model: "deepseek-v4-flash" }),
+  }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "secret" });
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    error: "force_regenerate_required",
+    message: "provider/model overrides require forceRegenerate=true",
+  });
+});
+
+test("openai-compatible route uses only the preconfigured HTTPS base URL", async () => {
+  const markdown = completeReport(["NVDA"], "Compatible endpoint generated this report.");
+  const result = await withFetchStub((url, init) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    assert.equal(url, "https://models.example.test/v1/chat/completions");
+    const body = JSON.parse(init.body);
+    assert.equal(body.model, "research-model");
+    assert.equal("thinking" in body, false);
+    return responseJson({ choices: [{ finish_reason: "stop", message: { content: markdown } }] });
+  }, () => runScheduledBrief({
+    WATCHLIST: "NVDA",
+    AI_PROVIDER: "openai-compatible",
+    OPENAI_COMPAT_API_KEY: "compat-key",
+    OPENAI_COMPAT_BASE_URL: "https://models.example.test/v1/",
+    OPENAI_COMPAT_MODEL: "research-model",
+    BRIEF_BUCKET: r2(),
+  }, new Date("2026-08-05T13:35:00.000Z")));
+
+  assert.equal(result.report.aiProvider, "openai-compatible");
+  assert.equal(result.report.aiModel, "research-model");
+});
+
+test("strict schema rejects a market recap that only has the five section names", () => {
+  const recap = [
+    "# Executive Summary", "Market action is mixed.",
+    "# Overnight and Market Context", "NVDA moved higher.",
+    "# AI Cycle Dashboard", "Hardware is bullish.",
+    "# Sector Scorecard", "Networking leads.",
+    "# Watchlist", "NVDA: $110 (+10%).",
+  ].join("\n\n");
+  const validation = validateReportCompleteness(recap, ["NVDA"]);
+  assert.equal(validation.ok, false);
+  assert.ok(validation.errors.includes("missing Executive Summary field: AI Cycle"));
+  assert.ok(validation.errors.includes("missing AI Cycle Dashboard row: Hyperscaler AI CapEx"));
+  assert.ok(validation.errors.includes("missing Sector Scorecard row: Cloud Software"));
+  assert.ok(validation.errors.includes("missing Watchlist column: Catalyst"));
+});
+
 test("Gemini 404 diagnostics include status and model without exposing the API key", async () => {
   const env = {
     WATCHLIST: "NVDA",
@@ -219,7 +357,7 @@ test("Gemini 404 diagnostics include status and model without exposing the API k
     throw new Error(`Unexpected fetch ${url}`);
   }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
 
-  assert.match(result.report.error, /Gemini report failed \(404, model: gemini-3.5-flash, finishReason: missing\):/);
+  assert.match(result.report.error, /AI report failed \(404, provider: gemini, model: gemini-3.5-flash, finishReason: missing\):/);
   assert.match(result.report.error, /models\/gemini-old is unavailable for \[redacted\]/);
   assert.doesNotMatch(result.report.error, /gemini-secret-key/);
 });
@@ -234,6 +372,7 @@ test("successful Gemini generation stores the report and delivers Discord", asyn
     BRIEF_BUCKET: bucket,
   };
 
+  const discordContents = [];
   const result = await withFetchStub((url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
@@ -243,18 +382,19 @@ test("successful Gemini generation stores the report and delivers Discord", asyn
       return responseJson(geminiReport(markdown));
     }
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
-    assert.match(JSON.parse(init.body).content, /Discord delivery receives/);
+    discordContents.push(JSON.parse(init.body).content);
     return new Response(null, { status: 204 });
   }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
 
   assert.equal(result.report.generated, true);
   assert.equal(result.report.geminiModel, "gemini-3.5-flash");
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
+  assert.match(discordContents.join("\n"), /Discord delivery receives/);
   assert.deepEqual(result.report.webhook, {
     sent: true,
     provider: "discord",
-    messages: 1,
-    chunks: { expected: 1, delivered: 1, failed: 0 },
+    messages: discordContents.length,
+    chunks: { expected: discordContents.length, delivered: discordContents.length, failed: 0 },
   });
 });
 
@@ -382,12 +522,13 @@ test("forceRegenerate replaces an existing incomplete report after validation su
     BRIEF_BUCKET: bucket,
   };
 
+  const discordContents = [];
   const response = await withFetchStub((url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
     if (url.startsWith("https://generativelanguage.googleapis.com")) return responseJson(geminiReport(markdown));
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
-    assert.match(JSON.parse(init.body).content, /Regeneration produces/);
+    discordContents.push(JSON.parse(init.body).content);
     return new Response(null, { status: 204 });
   }, () => worker.fetch(new Request("https://example.test/run-report", {
     method: "POST",
@@ -396,6 +537,7 @@ test("forceRegenerate replaces an existing incomplete report after validation su
   }), env));
 
   assert.equal(response.status, 200);
+  assert.match(discordContents.join("\n"), /Regeneration produces/);
   const body = await response.json();
   assert.equal(body.report.replaced, true);
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
@@ -540,8 +682,8 @@ test("Discord 429 responses are retried with the requested delay", async () => {
     return new Response(null, { status: 204 });
   }, () => sendReportWebhook(env, "2026-08-05", completeReport(["NVDA"])));
 
-  assert.equal(calls, 2);
-  assert.deepEqual(result.chunks, { expected: 1, delivered: 1, failed: 0 });
+  assert.equal(calls, result.messages + 1);
+  assert.deepEqual(result.chunks, { expected: result.messages, delivered: result.messages, failed: 0 });
 });
 
 test("deliver-latest requires authorization", async () => {
