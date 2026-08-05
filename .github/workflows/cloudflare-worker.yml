@@ -83,7 +83,11 @@ jobs:
             sleep 5
           done
 
-          response="$(curl --fail-with-body --silent --show-error \
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          if ! http_status="$(curl --fail-with-body --silent --show-error \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
             --connect-timeout 15 \
             --max-time 300 \
             --request POST \
@@ -96,20 +100,23 @@ jobs:
               "provider": "deepseek",
               "model": "deepseek-v4-flash",
               "reportMode": "verbose"
-            }')"
+            }')"; then
+            echo "::error::The /run-report request failed (HTTP ${http_status:-unknown})."
+            if jq -e . "$response_file" > /dev/null 2>&1; then
+              jq '{ error, reportError: .report.error, webhook: .report.webhook }' "$response_file"
+            else
+              echo "The Worker returned a non-JSON response ($(wc -c < "$response_file") bytes)."
+            fi
+            exit 1
+          fi
 
-          jq -e --arg expected_version "$expected_version" '
-            .report.generated == true and
-            .report.stored == true and
-            .report.aiProvider == "deepseek" and
-            .report.aiModel == "deepseek-v4-flash" and
-            .report.reportMode == "verbose" and
-            .report.reportEngineVersion == $expected_version and
-            .report.generation.validation == "passed" and
-            .report.webhook.sent == true
-          ' <<< "$response" > /dev/null
+          if ! jq -e . "$response_file" > /dev/null 2>&1; then
+            echo "::error::The /run-report request returned invalid JSON (HTTP $http_status, $(wc -c < "$response_file") bytes)."
+            exit 1
+          fi
+          response="$(< "$response_file")"
 
-          jq '{
+          summary="$(jq '{
             date: .report.date,
             generated: .report.generated,
             stored: .report.stored,
@@ -119,4 +126,33 @@ jobs:
             reportEngineVersion: .report.reportEngineVersion,
             validation: .report.generation.validation,
             webhook: .report.webhook
-          }' <<< "$response"
+          }' <<< "$response")"
+          echo "$summary"
+          {
+            echo "### Post-deploy report smoke test"
+            echo '```json'
+            echo "$summary"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failures="$(jq -r --arg expected_version "$expected_version" '[
+            if .report.generated == true then empty else "Report generation did not complete: \(.report.error // "no error reported")" end,
+            if .report.stored == true then empty else "Generated report was not stored" end,
+            if .report.aiProvider == "deepseek" then empty else "Unexpected AI provider: \(.report.aiProvider // "missing")" end,
+            if .report.aiModel == "deepseek-v4-flash" then empty else "Unexpected AI model: \(.report.aiModel // "missing")" end,
+            if .report.reportMode == "verbose" then empty else "Unexpected report mode: \(.report.reportMode // "missing")" end,
+            if .report.reportEngineVersion == $expected_version then empty else "Stale report engine: expected \($expected_version), received \(.report.reportEngineVersion // "missing")" end,
+            if .report.generation.validation == "passed" then empty else "Report validation failed: \(.report.generation.validation // "missing")" end,
+            if .report.webhook.sent == true then empty else "Discord delivery incomplete: \(.report.webhook.chunks.delivered // 0)/\(.report.webhook.chunks.expected // "unknown") chunks delivered; \(.report.webhook.error // .report.webhook.reason // "no error reported")" end
+          ] | .[]' <<< "$response")"
+
+          if [ -n "$failures" ]; then
+            while IFS= read -r failure; do
+              echo "::error::$failure"
+              echo "- ❌ $failure" >> "$GITHUB_STEP_SUMMARY"
+            done <<< "$failures"
+            exit 1
+          fi
+
+          echo "Post-deploy report test passed."
+          echo "- ✅ All generation, storage, schema, and delivery checks passed." >> "$GITHUB_STEP_SUMMARY"
