@@ -45,11 +45,11 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "# Growth Tech Morning Brief",
     "",
     "# Executive Summary",
-    "- **AI Cycle:** Positive and stable based on supplied price and valuation data.",
+    "- **AI Cycle:** Insufficient data; price action cannot establish the cycle.",
     "- **Catalyst:** unavailable — not in snapshot.",
     "- **Risk:** Elevated valuation and adverse price momentum are the principal observable risks.",
-    `- **Best Opportunity:** ${symbols[0]} merits monitoring. ${detail}`,
-    "- **Avoid:** Avoid chasing unsupported narratives or unavailable catalysts.",
+    `- **Best Opportunity:** None — no stock meets the deterministic Buy rule. ${detail}`,
+    "- **Avoid:** None — no stock meets the deterministic Avoid rule.",
     "",
     "# Overnight and Market Context",
     `- **Sourced Facts:** ${symbolText} has supplied price, daily change, volume, range, and trailing valuation data.`,
@@ -64,23 +64,23 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "# AI Cycle Dashboard",
     "| Segment | Rating | Trend | Sourced Facts | Analysis |",
     "|---|---|---|---|---|",
-    "| Hyperscaler AI CapEx | n/a | n/a | unavailable | No inference without capex data. |",
-    "| GPU Demand | Positive | Stable | Supplied watchlist price data | Price action is a limited demand proxy. |",
-    "| AI Cloud | Neutral | Stable | Supplied watchlist price data | Mixed setup. |",
-    "| Enterprise AI | n/a | n/a | unavailable | No inference. |",
-    "| Inference | n/a | n/a | unavailable | No inference. |",
+    "| Hyperscaler AI CapEx | Insufficient Data | Unclear | unavailable | No inference without capex data. |",
+    "| GPU Demand | Insufficient Data | Unclear | Supplied watchlist price data | Price action measures momentum only. |",
+    "| AI Cloud | Insufficient Data | Unclear | Supplied watchlist price data | No demand inference. |",
+    "| Enterprise AI | Insufficient Data | Unclear | unavailable | No inference. |",
+    "| Inference | Insufficient Data | Unclear | unavailable | No inference. |",
     "",
     "# Sector Scorecard",
     "| Sector | Fundamentals | Valuation | Momentum | Action | Sourced Facts | Analysis |",
     "|---|---|---|---|---|---|---|",
-    "| GPU | n/a | Mixed | Positive | Hold | Supplied watchlist data | Momentum is constructive. |",
-    "| AI Cloud | n/a | Mixed | Neutral | Wait | Supplied watchlist data | Await more evidence. |",
-    "| GPU Cloud | n/a | Mixed | Neutral | Wait | Supplied watchlist data | Await more evidence. |",
-    "| Networking | n/a | Mixed | Neutral | Hold | Supplied watchlist data | Balanced. |",
-    "| Cooling | n/a | Mixed | Neutral | Hold | Supplied watchlist data | Balanced. |",
-    "| Power | n/a | Mixed | Neutral | Wait | Supplied watchlist data | Balanced. |",
-    "| Cybersecurity | n/a | Mixed | Neutral | Hold | Supplied watchlist data | Balanced. |",
-    "| Cloud Software | n/a | Mixed | Neutral | Wait | Supplied watchlist data | Balanced. |",
+    "| GPU | Unavailable | Unavailable | Positive | Hold | Supplied watchlist data | Momentum is constructive. |",
+    "| AI Cloud | Unavailable | Unavailable | Unavailable | Wait | Supplied watchlist data | Await more evidence. |",
+    "| GPU Cloud | Unavailable | Unavailable | Unavailable | Wait | Supplied watchlist data | Await more evidence. |",
+    "| Networking | Unavailable | Unavailable | Unavailable | Wait | Supplied watchlist data | Balanced. |",
+    "| Cooling | Unavailable | Unavailable | Unavailable | Wait | Supplied watchlist data | Balanced. |",
+    "| Power | Unavailable | Unavailable | Unavailable | Wait | Supplied watchlist data | Balanced. |",
+    "| Cybersecurity | Unavailable | Unavailable | Unavailable | Wait | Supplied watchlist data | Balanced. |",
+    "| Cloud Software | Unavailable | Unavailable | Unavailable | Wait | Supplied watchlist data | Balanced. |",
     "",
     "# Watchlist",
     "| Symbol | Price | Daily Change | 52W Position | Forward P/E or P/S | Historical Valuation Percentile | Catalyst | Risk | Action |",
@@ -358,6 +358,15 @@ test("strict schema rejects a market recap that only has the five section names"
   assert.ok(validation.errors.includes("missing AI Cycle Dashboard row: Hyperscaler AI CapEx"));
   assert.ok(validation.errors.includes("missing Sector Scorecard row: Cloud Software"));
   assert.ok(validation.errors.includes("missing Watchlist column: Catalyst"));
+});
+
+test("semantic validation rejects unsupported demand and CapEx conclusions", () => {
+  const markdown = completeReport(["NVDA"])
+    .replace("Insufficient data; price action cannot establish the cycle.", "GPU demand remains robust and the CapEx cycle is intact.");
+  const validation = validateReportCompleteness(markdown, ["NVDA"]);
+  assert.equal(validation.ok, false);
+  assert.ok(validation.errors.includes("unsupported demand claim"));
+  assert.ok(validation.errors.includes("unsupported CapEx-cycle claim"));
 });
 
 test("Gemini 404 diagnostics include status and model without exposing the API key", async () => {
