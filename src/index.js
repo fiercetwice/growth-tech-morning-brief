@@ -1,6 +1,7 @@
 const YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart";
 const SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts";
-const GEMINI_GENERATE_CONTENT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 
@@ -35,6 +36,26 @@ export default {
         return json({ error: "snapshot_failed", message: error instanceof Error ? error.message : String(error) }, 502);
       }
     }
+    if (path === "/deliver-latest" && request.method === "POST") {
+      if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
+      try {
+        return json(await deliverLatestReport(env, new Date()));
+      } catch (error) {
+        if (error?.code === "NO_REPORT_YET") return json({ error: "no_report_yet" }, 404);
+        console.error(error);
+        return json({ error: "delivery_failed", message: errorMessage(error) }, 502);
+      }
+    }
+    if (path === "/run-report" && request.method === "POST") {
+      if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
+      try {
+        const options = await request.json().catch(() => ({}));
+        return json(await runReportNow(env, new Date(), { forceDelivery: options?.forceDelivery === true }));
+      } catch (error) {
+        console.error(error);
+        return json({ error: "run_report_failed", message: errorMessage(error) }, 502);
+      }
+    }
     return json({ error: "not_found" }, 404);
   },
 
@@ -46,29 +67,51 @@ export default {
 export async function runScheduledBrief(env, now = new Date()) {
   const snapshot = await buildSnapshot(env, now);
   if (snapshot.skipped) return snapshot;
-  if (!env.BRIEF_BUCKET?.get || !env.BRIEF_BUCKET?.put) return { snapshot, report: { skipped: true, reason: "r2_not_configured" } };
+  const report = await generateOrDeliverReport(env, now, { retryPendingDelivery: true });
+  return { snapshot, report };
+}
+
+export async function runReportNow(env, now = new Date(), options = {}) {
+  const snapshot = await buildSnapshot(env, now, { force: true });
+  const report = await generateOrDeliverReport(env, now, { forceDelivery: options.forceDelivery === true });
+  return { snapshot, report };
+}
+
+async function generateOrDeliverReport(env, now, options = {}) {
+  if (!env.BRIEF_BUCKET?.get || !env.BRIEF_BUCKET?.put) return { skipped: true, reason: "r2_not_configured" };
 
   const reportDate = zonedParts(now, "America/New_York").date;
-  if (await env.BRIEF_BUCKET.get(`reports/${reportDate}.md`)) {
-    return { snapshot, report: { skipped: true, reason: "report_already_exists", date: reportDate } };
-  }
-
+  const reportObject = await env.BRIEF_BUCKET.get(`reports/${reportDate}.md`);
   const reportResults = { date: reportDate, generated: false, stored: false, email: null, webhook: null };
   try {
-    const latestObject = await env.BRIEF_BUCKET.get("snapshots/latest.json");
-    if (!latestObject) throw new Error("snapshots/latest.json was not found after snapshot creation");
-    const latestSnapshot = await latestObject.json();
-    const reportMarkdown = await generateGeminiReport(env, latestSnapshot);
-    await storeReport(env, reportDate, reportMarkdown);
-    reportResults.generated = true;
-    reportResults.stored = true;
-    reportResults.email = await settleDelivery(() => sendReportEmail(env, reportDate, reportMarkdown));
-    reportResults.webhook = await settleDelivery(() => sendReportWebhook(env, reportDate, reportMarkdown));
+    let reportMarkdown;
+    if (reportObject) {
+      reportMarkdown = await reportObject.text();
+      reportResults.reused = true;
+      reportResults.stored = true;
+    } else {
+      const latestObject = await env.BRIEF_BUCKET.get("snapshots/latest.json");
+      if (!latestObject) throw new Error("snapshots/latest.json was not found after snapshot creation");
+      const latestSnapshot = await latestObject.json();
+      const generatedReport = await generateGeminiReport(env, latestSnapshot);
+      reportMarkdown = generatedReport.markdown;
+      reportResults.geminiModel = generatedReport.model;
+      await storeReport(env, reportDate, reportMarkdown, { geminiModel: generatedReport.model });
+      reportResults.generated = true;
+      reportResults.stored = true;
+    }
+    if (!reportObject) {
+      reportResults.email = await settleDelivery(() => sendReportEmail(env, reportDate, reportMarkdown));
+    }
+    reportResults.webhook = await deliverReportWebhookOnce(env, reportDate, reportMarkdown, {
+      force: options.forceDelivery === true,
+      retryPending: options.retryPendingDelivery === true,
+    });
   } catch (error) {
     reportResults.error = errorMessage(error);
     console.error(error);
   }
-  return { snapshot, report: reportResults };
+  return reportResults;
 }
 
 export async function buildSnapshot(env, now = new Date(), options = {}) {
@@ -164,10 +207,12 @@ export function compactSnapshotForReport(snapshot) {
 
 export async function generateGeminiReport(env, snapshot) {
   if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not configured");
+  const model = selectedGeminiModel(env);
+  const endpoint = `${GEMINI_API_BASE}/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
   const compact = compactSnapshotForReport(snapshot);
-  const response = await fetch(GEMINI_GENERATE_CONTENT, {
+  const response = await fetch(endpoint, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({
       contents: [{
         role: "user",
@@ -177,10 +222,12 @@ export async function generateGeminiReport(env, snapshot) {
     }),
   });
   const body = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(`Gemini report failed (${response.status}): ${body?.error?.message ?? "unknown error"}`);
+  if (!response.ok) {
+    throw new Error(`Gemini report failed (${response.status}, model: ${model}): ${sanitizeGeminiMessage(body?.error?.message, env)}`);
+  }
   const text = body?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) throw new Error("Gemini report response did not include candidates[0].content.parts[0].text");
-  return text;
+  return { markdown: text, model };
 }
 
 function reportPrompt(compact) {
@@ -195,11 +242,89 @@ function reportPrompt(compact) {
   ].join("\n");
 }
 
-async function storeReport(env, reportDate, markdown) {
+function selectedGeminiModel(env) {
+  return env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+}
+
+function sanitizeGeminiMessage(message, env) {
+  const fallback = "unknown error";
+  const text = typeof message === "string" && message.trim() ? message : fallback;
+  return env.GEMINI_API_KEY ? text.replaceAll(env.GEMINI_API_KEY, "[redacted]") : text;
+}
+
+async function storeReport(env, reportDate, markdown, metadata = {}) {
+  const options = {
+    httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+    customMetadata: {
+      reportDate,
+      ...(metadata.geminiModel ? { geminiModel: metadata.geminiModel } : {}),
+    },
+  };
   await Promise.all([
-    env.BRIEF_BUCKET.put(`reports/${reportDate}.md`, markdown, { httpMetadata: { contentType: "text/markdown; charset=utf-8" } }),
-    env.BRIEF_BUCKET.put("reports/latest.md", markdown, { httpMetadata: { contentType: "text/markdown; charset=utf-8" } }),
+    env.BRIEF_BUCKET.put(`reports/${reportDate}.md`, markdown, options),
+    env.BRIEF_BUCKET.put("reports/latest.md", markdown, options),
   ]);
+}
+
+async function deliverLatestReport(env, now) {
+  if (!env.BRIEF_BUCKET?.get) return { skipped: true, reason: "r2_not_configured" };
+  const latestObject = await env.BRIEF_BUCKET.get("reports/latest.md");
+  if (!latestObject) {
+    const error = new Error("reports/latest.md was not found");
+    error.code = "NO_REPORT_YET";
+    throw error;
+  }
+  const markdown = await latestObject.text();
+  const reportDate = reportDateFromObject(latestObject) || zonedParts(now, "America/New_York").date;
+  const webhook = await settleDelivery(() => sendReportWebhook(env, reportDate, markdown));
+  if (env.BRIEF_BUCKET?.put) await storeDeliveryReceipt(env, reportDate, webhook);
+  return { date: reportDate, webhook };
+}
+
+async function deliverReportWebhookOnce(env, reportDate, markdown, options = {}) {
+  const receipt = await readDeliveryReceipt(env, reportDate);
+  if (!options.force && receipt?.discord?.sent) {
+    return { skipped: true, reason: "discord_already_delivered", receipt: receipt.discord };
+  }
+  if (!options.force && !options.retryPending && receipt) {
+    return { skipped: true, reason: "delivery_retry_not_requested" };
+  }
+  const webhook = await settleDelivery(() => sendReportWebhook(env, reportDate, markdown));
+  await storeDeliveryReceipt(env, reportDate, webhook);
+  return webhook;
+}
+
+async function readDeliveryReceipt(env, reportDate) {
+  const object = await env.BRIEF_BUCKET?.get?.(`deliveries/${reportDate}.json`);
+  if (!object) return null;
+  return object.json().catch(() => null);
+}
+
+async function storeDeliveryReceipt(env, reportDate, webhook) {
+  if (!env.BRIEF_BUCKET?.put) return;
+  const payload = {
+    date: reportDate,
+    updatedAt: new Date().toISOString(),
+    discord: {
+      sent: webhook?.provider === "discord" && webhook?.sent === true,
+      failed: webhook?.failed === true,
+      skipped: webhook?.skipped === true,
+      reason: webhook?.reason,
+      error: webhook?.error,
+      messages: webhook?.messages ?? null,
+      timestamp: new Date().toISOString(),
+    },
+  };
+  await env.BRIEF_BUCKET.put(`deliveries/${reportDate}.json`, JSON.stringify(payload, null, 2), {
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+  });
+}
+
+function reportDateFromObject(object) {
+  const metadataDate = object?.customMetadata?.reportDate || object?.httpMetadata?.reportDate;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(metadataDate)) return metadataDate;
+  if (object?.uploaded instanceof Date) return zonedParts(object.uploaded, "America/New_York").date;
+  return null;
 }
 
 export async function sendReportEmail(env, reportDate, markdown) {
@@ -227,16 +352,25 @@ export async function sendReportEmail(env, reportDate, markdown) {
 }
 
 export async function sendReportWebhook(env, reportDate, markdown) {
-  if (!env.WEBHOOK_URL) return { skipped: true, reason: "webhook_not_configured" };
-  if (isDiscordWebhook(env.WEBHOOK_URL)) {
+  const discordUrl = env.DISCORD_WEBHOOK_URL || (isDiscordWebhook(env.WEBHOOK_URL) ? env.WEBHOOK_URL : null);
+  if (discordUrl) {
     const chunks = discordMessageChunks(reportDate, markdown);
     for (const [index, content] of chunks.entries()) {
-      await postWebhookJson(env.WEBHOOK_URL, { content }, `Discord webhook delivery failed (${index + 1}/${chunks.length})`);
+      await postWebhookJson(discordUrl, discordPayload(content), `Discord webhook delivery failed (${index + 1}/${chunks.length})`);
     }
     return { sent: true, provider: "discord", messages: chunks.length };
   }
+  if (!env.WEBHOOK_URL) return { skipped: true, reason: "webhook_not_configured" };
   await postWebhookJson(env.WEBHOOK_URL, { date: reportDate, markdown }, "Webhook delivery failed");
   return { sent: true, provider: "generic" };
+}
+
+function discordPayload(content) {
+  return {
+    username: "Stock Analyst Bot",
+    avatar_url: "https://i.imgur.com/4M34hi2.png",
+    content,
+  };
 }
 
 async function postWebhookJson(url, payload, label) {
