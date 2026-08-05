@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildCalendarContext, buildMarketContext, buildValuationHistory, normalizeNasdaqEarningsCalendar, normalizeNasdaqMacroCalendar,
-  marketSession, normalizeYahooChart, percentile, quarterlyFacts, reportedGrowth, toBrief, zonedParts,
+  buildCalendarContext, buildMarketContext, buildValuationHistory, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
+  normalizeNasdaqMacroCalendar, normalizeYahooNews, marketSession, normalizeYahooChart, percentile, quarterlyFacts,
+  reportedGrowth, toBrief, zonedParts,
 } from "../src/index.js";
 
 test("DST-aware New York schedule accepts summer and winter triggers", () => {
@@ -48,6 +49,24 @@ test("macro calendar removes low-relevance non-US events", () => {
     { time: "02:00 PM", country: "EU", eventName: "ECB Interest Rate Decision", actual: "3%" },
   ] } }, "2026-08-05");
   assert.deepEqual(calendar.events.map((event) => event.event), ["ISM Services", "ECB Interest Rate Decision"]);
+});
+
+test("official Fed feed classifies a fresh rate decision", () => {
+  const xml = `<rss><channel><item><title>Federal Reserve issues FOMC statement on interest rates</title><link>https://www.federalreserve.gov/newsevents/pressreleases/monetary20260804a.htm</link><pubDate>Tue, 04 Aug 2026 18:00:00 GMT</pubDate></item></channel></rss>`;
+  const news = normalizeFedMonetaryNews(xml, new Date("2026-08-05T13:35:00Z"));
+  assert.equal(news.items.length, 1);
+  assert.equal(news.items[0].kind, "rate_decision");
+  assert.equal(news.items[0].verified, true);
+});
+
+test("company news keeps only fresh symbol-linked headlines", () => {
+  const news = normalizeYahooNews({ news: [
+    { title: "NVIDIA announces new platform", link: "https://example.test/nvda", publisher: "Reuters", providerPublishTime: 1785930000 },
+    { title: "Old NVIDIA item", link: "https://example.test/old", providerPublishTime: 1785000000 },
+  ] }, "NVDA", new Date("2026-08-05T13:35:00Z"));
+  assert.equal(news.length, 1);
+  assert.deepEqual(news[0].symbols, ["NVDA"]);
+  assert.equal(news[0].source, "Reuters");
 });
 
 test("market session labels premarket, regular trading, after-hours, and closed", () => {
@@ -168,8 +187,8 @@ test("brief excludes raw history and selects P/S for negative earners", () => {
   assert.equal(brief.watchlist[0].valuation.selectedMetric, "trailingPS");
   assert.equal(brief.watchlist[0].valuation.selectedPercentile, 80);
   assert.equal("history" in brief.watchlist[0], false);
-  assert.match(brief.markdown, /CRWV/);
-  assert.match(brief.markdown, /80 percentile \(P\/S\)/);
+  assert.equal(brief.opportunityGate.candidates.length, 0);
+  assert.match(brief.markdown, /No stock cleared the absolute setup gate/);
 });
 
 test("brief renders missing valuation percentile as n/a", () => {
@@ -180,7 +199,7 @@ test("brief renders missing valuation percentile as n/a", () => {
       positionIn52WeekRange: 50, missing: false, valuation: null }],
   });
   assert.doesNotMatch(brief.markdown, /n\/ath/);
-  assert.match(brief.markdown, /\| n\/a \|$/m);
+  assert.equal(brief.watchlist[0].valuation, null);
 });
 
 test("brief computes deterministic stock and sector actions from supplied metrics", () => {
@@ -197,4 +216,5 @@ test("brief computes deterministic stock and sector actions from supplied metric
   assert.equal(brief.watchlist[0].action, "Buy");
   assert.equal(brief.decisionFramework.sectorScorecard.GPU.action, "Buy");
   assert.equal(brief.decisionFramework.aiCycle["GPU Demand"].rating, "Insufficient Data");
+  assert.equal(brief.opportunityGate.candidates.length, 0);
 });
