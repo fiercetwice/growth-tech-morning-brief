@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.4.1 — AI report edition
+# Growth Tech Morning Brief v0.4.2 — AI report edition
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -32,6 +32,34 @@ curl -X POST \
 
 `/run` now returns a compact JSON brief with a ready-to-render `markdown` field. Full price, fundamental and valuation histories are retained in R2 instead of being returned to the terminal.
 
+Run the full report pipeline immediately, including snapshot refresh, Gemini report generation, R2 report storage, and delivery:
+
+```bash
+curl -X POST \
+  "https://growth-tech-morning-brief.ck-market-tools.workers.dev/run-report" \
+  -H "Authorization: Bearer YOUR_RUN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{}'
+```
+
+Retry delivery for today's existing report without calling Gemini or overwriting the stored report:
+
+```bash
+curl -X POST \
+  "https://growth-tech-morning-brief.ck-market-tools.workers.dev/run-report" \
+  -H "Authorization: Bearer YOUR_RUN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"forceDelivery":true}'
+```
+
+Deliver the latest stored report to the configured webhook:
+
+```bash
+curl -X POST \
+  "https://growth-tech-morning-brief.ck-market-tools.workers.dev/deliver-latest" \
+  -H "Authorization: Bearer YOUR_RUN_TOKEN"
+```
+
 Read the latest saved brief:
 
 ```bash
@@ -47,7 +75,7 @@ The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull 
 
 ## AI report generation and delivery
 
-On the valid 09:35 AM ET scheduled run, the Worker writes the stock snapshot, reads `snapshots/latest.json` back from R2, sends a compact snapshot to Gemini 2.5 Flash, and stores the generated Markdown report at both `reports/YYYY-MM-DD.md` and `reports/latest.md`. The duplicate daylight-saving cron expression is ignored unless it maps to 09:35 AM ET, and an existing dated report prevents duplicate report generation and delivery for the same market date.
+On the valid 09:35 AM ET scheduled run, the Worker writes the stock snapshot, reads `snapshots/latest.json` back from R2, sends a compact snapshot to Gemini 2.5 Flash, and stores the generated Markdown report at both `reports/YYYY-MM-DD.md` and `reports/latest.md`. The duplicate daylight-saving cron expression is ignored unless it maps to 09:35 AM ET. An existing dated report prevents duplicate Gemini generation, but delivery is retried until `deliveries/YYYY-MM-DD.json` records a successful Discord receipt.
 
 Configure these secrets or environment variables outside the repository:
 
@@ -57,6 +85,8 @@ Configure these secrets or environment variables outside the repository:
 - `WEBHOOK_URL`: optional generic webhook delivery. Discord URLs are also detected here for backward compatibility; non-Discord URLs receive `{ date, markdown }` JSON.
 
 Report storage is independent from delivery. Email or webhook failures are logged and returned in scheduled-run diagnostics without deleting or invalidating the stored R2 report.
+
+`POST /deliver-latest` reads `reports/latest.md` and sends it to the configured webhook without returning or logging the webhook URL. It returns `404` with `{ "error": "no_report_yet" }` until a report has been stored.
 
 ## Custom GPT Action
 
@@ -73,6 +103,7 @@ R2 object layout:
 - `briefs/latest.json`: response served by `/latest`.
 - `reports/YYYY-MM-DD.md`: Gemini-generated Markdown report.
 - `reports/latest.md`: latest Gemini-generated Markdown report.
+- `deliveries/YYYY-MM-DD.json`: Discord delivery receipt with success, failure, timestamp and message count diagnostics.
 
 ## Configuration
 
@@ -91,5 +122,5 @@ Two UTC cron expressions cover daylight-saving time. The Worker checks New York 
 ## Security and data use
 
 - Never commit `.dev.vars` or tokens.
-- `/run` requires `Authorization: Bearer <RUN_TOKEN>`.
+- `/run`, `/run-report`, `/deliver-latest`, and `/latest` require `Authorization: Bearer <RUN_TOKEN>` when `RUN_TOKEN_REQUIRED` is `true`.
 - Review Yahoo's terms before using this data in a public commercial product.
