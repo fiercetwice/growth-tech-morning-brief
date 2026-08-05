@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.5.4 — dynamic discovery and auditable reasoning
+# Growth Tech Morning Brief v0.5.5 — verbose decision audit
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -107,6 +107,8 @@ Gemini defaults to `gemini-3.5-flash` with low thinking. DeepSeek uses its offic
 
 Every provider must return a normally completed response. The Worker validates a six-section schema: Today's Verdict, Decision Reasoning, Opportunities, Rejected Candidates, Market and AI-Cycle Context, and What Could Change the Call. The reasoning section must disclose the universe searched, gate, and conclusion. Each opportunity must explain admission, possible mispricing, evidence for and against, strategic position, today's action, confidence, entry/exit condition, catalyst, risk/reward, and invalidation. Buy/Sell calls require a material fresh event or same-day earnings; a large price move without material news is Watch-only. Trim calls require that evidence or an extreme valuation/range setup. The validator also rejects unsupported demand, CapEx-cycle, or institutional-flow claims.
 
+`REPORT_MODE` selects `standard` or `verbose` generation and defaults to `verbose` in the deployed configuration. Verbose reports must audit every gated candidate supplied to the model (up to ten), expand a No-Trade Opportunities section into threshold/near-miss/failure/portfolio reasoning, and include a Data and Pipeline Audit. Every generated report and R2 metadata record identify the report mode and engine version. Authenticated forced runs may override the mode with `{"forceRegenerate":true,"reportMode":"standard"}` or `{"forceRegenerate":true,"verbose":true}`.
+
 The report omits exhaustive sector and full-watchlist tables, but it is not length-constrained when additional reasoning improves the decision. It includes the strongest rejected setups so a No-Trade verdict remains auditable.
 
 AI-cycle demand and CapEx rows intentionally remain `Insufficient Data / Unclear` until the snapshot contains direct indicators such as hyperscaler CapEx guidance, backlog, utilization, or analyst estimate revisions. Daily stock returns are momentum inputs, not evidence of end demand.
@@ -158,6 +160,7 @@ R2 object layout:
 - `DISCOVERY_MIN_MARKET_CAP`: minimum market capitalization for discovery; defaults to $250 million.
 - `DISCOVERY_MIN_DOLLAR_VOLUME`: minimum current-session price × volume; defaults to $5 million.
 - `SEC_REFRESH_LIMIT`: maximum uncached or expired SEC network refreshes per invocation; defaults to 3. Fresh cache entries are reused, and an expired entry remains available as stale data when the refresh budget is exhausted. Together with the default discovery limit, this keeps the full report pipeline within the Workers Free 50-external-subrequest ceiling.
+- `REPORT_MODE`: `standard` or `verbose`; the deployed default is `verbose`. A request-level override requires `forceRegenerate: true`.
 - `RUN_TOKEN_REQUIRED`: keep `true` for public workers.dev deployments.
 - `SEC_USER_AGENT`: optional descriptive SEC user agent with a contact email.
 - `YAHOO_USER_AGENT`: optional user agent for Yahoo quote and market-context requests.
