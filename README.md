@@ -1,15 +1,17 @@
-# Growth Tech Morning Brief v0.5.0 — provider router and strict report schema
+# Growth Tech Morning Brief v0.5.1 — sourced market context and calendars
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
 ## Sources and fields
 
 - Yahoo Finance's unofficial chart endpoint: current price, daily move, 52-week position and five years of split-adjusted daily history.
+- Yahoo Finance's unofficial chart endpoint: S&P 500, Nasdaq 100, Dow and Russell 2000 futures; U.S. 10-year yield; U.S. Dollar Index; WTI and Brent crude, including daily moves and quote timestamps.
+- Nasdaq public calendar endpoints: today's economic releases and earnings schedule, including available event times, actual/consensus/previous values, EPS forecasts and covered-watchlist matches.
 - SEC EDGAR CompanyFacts: reported revenue, diluted EPS and diluted shares.
 - Local calculation: point-in-time trailing P/E and P/S history plus five-year valuation percentiles. A historical date uses only SEC filings published by that date, avoiding look-ahead bias.
 - R2 caches SEC responses for seven days, keeps full dated calculation snapshots, stores compact dated briefs, and saves Gemini-generated Markdown reports.
 
-Yahoo is an unofficial community endpoint and can change or rate-limit access. SEC data is authoritative but issuers use differing XBRL tags; unavailable fields remain null rather than being invented. Historical analyst-consensus forward P/E is not included.
+Yahoo and Nasdaq calendar endpoints are unofficial public web endpoints and can change or rate-limit access. Every context category therefore carries `available`, `stale`, or `unavailable` status, its source, and an as-of timestamp. A failure is isolated to that category and never blocks the equity snapshot. SEC data is authoritative but issuers use differing XBRL tags; unavailable fields remain null rather than being invented. Historical analyst-consensus forward P/E is not included.
 
 ## One-time R2 setup and deployment
 
@@ -99,7 +101,7 @@ On the valid 09:35 AM ET scheduled run, the Worker writes the stock snapshot, re
 
 Gemini defaults to `gemini-3.5-flash` with low thinking. DeepSeek uses its official OpenAI-compatible Chat Completions endpoint, defaults to `deepseek-v4-flash`, and disables thinking for concise report generation. Neither route sets an application-level output-token ceiling. Generic OpenAI-compatible endpoints are available only through a preconfigured HTTPS base URL and secret.
 
-Every provider must return a normally completed response. The Worker validates an exact institutional report schema before storage: five labeled Executive Summary bullets; sourced facts separated from analysis; all five AI Cycle rows; all eight Sector Scorecard rows with Fundamentals, Valuation, Momentum, and Action; and one complete Watchlist row per retrieved symbol with price, daily move, 52-week position, forward-valuation availability, historical valuation percentile, catalyst, risk, and action. Missing metrics must be marked unavailable instead of invented. An existing dated report prevents duplicate generation, but delivery is retried until `deliveries/YYYY-MM-DD.json` records a successful Discord receipt.
+Every provider must return a normally completed response. The Worker validates an exact institutional report schema before storage: five labeled Executive Summary bullets; sourced facts separated from analysis; labeled Futures, Rates, USD, Oil, Macro Events and Earnings fields; all five AI Cycle rows; all eight Sector Scorecard rows with Fundamentals, Valuation, Momentum, and Action; and one complete Watchlist row per retrieved symbol with price, daily move, 52-week position, forward-valuation availability, historical valuation percentile, catalyst, risk, and action. A report is rejected if it marks a supplied context category unavailable. Missing metrics must be marked unavailable instead of invented. An existing dated report prevents duplicate generation, but delivery is retried until `deliveries/YYYY-MM-DD.json` records a successful Discord receipt.
 
 If a provider returns a token-limit finish reason or a report that fails schema validation, the Worker retries once with a shorter-but-complete prompt. If the retry is still incomplete, the report is rejected and the previous stored report remains unchanged. Use `forceRegenerate` when `/run-report` should replace an existing dated report; use `forceDelivery` by itself when the stored report should be resent without calling the AI provider.
 
@@ -145,6 +147,8 @@ R2 object layout:
 - `WATCHLIST`: comma-separated tickers.
 - `RUN_TOKEN_REQUIRED`: keep `true` for public workers.dev deployments.
 - `SEC_USER_AGENT`: optional descriptive SEC user agent with a contact email.
+- `YAHOO_USER_AGENT`: optional user agent for Yahoo quote and market-context requests.
+- `NASDAQ_USER_AGENT`: optional browser-compatible user agent for Nasdaq calendar requests.
 - `AI_PROVIDER`: `gemini`, `deepseek`, or `openai-compatible`; defaults to `gemini`.
 - `AI_MODEL`: optional scheduled-route model override.
 - `GEMINI_API_KEY`, `GEMINI_MODEL`: Gemini credentials and optional model override.
