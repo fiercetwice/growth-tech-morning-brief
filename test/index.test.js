@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildCalendarContext, buildMarketContext, buildValuationHistory, normalizeNasdaqEarningsCalendar, normalizeNasdaqMacroCalendar,
-  normalizeYahooChart, percentile, quarterlyFacts, toBrief, zonedParts,
+  marketSession, normalizeYahooChart, percentile, quarterlyFacts, reportedGrowth, toBrief, zonedParts,
 } from "../src/index.js";
 
 test("DST-aware New York schedule accepts summer and winter triggers", () => {
@@ -39,6 +39,22 @@ test("normalizes Nasdaq macro events without HTML placeholders", () => {
   assert.deepEqual(calendar.events[0], {
     time: "08:30 AM", country: "US", event: "Initial Claims", actual: "225K", consensus: "230K", previous: "228K",
   });
+});
+
+test("macro calendar removes low-relevance non-US events", () => {
+  const calendar = normalizeNasdaqMacroCalendar({ data: { rows: [
+    { time: "09:00 AM", country: "Canada", eventName: "S&P Manufacturing PMI", actual: "53" },
+    { time: "10:00 AM", country: "US", eventName: "ISM Services", actual: "52" },
+    { time: "02:00 PM", country: "EU", eventName: "ECB Interest Rate Decision", actual: "3%" },
+  ] } }, "2026-08-05");
+  assert.deepEqual(calendar.events.map((event) => event.event), ["ISM Services", "ECB Interest Rate Decision"]);
+});
+
+test("market session labels premarket, regular trading, after-hours, and closed", () => {
+  assert.equal(marketSession(new Date("2026-08-05T12:00:00Z")), "premarket");
+  assert.equal(marketSession(new Date("2026-08-05T15:00:00Z")), "regular_trading");
+  assert.equal(marketSession(new Date("2026-08-05T21:00:00Z")), "after_hours");
+  assert.equal(marketSession(new Date("2026-08-06T02:00:00Z")), "closed");
 });
 
 test("Nasdaq earnings prioritizes covered symbols and caps prompt payload", () => {
@@ -114,6 +130,17 @@ test("quarterly facts derive Q4 from annual total", () => {
   assert.equal(facts.at(-1).derivedFromAnnual, true);
 });
 
+test("reported growth calculates TTM and latest-quarter YoY from SEC facts", () => {
+  const quarterlyRevenue = Array.from({ length: 8 }, (_, index) => ({
+    value: index < 4 ? 100 : 120, filed: `202${index < 4 ? 5 : 6}-0${(index % 4) + 1}-15`,
+  }));
+  const growth = reportedGrowth({ quarterlyRevenue, quarterlyEps: quarterlyRevenue.map((row) => ({ ...row, value: row.value / 10 })) });
+  assert.equal(growth.revenueTtmYoY, 20);
+  assert.equal(growth.revenueLatestQuarterYoY, 20);
+  assert.equal(growth.epsTtmYoY, 20);
+  assert.match(growth.basis, /reported SEC filings/);
+});
+
 test("valuation uses only filings available on the price date", () => {
   const quarters = [1, 2, 3, 4].map((q) => ({ end: `2025-0${q * 2}-28`, filed: `2025-0${q * 2 + 1}-15`, value: 10 }));
   const history = buildValuationHistory([{ date: "2025-10-01", adjustedClose: 20 }], {
@@ -154,4 +181,20 @@ test("brief renders missing valuation percentile as n/a", () => {
   });
   assert.doesNotMatch(brief.markdown, /n\/ath/);
   assert.match(brief.markdown, /\| n\/a \|$/m);
+});
+
+test("brief computes deterministic stock and sector actions from supplied metrics", () => {
+  const brief = toBrief({
+    generatedAt: "2026-08-05T15:00:00.000Z", session: "regular_trading",
+    coverage: { requested: 1, succeeded: 1, failed: 0 },
+    watchlist: [{
+      symbol: "NVDA", price: 100, changePercent: 2, yearLow: 50, yearHigh: 110,
+      positionIn52WeekRange: 83, missing: false,
+      valuation: { trailingPE: 20, trailingPS: 10, trailingPEPercentile5Y: 50, trailingPSPercentile5Y: 70 },
+      reportedGrowth: { revenueTtmYoY: 25, epsTtmYoY: 30, basis: "reported SEC filings; not analyst estimates" },
+    }],
+  });
+  assert.equal(brief.watchlist[0].action, "Buy");
+  assert.equal(brief.decisionFramework.sectorScorecard.GPU.action, "Buy");
+  assert.equal(brief.decisionFramework.aiCycle["GPU Demand"].rating, "Insufficient Data");
 });
