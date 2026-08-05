@@ -9,7 +9,7 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.4";
+const SERVICE_VERSION = "0.5.5";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -23,7 +23,9 @@ const REQUIRED_REPORT_SECTIONS = [
 const REQUIRED_VERDICT_LABELS = ["Verdict", "Confidence", "Why Today"];
 const REQUIRED_CONTEXT_LABELS = ["AI Cycle", "Market Regime", "Material News"];
 const REQUIRED_REASONING_LABELS = ["Universe Searched", "Opportunity Gate", "Conclusion"];
+const REQUIRED_AUDIT_LABELS = ["Available Evidence", "Missing Evidence", "Source Failures", "Confidence Impact"];
 const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Trim", "Sell", "Watch", "No action"];
+const REPORT_MODES = new Set(["standard", "verbose"]);
 const DEFAULT_DISCOVERY_LIMIT = 6;
 const DEFAULT_MIN_MARKET_CAP = 250_000_000;
 const DEFAULT_MIN_DOLLAR_VOLUME = 5_000_000;
@@ -107,13 +109,15 @@ export default {
       try {
         const options = await request.json().catch(() => ({}));
         const routeOverride = requestedAiRoute(options);
-        if (routeOverride && options?.forceRegenerate !== true) {
-          return json({ error: "force_regenerate_required", message: "provider/model overrides require forceRegenerate=true" }, 400);
+        const reportMode = requestedReportMode(options);
+        if ((routeOverride || reportMode) && options?.forceRegenerate !== true) {
+          return json({ error: "force_regenerate_required", message: "provider/model/reportMode overrides require forceRegenerate=true" }, 400);
         }
         return json(await runReportNow(env, new Date(), {
           forceDelivery: options?.forceDelivery === true,
           forceRegenerate: options?.forceRegenerate === true,
           aiRoute: routeOverride,
+          reportMode,
         }));
       } catch (error) {
         console.error(error);
@@ -141,6 +145,7 @@ export async function runReportNow(env, now = new Date(), options = {}) {
     forceDelivery: options.forceDelivery === true,
     forceRegenerate: options.forceRegenerate === true,
     aiRoute: options.aiRoute,
+    reportMode: options.reportMode,
   });
   return { snapshot, report };
 }
@@ -150,21 +155,25 @@ async function generateOrDeliverReport(env, now, options = {}) {
 
   const reportDate = zonedParts(now, "America/New_York").date;
   const reportObject = await env.BRIEF_BUCKET.get(`reports/${reportDate}.md`);
-  const reportResults = { date: reportDate, generated: false, stored: false, email: null, webhook: null };
+  const reportResults = { date: reportDate, engineVersion: SERVICE_VERSION, generated: false, stored: false, email: null, webhook: null };
   try {
     let reportMarkdown;
     if (reportObject && !options.forceRegenerate) {
       reportMarkdown = await reportObject.text();
       reportResults.reused = true;
+      reportResults.reportMode = reportObject.customMetadata?.reportMode ?? "unknown";
+      reportResults.reportEngineVersion = reportObject.customMetadata?.engineVersion ?? "unknown";
       reportResults.stored = true;
     } else {
       const latestObject = await env.BRIEF_BUCKET.get("snapshots/latest.json");
       if (!latestObject) throw new Error("snapshots/latest.json was not found after snapshot creation");
       const latestSnapshot = await latestObject.json();
-      const generatedReport = await generateAiReport(env, latestSnapshot, options.aiRoute);
+      const generatedReport = await generateAiReport(env, latestSnapshot, options.aiRoute, { reportMode: options.reportMode });
       reportMarkdown = generatedReport.markdown;
       reportResults.aiProvider = generatedReport.provider;
       reportResults.aiModel = generatedReport.model;
+      reportResults.reportMode = generatedReport.reportMode;
+      reportResults.reportEngineVersion = SERVICE_VERSION;
       if (generatedReport.provider === "gemini") reportResults.geminiModel = generatedReport.model;
       reportResults.generation = generatedReport.metadata;
       await storeReport(env, reportDate, reportMarkdown, generatedReport.metadata);
@@ -850,10 +859,12 @@ function todaySetup(row, earnings) {
   };
 }
 
-export async function generateAiReport(env, snapshot, override = null) {
+export async function generateAiReport(env, snapshot, override = null, options = {}) {
   const route = selectedAiRoute(env, override);
   const { provider, model } = route;
   const compact = compactSnapshotForReport(snapshot);
+  compact.reportMode = selectedReportMode(env, options.reportMode);
+  compact.engineVersion = SERVICE_VERSION;
   const requiredSymbols = [
     ...(snapshot.watchlist ?? []).filter((row) => !row.missing).map((row) => row.symbol),
     ...(snapshot.discovery?.candidates ?? []).filter((row) => !row.missing).map((row) => row.symbol),
@@ -878,7 +889,13 @@ export async function generateAiReport(env, snapshot, override = null) {
     const validation = validateReportCompleteness(extracted.markdown, requiredSymbols, compact);
     metadata.validation = validation.ok ? "passed" : "failed";
     metadata.validationErrors = validation.errors.join("; ");
-    if (validation.ok) return { markdown: extracted.markdown, provider, model, metadata };
+    if (validation.ok) return {
+      markdown: extracted.markdown,
+      provider,
+      model,
+      reportMode: compact.reportMode,
+      metadata: { ...metadata, reportMode: compact.reportMode, engineVersion: SERVICE_VERSION },
+    };
     failures.push(`attempt ${attempt}: ${validation.errors.join("; ")}`);
   }
   throw new Error(`AI report incomplete after ${failures.length} attempt(s) (${provider}/${model}): ${failures.join(" | ")}`);
@@ -1030,11 +1047,49 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
   }
   const rejected = sectionBody(markdown, "Rejected Candidates");
   if (!rejected) errors.push("Rejected Candidates must explain the strongest failed setups");
+  validateDecisionAudit(markdown, compact, errors);
   validateOpportunities(markdown, symbols, compact, errors);
   validateUnsupportedClaims(markdown, compact, errors);
   if (markdown.length < 700) errors.push("report is shorter than the minimum insight length");
   if (endsIncomplete(markdown)) errors.push("report ends with an incomplete sentence");
   return { ok: errors.length === 0, errors };
+}
+
+function validateDecisionAudit(markdown, compact, errors) {
+  if (compact?.reportMode !== "verbose") return;
+  if (!/\*{0,2}Report Mode\*{0,2}\s*:\*{0,2}\s*verbose\b/i.test(markdown)) {
+    errors.push("verbose report must identify Report Mode: verbose");
+  }
+  const expectedVersion = compact.engineVersion ?? SERVICE_VERSION;
+  if (!new RegExp(`\\*{0,2}Engine Version\\*{0,2}\\s*:\\*{0,2}\\s*${escapeRegExp(expectedVersion)}\\b`, "i").test(markdown)) {
+    errors.push("verbose report must identify the current engine version");
+  }
+  const audit = sectionBody(markdown, "Data and Pipeline Audit");
+  if (!audit) errors.push("missing section: Data and Pipeline Audit");
+  for (const label of REQUIRED_AUDIT_LABELS) {
+    if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(audit)) {
+      errors.push(`missing Data and Pipeline Audit field: ${label}`);
+    }
+  }
+  const candidates = (compact?.opportunityGate?.candidates ?? []).slice(0, 10);
+  const audited = [
+    sectionBody(markdown, "Decision Reasoning"),
+    sectionBody(markdown, "Opportunities"),
+    sectionBody(markdown, "Rejected Candidates"),
+  ].join("\n");
+  for (const row of candidates) {
+    if (!new RegExp(`\\b${escapeRegExp(row.symbol)}\\b`).test(audited)) {
+      errors.push(`verbose report silently omitted gated candidate: ${row.symbol}`);
+    }
+  }
+  const opportunities = sectionBody(markdown, "Opportunities");
+  if (!/^###\s+/m.test(opportunities) && /no high-conviction trade|no actionable opportunity/i.test(opportunities)) {
+    for (const label of ["Threshold Result", "Best Near-Miss", "Why It Failed", "Portfolio Action"]) {
+      if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(opportunities)) {
+        errors.push(`verbose no-trade Opportunities missing field: ${label}`);
+      }
+    }
+  }
 }
 
 function validateOpportunities(markdown, symbols, compact, errors) {
@@ -1138,8 +1193,9 @@ function escapeRegExp(value) {
 }
 
 function reportPrompt(compact, options = {}) {
+  const verbose = compact.reportMode === "verbose";
   return [
-    "Produce an evidence-rich, decision-focused Growth Tech Morning Brief in Markdown using the exact six-section schema below.",
+    `Produce an evidence-rich, decision-focused Growth Tech Morning Brief in Markdown in ${compact.reportMode} mode.`,
     "Answer one question: after screening both the core watchlist and a broader movers universe, is there a sufficiently strong, time-sensitive reason to buy, sell, trim, or investigate a stock today?",
     "Do not recommend a trade merely because a stock ranks highest. Default to 'No high-conviction trade today' unless an absolute setup threshold is cleared.",
     `Use only opportunityGate.candidates. Include at most ${compact.opportunityGate.maximumOpportunities} names. A >=3% move without verified news may be Watch only, never Buy/Sell.`,
@@ -1151,7 +1207,14 @@ function reportPrompt(compact, options = {}) {
     "Reported growth is backward-looking SEC data. Price action cannot establish demand, CapEx, adoption, institutional flows, or fundamental strength.",
     `Label market context as ${compact.session}; do not call regular-trading quotes overnight futures or premarket indications.`,
     `Allowed Today's Actions: ${TODAY_ACTIONS.join(", ")}.`,
+    verbose
+      ? "Verbose mode is an audit trail, not filler: expose the candidate funnel, analyze every gated candidate supplied (up to ten), state missing or failed inputs, and fully explain why each setup passed or failed. Do not silently omit a candidate or data-source failure."
+      : "Standard mode must remain auditable: explain the funnel and strongest rejected setups without exhaustive low-value tables.",
     "Depth is preferred over brevity when it adds decision value. Do not add exhaustive sector, dashboard, or full-watchlist tables.",
+    "",
+    `**Report Mode:** ${compact.reportMode}`,
+    `**Engine Version:** ${compact.engineVersion}`,
+    "Repeat those two metadata lines verbatim immediately beneath the report title.",
     "",
     "# Today's Verdict",
     "Exactly three bullets labeled **Verdict:**, **Confidence:**, and **Why Today:**.",
@@ -1160,22 +1223,49 @@ function reportPrompt(compact, options = {}) {
     "Use three labeled paragraphs: **Universe Searched:** with core and discovery coverage counts, **Opportunity Gate:** explaining which signals admitted candidates and the evidence standard, and **Conclusion:** explaining why the strongest setups passed or failed today.",
     "",
     "# Opportunities",
-    "If no candidate merits action, write one sentence: No actionable opportunity clears the threshold.",
+    verbose
+      ? "If no candidate merits action, do not leave this section empty or use only one sentence. Use four labeled bullets: **Threshold Result:**, **Best Near-Miss:**, **Why It Failed:**, and **Portfolio Action:**."
+      : "If no candidate merits action, state that no actionable opportunity clears the threshold and identify the best near-miss plus its decisive failure.",
     "Otherwise use `### SYMBOL — Today's Action` and eleven bullets labeled **Why Considered:**, **Mispricing Thesis:**, **Evidence For:**, **Evidence Against:**, **Strategic Position:**, **Today's Action:**, **Confidence:**, **Entry/Exit Condition:**, **Verified Catalyst:**, **Risk/Reward:**, and **Invalidation:** for each name.",
     "",
     "# Rejected Candidates",
-    "Discuss up to five of the strongest candidates that failed the action threshold. For each, state the admission signal, missing evidence or conflicting evidence, and what would promote it to an actionable setup. If none exist, say so explicitly.",
+    verbose
+      ? "Audit every supplied opportunityGate candidate, up to ten, that is not actionable. Use `### SYMBOL — Rejected/Watch` and fields **Admission Signal:**, **Evidence Supporting:**, **Evidence Missing or Conflicting:**, **Rejection Reason:**, and **Promotion Trigger:**."
+      : "Discuss up to five of the strongest candidates that failed the action threshold. For each, state the admission signal, missing evidence or conflicting evidence, and what would promote it to an actionable setup. If none exist, say so explicitly.",
+    "",
+    ...(verbose ? [
+      "# Data and Pipeline Audit",
+      "Use four labeled paragraphs: **Available Evidence:**, **Missing Evidence:**, **Source Failures:**, and **Confidence Impact:**. Distinguish a genuine lack of evidence from a source or extraction failure. If no source failed, say so explicitly.",
+      "",
+    ] : []),
     "",
     "# Market and AI-Cycle Context",
     "Exactly three concise bullets labeled **AI Cycle:**, **Market Regime:**, and **Material News:**. Mention only facts that change conviction today; omit low-value calendar items.",
     "",
     "# What Could Change the Call",
     "Use specific earnings, macro events, price levels, verified news, or data gaps that could change today's calls.",
-    options.retry ? "Retry instruction: the previous response failed validation. Preserve all six sections and every required label; reduce repetition but retain the reasoning chain." : "",
+    options.retry ? `Retry instruction: the previous response failed validation. Preserve every ${verbose ? "verbose" : "standard"} section and required label; reduce repetition but retain the complete reasoning chain.` : "",
     "",
     "Compact snapshot JSON:",
     JSON.stringify(compact),
   ].filter(Boolean).join("\n");
+}
+
+function requestedReportMode(options) {
+  if (options?.reportMode !== undefined) return cleanReportMode(options.reportMode);
+  if (options?.verbose === true) return "verbose";
+  if (options?.verbose === false) return "standard";
+  return null;
+}
+
+function selectedReportMode(env, override = null) {
+  return cleanReportMode(override ?? env.REPORT_MODE ?? "standard");
+}
+
+function cleanReportMode(value) {
+  const mode = String(value ?? "").trim().toLowerCase();
+  if (!REPORT_MODES.has(mode)) throw new Error("reportMode must be standard or verbose");
+  return mode;
 }
 
 function requestedAiRoute(options) {
@@ -1258,6 +1348,8 @@ async function storeReport(env, reportDate, markdown, metadata = {}) {
       generatedAt: metadata.generatedAt,
       validation: metadata.validation,
       validationErrors: metadata.validationErrors,
+      reportMode: metadata.reportMode,
+      engineVersion: metadata.engineVersion ?? SERVICE_VERSION,
     }),
   };
   await Promise.all([

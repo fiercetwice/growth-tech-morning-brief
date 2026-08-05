@@ -39,5 +39,5 @@ test("Worker accepts a trailing slash on the GPT read route", async () => {
 test("health exposes the deployed release for propagation-safe smoke tests", async () => {
   const response = await worker.fetch(new Request("https://example.test/health"), {});
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.4" });
+  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.5" });
 });

@@ -94,14 +94,17 @@ jobs:
               "forceRegenerate": true,
               "forceDelivery": true,
               "provider": "deepseek",
-              "model": "deepseek-v4-flash"
+              "model": "deepseek-v4-flash",
+              "reportMode": "verbose"
             }')"
 
-          jq -e '
+          jq -e --arg expected_version "$expected_version" '
             .report.generated == true and
             .report.stored == true and
             .report.aiProvider == "deepseek" and
             .report.aiModel == "deepseek-v4-flash" and
+            .report.reportMode == "verbose" and
+            .report.reportEngineVersion == $expected_version and
             .report.generation.validation == "passed" and
             .report.webhook.sent == true
           ' <<< "$response" > /dev/null
@@ -112,6 +115,8 @@ jobs:
             stored: .report.stored,
             aiProvider: .report.aiProvider,
             aiModel: .report.aiModel,
+            reportMode: .report.reportMode,
+            reportEngineVersion: .report.reportEngineVersion,
             validation: .report.generation.validation,
             webhook: .report.webhook
           }' <<< "$response"

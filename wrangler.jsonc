@@ -13,6 +13,7 @@
     "DISCOVERY_MIN_MARKET_CAP": "250000000",
     "DISCOVERY_MIN_DOLLAR_VOLUME": "5000000",
     "SEC_REFRESH_LIMIT": "3",
+    "REPORT_MODE": "verbose",
     "RUN_TOKEN_REQUIRED": "true"
   },
   "r2_buckets": [{ "binding": "BRIEF_BUCKET", "bucket_name": "growth-tech-brief-data" }]
