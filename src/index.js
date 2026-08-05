@@ -2,6 +2,9 @@ const YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart";
 const SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts";
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
+const DEEPSEEK_API_BASE = "https://api.deepseek.com";
+const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
+const DEFAULT_AI_PROVIDER = "gemini";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -11,6 +14,10 @@ const REQUIRED_REPORT_SECTIONS = [
   "Sector Scorecard",
   "Watchlist",
 ];
+const REQUIRED_EXECUTIVE_LABELS = ["AI Cycle", "Catalyst", "Risk", "Best Opportunity", "Avoid"];
+const REQUIRED_AI_CYCLE_ROWS = ["Hyperscaler AI CapEx", "GPU Demand", "AI Cloud", "Enterprise AI", "Inference"];
+const REQUIRED_SECTOR_ROWS = ["GPU", "AI Cloud", "GPU Cloud", "Networking", "Cooling", "Power", "Cybersecurity", "Cloud Software"];
+const ALLOWED_AI_PROVIDERS = new Set(["gemini", "deepseek", "openai-compatible"]);
 
 const CIKS = {
   NVDA: "0001045810", AMZN: "0001018724", MSFT: "0000789019",
@@ -57,9 +64,14 @@ export default {
       if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
       try {
         const options = await request.json().catch(() => ({}));
+        const routeOverride = requestedAiRoute(options);
+        if (routeOverride && options?.forceRegenerate !== true) {
+          return json({ error: "force_regenerate_required", message: "provider/model overrides require forceRegenerate=true" }, 400);
+        }
         return json(await runReportNow(env, new Date(), {
           forceDelivery: options?.forceDelivery === true,
           forceRegenerate: options?.forceRegenerate === true,
+          aiRoute: routeOverride,
         }));
       } catch (error) {
         console.error(error);
@@ -86,6 +98,7 @@ export async function runReportNow(env, now = new Date(), options = {}) {
   const report = await generateOrDeliverReport(env, now, {
     forceDelivery: options.forceDelivery === true,
     forceRegenerate: options.forceRegenerate === true,
+    aiRoute: options.aiRoute,
   });
   return { snapshot, report };
 }
@@ -106,9 +119,11 @@ async function generateOrDeliverReport(env, now, options = {}) {
       const latestObject = await env.BRIEF_BUCKET.get("snapshots/latest.json");
       if (!latestObject) throw new Error("snapshots/latest.json was not found after snapshot creation");
       const latestSnapshot = await latestObject.json();
-      const generatedReport = await generateGeminiReport(env, latestSnapshot);
+      const generatedReport = await generateAiReport(env, latestSnapshot, options.aiRoute);
       reportMarkdown = generatedReport.markdown;
-      reportResults.geminiModel = generatedReport.model;
+      reportResults.aiProvider = generatedReport.provider;
+      reportResults.aiModel = generatedReport.model;
+      if (generatedReport.provider === "gemini") reportResults.geminiModel = generatedReport.model;
       reportResults.generation = generatedReport.metadata;
       await storeReport(env, reportDate, reportMarkdown, generatedReport.metadata);
       reportResults.generated = true;
@@ -223,9 +238,9 @@ export function compactSnapshotForReport(snapshot) {
   };
 }
 
-export async function generateGeminiReport(env, snapshot) {
-  if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not configured");
-  const model = selectedGeminiModel(env);
+export async function generateAiReport(env, snapshot, override = null) {
+  const route = selectedAiRoute(env, override);
+  const { provider, model } = route;
   const compact = compactSnapshotForReport(snapshot);
   const requiredSymbols = compact.watchlist.filter((row) => !row.missing).map((row) => row.symbol);
   const prompts = [
@@ -236,32 +251,61 @@ export async function generateGeminiReport(env, snapshot) {
 
   for (const [index, prompt] of prompts.entries()) {
     const attempt = index + 1;
-    const response = await requestGeminiReport(env, model, prompt);
-    const extracted = extractGeminiReport(response.body, model, env);
-    const metadata = reportMetadata(model, response.body, extracted, attempt);
+    const response = await requestAiReport(env, route, prompt);
+    const extracted = extractAiReport(response.body, route, env);
+    const metadata = reportMetadata(route, response.body, extracted, attempt);
     if (!response.ok || extracted.finishReason !== "STOP" || !extracted.markdown) {
-      const diagnostic = geminiFailureDiagnostic(response.status, model, extracted, env);
+      const diagnostic = aiFailureDiagnostic(response.status, route, extracted, env);
       failures.push(`attempt ${attempt}: ${diagnostic}`);
-      if (extracted.finishReason !== "MAX_TOKENS") break;
+      if (!isTokenLimitFinish(extracted.finishReason)) break;
       continue;
     }
     const validation = validateReportCompleteness(extracted.markdown, requiredSymbols);
     metadata.validation = validation.ok ? "passed" : "failed";
     metadata.validationErrors = validation.errors.join("; ");
-    if (validation.ok) return { markdown: extracted.markdown, model, metadata };
+    if (validation.ok) return { markdown: extracted.markdown, provider, model, metadata };
     failures.push(`attempt ${attempt}: ${validation.errors.join("; ")}`);
   }
-  throw new Error(`Gemini report incomplete after ${failures.length} attempt(s): ${failures.join(" | ")}`);
+  throw new Error(`AI report incomplete after ${failures.length} attempt(s) (${provider}/${model}): ${failures.join(" | ")}`);
 }
 
-async function requestGeminiReport(env, model, prompt) {
-  const endpoint = `${GEMINI_API_BASE}/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
+// Backward-compatible export for callers that explicitly expect Gemini.
+export async function generateGeminiReport(env, snapshot) {
+  return generateAiReport(env, snapshot, { provider: "gemini" });
+}
+
+async function requestAiReport(env, route, prompt) {
+  if (route.provider === "gemini") return requestGeminiReport(env, route, prompt);
+  return requestOpenAiCompatibleReport(env, route, prompt);
+}
+
+async function requestGeminiReport(env, route, prompt) {
+  const endpoint = `${GEMINI_API_BASE}/${encodeURIComponent(route.model)}:generateContent?key=${encodeURIComponent(route.apiKey)}`;
   const response = await fetch(endpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(geminiRequestBody(prompt)),
   });
   return { ok: response.ok, status: response.status, body: await response.json().catch(() => null) };
+}
+
+async function requestOpenAiCompatibleReport(env, route, prompt) {
+  const response = await fetch(`${route.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${route.apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify(openAiCompatibleRequestBody(route, prompt)),
+  });
+  return { ok: response.ok, status: response.status, body: await response.json().catch(() => null) };
+}
+
+function openAiCompatibleRequestBody(route, prompt) {
+  return {
+    model: route.model,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.25,
+    stream: false,
+    ...(route.provider === "deepseek" ? { thinking: { type: "disabled" } } : {}),
+  };
 }
 
 function geminiRequestBody(prompt) {
@@ -277,10 +321,11 @@ function geminiRequestBody(prompt) {
   };
 }
 
-function extractGeminiReport(body, model, env) {
+function extractAiReport(body, route, env) {
+  if (route.provider !== "gemini") return extractOpenAiCompatibleReport(body, route, env);
   const candidate = body?.candidates?.[0];
   if (!candidate) {
-    return { finishReason: null, markdown: "", error: sanitizeGeminiMessage(body?.error?.message || "missing candidates[0]", env) };
+    return { finishReason: null, markdown: "", error: sanitizeAiMessage(body?.error?.message || "missing candidates[0]", env) };
   }
   const finishReason = candidate.finishReason ?? null;
   const parts = candidate.content?.parts ?? [];
@@ -292,50 +337,138 @@ function extractGeminiReport(body, model, env) {
   return {
     finishReason,
     markdown,
-    error: markdown ? null : `missing non-thought text for model ${model}`,
+    error: markdown ? null : `missing non-thought text for model ${route.model}`,
   };
 }
 
-function geminiFailureDiagnostic(status, model, extracted, env) {
-  const finish = extracted.finishReason || "missing";
-  const message = extracted.error ? `: ${sanitizeGeminiMessage(extracted.error, env)}` : "";
-  return `Gemini report failed (${status}, model: ${model}, finishReason: ${finish})${message}`;
+function extractOpenAiCompatibleReport(body, route, env) {
+  const choice = body?.choices?.[0];
+  if (!choice) {
+    return { finishReason: null, markdown: "", error: sanitizeAiMessage(body?.error?.message || "missing choices[0]", env) };
+  }
+  const markdown = typeof choice.message?.content === "string" ? choice.message.content.trim() : "";
+  const finishReason = normalizeFinishReason(choice.finish_reason);
+  return {
+    finishReason,
+    markdown,
+    error: markdown ? null : `missing assistant content for model ${route.model}`,
+  };
 }
 
-function reportMetadata(model, body, extracted, attempts) {
-  const usage = body?.usageMetadata ?? {};
+function normalizeFinishReason(reason) {
+  if (typeof reason !== "string") return reason ?? null;
+  if (reason.toLowerCase() === "stop") return "STOP";
+  if (["length", "max_tokens"].includes(reason.toLowerCase())) return "MAX_TOKENS";
+  return reason.toUpperCase();
+}
+
+function isTokenLimitFinish(reason) {
+  return reason === "MAX_TOKENS";
+}
+
+function aiFailureDiagnostic(status, route, extracted, env) {
+  const finish = extracted.finishReason || "missing";
+  const message = extracted.error ? `: ${sanitizeAiMessage(extracted.error, env)}` : "";
+  return `AI report failed (${status}, provider: ${route.provider}, model: ${route.model}, finishReason: ${finish})${message}`;
+}
+
+function reportMetadata(route, body, extracted, attempts) {
+  const usage = route.provider === "gemini" ? (body?.usageMetadata ?? {}) : (body?.usage ?? {});
   return {
-    geminiModel: model,
+    aiProvider: route.provider,
+    aiModel: route.model,
+    ...(route.provider === "gemini" ? { geminiModel: route.model } : {}),
     finishReason: extracted.finishReason || "missing",
     outputCharacters: extracted.markdown.length,
-    outputTokenCount: usage.candidatesTokenCount ?? usage.outputTokenCount ?? null,
-    thoughtsTokenCount: usage.thoughtsTokenCount ?? null,
-    totalTokenCount: usage.totalTokenCount ?? null,
+    outputTokenCount: usage.candidatesTokenCount ?? usage.outputTokenCount ?? usage.completion_tokens ?? null,
+    thoughtsTokenCount: usage.thoughtsTokenCount ?? usage.completion_tokens_details?.reasoning_tokens ?? usage.reasoning_tokens ?? null,
+    totalTokenCount: usage.totalTokenCount ?? usage.total_tokens ?? null,
     generationAttempts: attempts,
     generatedAt: new Date().toISOString(),
     validation: "not_run",
   };
 }
 
-function validateReportCompleteness(markdown, symbols) {
+export function validateReportCompleteness(markdown, symbols) {
   const errors = [];
-  const normalized = markdown.toLowerCase();
   for (const section of REQUIRED_REPORT_SECTIONS) {
-    if (!normalized.includes(section.toLowerCase())) errors.push(`missing section: ${section}`);
+    if (!sectionBody(markdown, section)) errors.push(`missing section: ${section}`);
+  }
+
+  const executive = sectionBody(markdown, "Executive Summary");
+  const executiveBullets = executive.split("\n").filter((line) => /^\s*[-*]\s+/.test(line));
+  if (executiveBullets.length !== 5) errors.push("Executive Summary must contain exactly five bullets");
+  for (const label of REQUIRED_EXECUTIVE_LABELS) {
+    if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(executive)) {
+      errors.push(`missing Executive Summary field: ${label}`);
+    }
+  }
+
+  const overnight = sectionBody(markdown, "Overnight and Market Context");
+  for (const label of ["Sourced Facts", "Analysis"]) {
+    if (!new RegExp(escapeRegExp(label), "i").test(overnight)) errors.push(`missing Overnight field: ${label}`);
+  }
+
+  const dashboard = sectionBody(markdown, "AI Cycle Dashboard");
+  for (const header of ["Rating", "Trend", "Sourced Facts", "Analysis"]) {
+    if (!new RegExp(escapeRegExp(header), "i").test(dashboard)) errors.push(`missing AI Cycle Dashboard column: ${header}`);
+  }
+  for (const row of REQUIRED_AI_CYCLE_ROWS) {
+    if (!new RegExp(escapeRegExp(row), "i").test(dashboard)) errors.push(`missing AI Cycle Dashboard row: ${row}`);
+  }
+
+  const scorecard = sectionBody(markdown, "Sector Scorecard");
+  for (const header of ["Fundamentals", "Valuation", "Momentum", "Action", "Sourced Facts", "Analysis"]) {
+    if (!new RegExp(escapeRegExp(header), "i").test(scorecard)) errors.push(`missing Sector Scorecard column: ${header}`);
+  }
+  for (const row of REQUIRED_SECTOR_ROWS) {
+    const cells = markdownTableRow(scorecard, row, { allowLabelFormatting: true });
+    if (!cells) errors.push(`missing Sector Scorecard row: ${row}`);
+    else if (cells.length < 7 || !validAction(cells[4])) errors.push(`invalid Sector Scorecard fields: ${row}`);
+  }
+
+  const watchlist = sectionBody(markdown, "Watchlist");
+  for (const header of ["Price", "Daily Change", "52W Position", "Forward P/E or P/S", "Historical Valuation Percentile", "Catalyst", "Risk", "Action"]) {
+    if (!new RegExp(escapeRegExp(header), "i").test(watchlist)) errors.push(`missing Watchlist column: ${header}`);
   }
   for (const symbol of symbols) {
-    const pattern = new RegExp(`(^|[^A-Z])${escapeRegExp(symbol)}([^A-Z]|$)`);
-    if (!pattern.test(markdown)) errors.push(`missing watchlist symbol: ${symbol}`);
+    const cells = markdownTableRow(watchlist, symbol, { allowLabelFormatting: true, allowDollar: true });
+    if (!cells) errors.push(`missing watchlist symbol: ${symbol}`);
+    else if (cells.length < 9 || !validAction(cells[8])) errors.push(`incomplete watchlist fields: ${symbol}`);
   }
   if (markdown.length < 500) errors.push("report is shorter than the minimum complete length");
   if (endsIncomplete(markdown)) errors.push("report ends with an incomplete sentence");
   return { ok: errors.length === 0, errors };
 }
 
+function sectionBody(markdown, section) {
+  const pattern = new RegExp(`^#{1,2}\\s+${escapeRegExp(section)}\\s*$`, "im");
+  const match = pattern.exec(markdown);
+  if (!match) return "";
+  const start = match.index + match[0].length;
+  const rest = markdown.slice(start);
+  const next = /^#{1,2}\s+/m.exec(rest);
+  return (next ? rest.slice(0, next.index) : rest).trim();
+}
+
+function markdownTableRow(section, label, options = {}) {
+  const escaped = escapeRegExp(label);
+  const prefix = options.allowLabelFormatting
+    ? `(?:\\*{0,2}|\`{0,1})${options.allowDollar ? "\\$?" : ""}${escaped}(?:\\*{0,2}|\`{0,1})`
+    : escaped;
+  const line = section.split("\n").find((candidate) => new RegExp(`^\\|\\s*${prefix}\\s*\\|`, "i").test(candidate));
+  if (!line) return null;
+  return line.split("|").slice(1, -1).map((cell) => cell.trim());
+}
+
+function validAction(value) {
+  return /^(Buy|Hold|Wait|Avoid)$/i.test(value.replace(/[\s*`_]/g, ""));
+}
+
 function endsIncomplete(markdown) {
   const text = markdown.trim();
   if (!text) return true;
-  if (/[.!?)]$/.test(text)) return false;
+  if (/[.!?)|]$/.test(text)) return false;
   const lastLine = text.split("\n").filter(Boolean).at(-1) || "";
   return !/^\s*[-*]?\s*[A-Z0-9.]+[:|]/.test(lastLine);
 }
@@ -346,13 +479,32 @@ function escapeRegExp(value) {
 
 function reportPrompt(compact, options = {}) {
   return [
-    "Produce a concise institutional-style Growth Tech Morning Brief in Markdown.",
-    "Use exactly these top-level sections: Executive Summary; Overnight and Market Context; AI Cycle Dashboard; Sector Scorecard; Watchlist.",
-    "The Watchlist section must mention every successfully retrieved symbol from the supplied data.",
-    "Cover major gainers and losers, volume spikes, market movements, AI-cycle signals, sector conclusions, catalysts, risks, and stock actions.",
-    "Keep each section concise and complete; prefer bullets and short sentences.",
-    "Use only the supplied data; label unavailable items as n/a rather than inventing facts.",
-    "Keep the report actionable, balanced, and suitable for a portfolio manager.",
+    "Produce a concise institutional sell-side Growth Tech Morning Brief in Markdown using the exact schema below.",
+    "Do not add, remove, or rename top-level sections, table columns, required rows, or Executive Summary labels.",
+    "Use only supplied data as sourced facts. Never describe volume as institutional, claim an earnings/macro catalyst, or infer demand from price action as fact.",
+    "When futures, rates, USD, oil, macro events, earnings, forward estimates, catalysts, or risks are not supplied, write 'unavailable' or 'n/a — not in snapshot'.",
+    "Keep sourced facts separate from analysis. Analysis may infer cautiously from supplied price, volume, range, and trailing valuation data.",
+    "Allowed stock and sector actions are Buy, Hold, Wait, or Avoid.",
+    "In table Action cells, write one action only; do not add qualifiers in the same cell.",
+    "",
+    "# Executive Summary",
+    "Exactly five bullets labeled: **AI Cycle:**; **Catalyst:**; **Risk:**; **Best Opportunity:**; **Avoid:**.",
+    "",
+    "# Overnight and Market Context",
+    "Include **Sourced Facts:** and **Analysis:**. Explicitly flag unavailable futures, rates, USD, oil, macro, and earnings data.",
+    "",
+    "# AI Cycle Dashboard",
+    "Markdown table columns: Segment | Rating | Trend | Sourced Facts | Analysis.",
+    `Required rows: ${REQUIRED_AI_CYCLE_ROWS.join("; ")}.`,
+    "",
+    "# Sector Scorecard",
+    "Markdown table columns: Sector | Fundamentals | Valuation | Momentum | Action | Sourced Facts | Analysis.",
+    `Required rows: ${REQUIRED_SECTOR_ROWS.join("; ")}.`,
+    "",
+    "# Watchlist",
+    "Markdown table columns: Symbol | Price | Daily Change | 52W Position | Forward P/E or P/S | Historical Valuation Percentile | Catalyst | Risk | Action.",
+    "Include one row for every successfully retrieved symbol. Use n/a for forward valuation because the snapshot contains trailing metrics only.",
+    "Do not substitute trailing P/E or P/S into the Forward P/E or P/S column. Historical valuation percentile may use the supplied trailing valuation history.",
     options.retry ? "Retry instruction: the previous response was incomplete. Produce a shorter but complete report. Keep every required section and watchlist symbol while reducing commentary." : "",
     "",
     "Compact snapshot JSON:",
@@ -360,14 +512,67 @@ function reportPrompt(compact, options = {}) {
   ].filter(Boolean).join("\n");
 }
 
-function selectedGeminiModel(env) {
-  return env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+function requestedAiRoute(options) {
+  const provider = cleanRouteValue(options?.provider, "provider");
+  const model = cleanRouteValue(options?.model, "model");
+  return provider || model ? { ...(provider ? { provider } : {}), ...(model ? { model } : {}) } : null;
 }
 
-function sanitizeGeminiMessage(message, env) {
+function cleanRouteValue(value, field) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || value.length > 128 || !/^[a-zA-Z0-9._:/-]+$/.test(value)) {
+    throw new Error(`Invalid AI ${field}`);
+  }
+  return value;
+}
+
+function selectedAiRoute(env, override = null) {
+  const provider = (override?.provider || env.AI_PROVIDER || DEFAULT_AI_PROVIDER).toLowerCase();
+  if (!ALLOWED_AI_PROVIDERS.has(provider)) throw new Error(`Unsupported AI provider: ${provider}`);
+  if (provider === "gemini") {
+    const apiKey = env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error("GEMINI_API_KEY is not configured");
+    return { provider, model: override?.model || env.AI_MODEL || env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL, apiKey };
+  }
+  if (provider === "deepseek") {
+    const apiKey = env.DEEPSEEK_API_KEY;
+    if (!apiKey) throw new Error("DEEPSEEK_API_KEY is not configured");
+    return {
+      provider,
+      model: override?.model || env.AI_MODEL || env.DEEPSEEK_MODEL || DEFAULT_DEEPSEEK_MODEL,
+      apiKey,
+      baseUrl: validatedBaseUrl(env.DEEPSEEK_BASE_URL || DEEPSEEK_API_BASE, "DEEPSEEK_BASE_URL"),
+    };
+  }
+  const apiKey = env.OPENAI_COMPAT_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_COMPAT_API_KEY is not configured");
+  if (!env.OPENAI_COMPAT_BASE_URL) throw new Error("OPENAI_COMPAT_BASE_URL is not configured");
+  const model = override?.model || env.AI_MODEL || env.OPENAI_COMPAT_MODEL;
+  if (!model) throw new Error("OPENAI_COMPAT_MODEL is not configured");
+  return {
+    provider,
+    model,
+    apiKey,
+    baseUrl: validatedBaseUrl(env.OPENAI_COMPAT_BASE_URL, "OPENAI_COMPAT_BASE_URL"),
+  };
+}
+
+function validatedBaseUrl(value, name) {
+  let url;
+  try { url = new URL(value); } catch { throw new Error(`${name} must be a valid HTTPS URL`); }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+    throw new Error(`${name} must be a credential-free HTTPS URL without query or fragment`);
+  }
+  return url.toString().replace(/\/$/, "");
+}
+
+function sanitizeAiMessage(message, env) {
   const fallback = "unknown error";
-  const text = typeof message === "string" && message.trim() ? message : fallback;
-  return env.GEMINI_API_KEY ? text.replaceAll(env.GEMINI_API_KEY, "[redacted]") : text;
+  let text = typeof message === "string" && message.trim() ? message : fallback;
+  for (const secret of [env.GEMINI_API_KEY, env.DEEPSEEK_API_KEY, env.OPENAI_COMPAT_API_KEY]) {
+    if (secret) text = text.replaceAll(secret, "[redacted]");
+  }
+  return text;
 }
 
 async function storeReport(env, reportDate, markdown, metadata = {}) {
@@ -375,6 +580,8 @@ async function storeReport(env, reportDate, markdown, metadata = {}) {
     httpMetadata: { contentType: "text/markdown; charset=utf-8" },
     customMetadata: stringifyMetadata({
       reportDate,
+      aiProvider: metadata.aiProvider,
+      aiModel: metadata.aiModel,
       geminiModel: metadata.geminiModel,
       finishReason: metadata.finishReason,
       outputCharacters: metadata.outputCharacters,
@@ -461,7 +668,12 @@ async function resetDeliveryReceipt(env, reportDate, metadata = {}) {
   const payload = {
     date: reportDate,
     updatedAt: new Date().toISOString(),
-    report: stringifyMetadata({ geminiModel: metadata.geminiModel, generatedAt: metadata.generatedAt }),
+    report: stringifyMetadata({
+      aiProvider: metadata.aiProvider,
+      aiModel: metadata.aiModel,
+      geminiModel: metadata.geminiModel,
+      generatedAt: metadata.generatedAt,
+    }),
     discord: {
       sent: false,
       skipped: true,
