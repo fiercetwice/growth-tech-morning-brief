@@ -154,13 +154,15 @@ test("email delivery is skipped unless all Resend settings are present", async (
 
 test("Discord webhooks receive content messages instead of generic JSON", async () => {
   const longMarkdown = `# Report\n\n${"AI-cycle signal. ".repeat(150)}`;
-  const env = { WEBHOOK_URL: "https://discord.com/api/webhooks/123/token" };
+  const env = { DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token" };
 
   const result = await withFetchStub((url, init) => {
-    assert.equal(url, env.WEBHOOK_URL);
+    assert.equal(url, env.DISCORD_WEBHOOK_URL);
     const body = JSON.parse(init.body);
     assert.equal("content" in body, true);
     assert.equal("markdown" in body, false);
+    assert.equal(body.username, "Stock Analyst Bot");
+    assert.equal(body.avatar_url, "https://i.imgur.com/4M34hi2.png");
     assert.match(body.content, /^\*\*Growth Tech Morning Brief — 2026-08-05\*\*/);
     assert.ok(body.content.length <= 1900);
     return new Response(null, { status: 204 });
@@ -170,6 +172,18 @@ test("Discord webhooks receive content messages instead of generic JSON", async 
   assert.equal(result.provider, "discord");
   assert.ok(result.messages > 1);
 });
+
+test("Discord webhook delivery also supports Discord URLs in WEBHOOK_URL", async () => {
+  const env = { WEBHOOK_URL: "https://discordapp.com/api/webhooks/123/token" };
+  const result = await withFetchStub((url, init) => {
+    assert.equal(url, env.WEBHOOK_URL);
+    assert.match(JSON.parse(init.body).content, /Discord fallback/);
+    return new Response(null, { status: 204 });
+  }, () => sendReportWebhook(env, "2026-08-05", "Discord fallback"));
+
+  assert.deepEqual(result, { sent: true, provider: "discord", messages: 1 });
+});
+
 
 test("compact report payload excludes raw history while retaining volume leaders", () => {
   const compact = compactSnapshotForReport({
