@@ -72,6 +72,68 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
   ].join("\n");
 }
 
+function verboseNoTradeReport(symbols = ["NVDA"]) {
+  const symbolText = symbols.join(", ");
+  return [
+    "# Growth Tech Morning Brief",
+    "**Report Mode:** verbose",
+    "**Engine Version:** 0.5.5",
+    "",
+    "# Today's Verdict",
+    "- **Verdict:** No high-conviction trade today.",
+    "- **Confidence:** High because the screened candidates lack a verified, asymmetric setup.",
+    `- **Why Today:** ${symbolText} reached review, but the evidence does not support an actionable entry or exit.`,
+    "",
+    "# Decision Reasoning",
+    "**Universe Searched:** The core watchlist and broad discovery universe were screened for events, earnings, dislocations, valuation extremes, and liquidity.",
+    `**Opportunity Gate:** ${symbolText} entered through a material price move, then faced catalyst, valuation, evidence-quality, and risk/reward checks.`,
+    "**Conclusion:** The move was not tied to verified new fundamental information, so treating it as mispricing would be speculation rather than an evidence-backed trade.",
+    "",
+    "# Opportunities",
+    "- **Threshold Result:** No actionable opportunity clears the absolute trade threshold.",
+    `- **Best Near-Miss:** ${symbolText} was the strongest near-miss because its move was large enough to require investigation.`,
+    "- **Why It Failed:** No verified catalyst, fresh estimate change, or measurable valuation dislocation established favorable expected value.",
+    "- **Portfolio Action:** Hold existing exposure and wait for verified information or a price level that creates asymmetric risk/reward.",
+    "",
+    "# Rejected Candidates",
+    "### NVDA — Watch",
+    "- **Admission Signal:** The daily move exceeded the dislocation threshold.",
+    "- **Evidence Supporting:** Positive price momentum made the move relevant for same-day review.",
+    "- **Evidence Missing or Conflicting:** No direct company catalyst or demand evidence was verified, and valuation evidence does not establish a bargain.",
+    "- **Rejection Reason:** Momentum alone cannot justify a Buy or Sell action.",
+    "- **Promotion Trigger:** Verified company news plus a favorable entry and explicit invalidation level.",
+    "",
+    "# Data and Pipeline Audit",
+    "**Available Evidence:** Current price, daily change, range position, screened news, and available historical valuation were reviewed.",
+    "**Missing Evidence:** Forward estimates, direct demand indicators, and a verified company catalyst are unavailable.",
+    "**Source Failures:** No source failure is hidden; missing items are absent from configured feeds rather than silently treated as negative evidence.",
+    "**Confidence Impact:** Missing catalyst and forward-estimate data raises confidence in No Trade but lowers confidence in any directional thesis.",
+    "",
+    "# Market and AI-Cycle Context",
+    "- **AI Cycle:** Direct CapEx, backlog, utilization, and estimate-revision evidence remains insufficient.",
+    "- **Market Regime:** Price action is mixed and does not independently create a trade signal.",
+    "- **Material News:** No verified event changes the candidate conclusion.",
+    "",
+    "# What Could Change the Call",
+    "- A verified earnings, guidance, contract, regulatory, or estimate-revision event.",
+    "- A larger price dislocation that creates favorable risk/reward with a defined invalidation level.",
+  ].join("\n");
+}
+
+test("verbose validation requires an auditable no-trade explanation", () => {
+  const compact = {
+    reportMode: "verbose",
+    engineVersion: "0.5.5",
+    opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
+  };
+  const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
+  assert.deepEqual(valid, { ok: true, errors: [] });
+
+  const silent = validateReportCompleteness(verboseNoTradeReport().replace(/NVDA/g, "the candidate"), ["NVDA"], compact);
+  assert.equal(silent.ok, false);
+  assert.match(silent.errors.join("; "), /silently omitted gated candidate: NVDA/);
+});
+
 function geminiReport(text, finishReason = "STOP", usageMetadata = {}, parts = null) {
   return {
     candidates: [{ finishReason, content: { parts: parts ?? [{ text }] } }],
@@ -246,9 +308,9 @@ test("DeepSeek route uses the official OpenAI-compatible endpoint without an out
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.outputTokenCount, "1400");
 });
 
-test("authenticated run-report can route a forced regeneration to a selected DeepSeek model", async () => {
+test("authenticated run-report can route a forced verbose regeneration to a selected DeepSeek model", async () => {
   const bucket = r2({ "reports/2026-08-05.md": "old report", "reports/latest.md": "old report" });
-  const markdown = completeReport(["NVDA"], "One-off DeepSeek route completed.");
+  const markdown = verboseNoTradeReport(["NVDA"]);
   const env = {
     RUN_TOKEN_REQUIRED: "true",
     RUN_TOKEN: "secret",
@@ -262,18 +324,25 @@ test("authenticated run-report can route a forced regeneration to a selected Dee
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
     assert.equal(url, "https://api.deepseek.com/chat/completions");
-    assert.equal(JSON.parse(init.body).model, "deepseek-v4-pro");
+    const requestBody = JSON.parse(init.body);
+    assert.equal(requestBody.model, "deepseek-v4-pro");
+    assert.match(requestBody.messages[0].content, /Verbose mode is an audit trail/);
+    assert.match(requestBody.messages[0].content, /Data and Pipeline Audit/);
     return responseJson({ choices: [{ finish_reason: "stop", message: { content: markdown } }] });
   }, () => worker.fetch(new Request("https://example.test/run-report", {
     method: "POST",
     headers: { authorization: "Bearer secret", "content-type": "application/json" },
-    body: JSON.stringify({ forceRegenerate: true, provider: "deepseek", model: "deepseek-v4-pro" }),
+    body: JSON.stringify({ forceRegenerate: true, provider: "deepseek", model: "deepseek-v4-pro", reportMode: "verbose" }),
   }), env));
 
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.report.aiProvider, "deepseek");
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
+  assert.equal(body.report.reportMode, "verbose");
+  assert.equal(body.report.reportEngineVersion, "0.5.5");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.5");
   assert.equal(bucket.objects.get("reports/latest.md"), markdown);
 });
 
@@ -287,7 +356,7 @@ test("run-report rejects provider/model overrides unless regeneration is explici
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), {
     error: "force_regenerate_required",
-    message: "provider/model overrides require forceRegenerate=true",
+    message: "provider/model/reportMode overrides require forceRegenerate=true",
   });
 });
 
@@ -627,11 +696,14 @@ test("existing dated report prevents duplicate report generation but still evalu
 
   assert.deepEqual(result.report, {
     date: "2026-08-05",
+    engineVersion: "0.5.5",
     generated: false,
     stored: true,
     email: null,
     webhook: { skipped: true, reason: "webhook_not_configured" },
     reused: true,
+    reportMode: "unknown",
+    reportEngineVersion: "unknown",
   });
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), "already sent");
 });
