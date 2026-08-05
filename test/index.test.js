@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildValuationHistory, normalizeYahooChart, percentile, quarterlyFacts, toBrief, zonedParts } from "../src/index.js";
+import {
+  buildCalendarContext, buildMarketContext, buildValuationHistory, normalizeNasdaqEarningsCalendar, normalizeNasdaqMacroCalendar,
+  normalizeYahooChart, percentile, quarterlyFacts, toBrief, zonedParts,
+} from "../src/index.js";
 
 test("DST-aware New York schedule accepts summer and winter triggers", () => {
   assert.deepEqual(zonedParts(new Date("2026-08-03T13:35:00Z"), "America/New_York"), { date: "2026-08-03", hour: 9, minute: 35 });
@@ -16,6 +19,73 @@ test("normalizes Yahoo chart history and current move", () => {
   assert.equal(chart.price, 110);
   assert.equal(chart.changePercent, 10);
   assert.equal(chart.history.length, 2);
+});
+
+test("Yahoo normalization retains the quote as-of timestamp", () => {
+  const chart = normalizeYahooChart({
+    meta: { regularMarketPrice: 101, regularMarketPreviousClose: 100, regularMarketTime: 1785935700 },
+    timestamp: [1785849300, 1785935700],
+    indicators: { quote: [{ close: [100, 101] }] },
+  });
+  assert.equal(chart.asOf, "2026-08-05T13:15:00.000Z");
+});
+
+test("normalizes Nasdaq macro events without HTML placeholders", () => {
+  const calendar = normalizeNasdaqMacroCalendar({ data: { rows: [{
+    time: "08:30 AM", country: "US", eventName: "Initial Claims", actual: "225K",
+    consensus: "230K", previous: "<span>228K</span>",
+  }] } }, "2026-08-05", new Date("2026-08-05T13:35:00Z"));
+  assert.equal(calendar.status, "available");
+  assert.deepEqual(calendar.events[0], {
+    time: "08:30 AM", country: "US", event: "Initial Claims", actual: "225K", consensus: "230K", previous: "228K",
+  });
+});
+
+test("Nasdaq earnings prioritizes covered symbols and caps prompt payload", () => {
+  const rows = Array.from({ length: 30 }, (_, index) => ({
+    symbol: `T${index}`, name: `Company ${index}`, time: "time-not-supplied", epsForecast: "$1.00",
+  }));
+  rows.push({ symbol: "NVDA", name: "NVIDIA", time: "After Hours", epsForecast: "$2.00" });
+  const calendar = normalizeNasdaqEarningsCalendar({ data: { asOf: "08/05/2026", rows } }, "2026-08-05", ["NVDA"]);
+  assert.equal(calendar.events.length, 25);
+  assert.equal(calendar.events[0].symbol, "NVDA");
+  assert.deepEqual(calendar.watchlistMatches, ["NVDA"]);
+});
+
+test("market context preserves partial coverage and flags stale quotes", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (!url.includes("ES%3DF")) return new Response("upstream failed", { status: 503 });
+    return new Response(JSON.stringify({ chart: { result: [{
+      meta: { regularMarketPrice: 6000, regularMarketPreviousClose: 5970, regularMarketTime: 1785849300, currency: "USD" },
+      timestamp: [1785849300], indicators: { quote: [{ close: [6000] }] },
+    }] } }), { headers: { "content-type": "application/json" } });
+  };
+  try {
+    const context = await buildMarketContext({}, new Date("2026-08-05T13:35:00Z"));
+    assert.equal(context.futures.status, "stale");
+    assert.equal(context.futures.items.length, 1);
+    assert.equal(context.futures.failed, 3);
+    assert.equal(context.rates.status, "unavailable");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("calendar provider failure is isolated by category", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ status: { bCodeMessage: [{ errorMessage: "calendar unavailable" }] } }), {
+    status: 503, headers: { "content-type": "application/json" },
+  });
+  try {
+    const calendars = await buildCalendarContext({}, new Date("2026-08-05T13:35:00Z"), ["NVDA"]);
+    assert.equal(calendars.macroEvents.status, "unavailable");
+    assert.equal(calendars.earnings.status, "unavailable");
+    assert.match(calendars.macroEvents.reason, /calendar unavailable/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("does not mistake the start of a multi-year chart for previous close", () => {
