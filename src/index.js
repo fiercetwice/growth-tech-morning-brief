@@ -1,6 +1,7 @@
 const YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart";
 const SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts";
-const GEMINI_GENERATE_CONTENT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 
@@ -92,8 +93,10 @@ async function generateOrDeliverReport(env, now, options = {}) {
       const latestObject = await env.BRIEF_BUCKET.get("snapshots/latest.json");
       if (!latestObject) throw new Error("snapshots/latest.json was not found after snapshot creation");
       const latestSnapshot = await latestObject.json();
-      reportMarkdown = await generateGeminiReport(env, latestSnapshot);
-      await storeReport(env, reportDate, reportMarkdown);
+      const generatedReport = await generateGeminiReport(env, latestSnapshot);
+      reportMarkdown = generatedReport.markdown;
+      reportResults.geminiModel = generatedReport.model;
+      await storeReport(env, reportDate, reportMarkdown, { geminiModel: generatedReport.model });
       reportResults.generated = true;
       reportResults.stored = true;
     }
@@ -204,10 +207,12 @@ export function compactSnapshotForReport(snapshot) {
 
 export async function generateGeminiReport(env, snapshot) {
   if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not configured");
+  const model = selectedGeminiModel(env);
+  const endpoint = `${GEMINI_API_BASE}/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
   const compact = compactSnapshotForReport(snapshot);
-  const response = await fetch(GEMINI_GENERATE_CONTENT, {
+  const response = await fetch(endpoint, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({
       contents: [{
         role: "user",
@@ -217,10 +222,12 @@ export async function generateGeminiReport(env, snapshot) {
     }),
   });
   const body = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(`Gemini report failed (${response.status}): ${body?.error?.message ?? "unknown error"}`);
+  if (!response.ok) {
+    throw new Error(`Gemini report failed (${response.status}, model: ${model}): ${sanitizeGeminiMessage(body?.error?.message, env)}`);
+  }
   const text = body?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) throw new Error("Gemini report response did not include candidates[0].content.parts[0].text");
-  return text;
+  return { markdown: text, model };
 }
 
 function reportPrompt(compact) {
@@ -235,10 +242,27 @@ function reportPrompt(compact) {
   ].join("\n");
 }
 
-async function storeReport(env, reportDate, markdown) {
+function selectedGeminiModel(env) {
+  return env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+}
+
+function sanitizeGeminiMessage(message, env) {
+  const fallback = "unknown error";
+  const text = typeof message === "string" && message.trim() ? message : fallback;
+  return env.GEMINI_API_KEY ? text.replaceAll(env.GEMINI_API_KEY, "[redacted]") : text;
+}
+
+async function storeReport(env, reportDate, markdown, metadata = {}) {
+  const options = {
+    httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+    customMetadata: {
+      reportDate,
+      ...(metadata.geminiModel ? { geminiModel: metadata.geminiModel } : {}),
+    },
+  };
   await Promise.all([
-    env.BRIEF_BUCKET.put(`reports/${reportDate}.md`, markdown, { httpMetadata: { contentType: "text/markdown; charset=utf-8" } }),
-    env.BRIEF_BUCKET.put("reports/latest.md", markdown, { httpMetadata: { contentType: "text/markdown; charset=utf-8" } }),
+    env.BRIEF_BUCKET.put(`reports/${reportDate}.md`, markdown, options),
+    env.BRIEF_BUCKET.put("reports/latest.md", markdown, options),
   ]);
 }
 
