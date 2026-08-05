@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.5.1 — sourced market context and calendars
+# Growth Tech Morning Brief v0.5.2 — deterministic research decisions
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -8,10 +8,11 @@ Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/N
 - Yahoo Finance's unofficial chart endpoint: S&P 500, Nasdaq 100, Dow and Russell 2000 futures; U.S. 10-year yield; U.S. Dollar Index; WTI and Brent crude, including daily moves and quote timestamps.
 - Nasdaq public calendar endpoints: today's economic releases and earnings schedule, including available event times, actual/consensus/previous values, EPS forecasts and covered-watchlist matches.
 - SEC EDGAR CompanyFacts: reported revenue, diluted EPS and diluted shares.
-- Local calculation: point-in-time trailing P/E and P/S history plus five-year valuation percentiles. A historical date uses only SEC filings published by that date, avoiding look-ahead bias.
+- Local calculation: reported TTM and latest-quarter revenue/EPS growth, point-in-time trailing P/E and P/S history, and five-year valuation percentiles. A historical date uses only SEC filings published by that date, avoiding look-ahead bias.
+- Deterministic research framework: sector fundamentals, valuation, momentum, actions, watchlist actions, catalysts, and quantified risks are computed before AI generation. The model explains these decisions but cannot override them.
 - R2 caches SEC responses for seven days, keeps full dated calculation snapshots, stores compact dated briefs, and saves Gemini-generated Markdown reports.
 
-Yahoo and Nasdaq calendar endpoints are unofficial public web endpoints and can change or rate-limit access. Every context category therefore carries `available`, `stale`, or `unavailable` status, its source, and an as-of timestamp. A failure is isolated to that category and never blocks the equity snapshot. SEC data is authoritative but issuers use differing XBRL tags; unavailable fields remain null rather than being invented. Historical analyst-consensus forward P/E is not included.
+Yahoo and Nasdaq calendar endpoints are unofficial public web endpoints and can change or rate-limit access. Every context category therefore carries `available`, `stale`, or `unavailable` status, its source, and an as-of timestamp. A failure is isolated to that category and never blocks the equity snapshot. Macro events are filtered to U.S. releases and globally relevant central-bank/growth/inflation events. SEC data is authoritative but issuers use differing XBRL tags; unavailable fields remain null rather than being invented. Analyst-consensus forward valuation and estimate revisions are not included and remain explicitly unavailable.
 
 ## One-time R2 setup and deployment
 
@@ -101,7 +102,9 @@ On the valid 09:35 AM ET scheduled run, the Worker writes the stock snapshot, re
 
 Gemini defaults to `gemini-3.5-flash` with low thinking. DeepSeek uses its official OpenAI-compatible Chat Completions endpoint, defaults to `deepseek-v4-flash`, and disables thinking for concise report generation. Neither route sets an application-level output-token ceiling. Generic OpenAI-compatible endpoints are available only through a preconfigured HTTPS base URL and secret.
 
-Every provider must return a normally completed response. The Worker validates an exact institutional report schema before storage: five labeled Executive Summary bullets; sourced facts separated from analysis; labeled Futures, Rates, USD, Oil, Macro Events and Earnings fields; all five AI Cycle rows; all eight Sector Scorecard rows with Fundamentals, Valuation, Momentum, and Action; and one complete Watchlist row per retrieved symbol with price, daily move, 52-week position, forward-valuation availability, historical valuation percentile, catalyst, risk, and action. A report is rejected if it marks a supplied context category unavailable. Missing metrics must be marked unavailable instead of invented. An existing dated report prevents duplicate generation, but delivery is retried until `deliveries/YYYY-MM-DD.json` records a successful Discord receipt.
+Every provider must return a normally completed response. The Worker validates an exact institutional report schema before storage: five labeled Executive Summary bullets; sourced facts separated from analysis; labeled Futures, Rates, USD, Oil, Macro Events and Earnings fields; all five AI Cycle rows; all eight Sector Scorecard rows with Fundamentals, Valuation, Momentum, and Action; and one complete Watchlist row per retrieved symbol with price, daily move, 52-week position, forward-valuation availability, historical valuation percentile, catalyst, risk, and action. It also rejects model output that contradicts deterministic ratings/actions or makes unsupported demand, CapEx-cycle, or institutional-flow claims. A report is rejected if it marks a supplied context category unavailable. Missing metrics must be marked unavailable instead of invented. Session labels distinguish premarket, regular trading, after-hours, and closed markets. An existing dated report prevents duplicate generation, but delivery is retried until `deliveries/YYYY-MM-DD.json` records a successful Discord receipt.
+
+AI-cycle demand and CapEx rows intentionally remain `Insufficient Data / Unclear` until the snapshot contains direct indicators such as hyperscaler CapEx guidance, backlog, utilization, or analyst estimate revisions. Daily stock returns are momentum inputs, not evidence of end demand.
 
 If a provider returns a token-limit finish reason or a report that fails schema validation, the Worker retries once with a shorter-but-complete prompt. If the retry is still incomplete, the report is rejected and the previous stored report remains unchanged. Use `forceRegenerate` when `/run-report` should replace an existing dated report; use `forceDelivery` by itself when the stored report should be resent without calling the AI provider.
 
