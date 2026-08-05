@@ -4,6 +4,7 @@ import fs from "node:fs";
 import worker from "../src/index.js";
 
 const schema = fs.readFileSync(new URL("../openapi/gpt-action.yaml", import.meta.url), "utf8");
+const deployWorkflow = fs.readFileSync(new URL("../.github/workflows/cloudflare-worker.yml", import.meta.url), "utf8");
 
 test("GPT Action schema targets the deployed Worker and all routes", () => {
   assert.match(schema, /https:\/\/growth-tech-morning-brief\.ck-market-tools\.workers\.dev/);
@@ -40,4 +41,14 @@ test("health exposes the deployed release for propagation-safe smoke tests", asy
   const response = await worker.fetch(new Request("https://example.test/health"), {});
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.5" });
+});
+
+test("post-deploy failures print actionable diagnostics before exiting", () => {
+  const summaryIndex = deployWorkflow.indexOf('echo "$summary"');
+  const failureIndex = deployWorkflow.indexOf('if [ -n "$failures" ]');
+  assert.ok(summaryIndex >= 0 && summaryIndex < failureIndex);
+  assert.match(deployWorkflow, /Discord delivery incomplete:/);
+  assert.match(deployWorkflow, /chunks delivered/);
+  assert.match(deployWorkflow, /echo "::error::\$failure"/);
+  assert.match(deployWorkflow, /GITHUB_STEP_SUMMARY/);
 });
