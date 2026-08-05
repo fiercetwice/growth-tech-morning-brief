@@ -49,8 +49,16 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "- **Confidence:** Medium.",
     `- **Why Today:** ${detail}`,
     "",
+    "# Decision Reasoning",
+    "**Universe Searched:** The core watchlist and configured discovery screens were checked with liquidity and relevance filters.",
+    "**Opportunity Gate:** Candidates require a fresh event, earnings, a meaningful dislocation, or an extreme trim setup; ranking alone is insufficient.",
+    "**Conclusion:** The strongest setup lacks enough verified evidence and asymmetric risk/reward to justify action today.",
+    "",
     "# Opportunities",
     "No actionable opportunity clears the threshold.",
+    "",
+    "# Rejected Candidates",
+    `${symbolText} reached review, but the fixture contains no verified catalyst or evidence of a durable market mispricing. A confirmed event and favorable entry would promote it.`,
     "",
     "# Market and AI-Cycle Context",
     "- **AI Cycle:** Insufficient data; price action cannot establish the cycle.",
@@ -60,6 +68,7 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "# What Could Change the Call",
     "- A verified company catalyst with a measurable price reaction.",
     "- A material Fed decision or yield reversal.",
+    "- Better fundamental, valuation, and liquidity evidence could change the conclusion.",
   ].join("\n");
 }
 

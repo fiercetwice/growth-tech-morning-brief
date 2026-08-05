@@ -67,13 +67,21 @@ jobs:
             exit 1
           fi
 
-          curl --fail --silent --show-error \
-            --retry 12 \
-            --retry-all-errors \
-            --retry-delay 5 \
-            --connect-timeout 10 \
-            --max-time 30 \
-            "$WORKER_URL/health" > /dev/null
+          expected_version="$(jq -r '.version' package.json)"
+          for attempt in $(seq 1 24); do
+            deployed_version="$(curl --fail --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              "$WORKER_URL/health" | jq -r '.version // empty' || true)"
+            if [ "$deployed_version" = "$expected_version" ]; then
+              break
+            fi
+            if [ "$attempt" = "24" ]; then
+              echo "::error::Worker v$expected_version did not become active before the smoke-test deadline."
+              exit 1
+            fi
+            sleep 5
+          done
 
           response="$(curl --fail-with-body --silent --show-error \
             --connect-timeout 15 \

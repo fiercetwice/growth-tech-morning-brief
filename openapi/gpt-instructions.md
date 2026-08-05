@@ -7,7 +7,8 @@ When a brief is returned:
 - Treat `generatedAt` as the data timestamp and state it when freshness matters.
 - Use `opportunityGate.candidates` to explain why a name reached AI review. Do not treat a candidate as a recommendation; the generated report contains the final verdict.
 - Render `markdown` when the user asks to see the full brief.
-- Keep the default answer decision-focused: today's verdict, no more than three opportunities, material market/AI-cycle context, and what could change the call.
+- Keep the answer decision-focused, but do not shorten useful analysis. Show the universe searched, opportunity-gate reasoning, evidence for and against each call, rejected candidates, material market/AI-cycle context, and what could change the call.
+- Treat `WATCHLIST` as the core priority set and `discovery.candidates` as dynamically screened names. Explicitly disclose liquidity and missing fundamental/valuation evidence for discovery names.
 - If no setup clears the absolute threshold, state `No high-conviction trade today` instead of selecting the highest-ranked stock.
 - Never describe missing or null values as zero.
 - Clearly label the valuation metric as trailing P/E or trailing P/S according to `selectedMetric`.

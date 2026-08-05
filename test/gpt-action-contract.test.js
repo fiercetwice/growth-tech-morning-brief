@@ -12,10 +12,10 @@ test("GPT Action schema targets the deployed Worker and all routes", () => {
   assert.match(schema, /operationId: refreshMorningBrief/);
 });
 
-test("GPT Action contract uses bearer auth and schema version 5", () => {
+test("GPT Action contract uses bearer auth and schema version 6", () => {
   assert.match(schema, /type: http\n\s+scheme: bearer/);
-  assert.match(schema, /schemaVersion:[\s\S]*enum: \[5\]/);
-  assert.match(schema, /required: \[schemaVersion, generatedAt, session, coverage, opportunityGate, watchlist, markdown\]/);
+  assert.match(schema, /schemaVersion:[\s\S]*enum: \[6\]/);
+  assert.match(schema, /required: \[schemaVersion, generatedAt, session, coverage, discovery, opportunityGate, watchlist, markdown\]/);
 });
 
 test("refresh action is explicitly opt-in", () => {
@@ -23,7 +23,7 @@ test("refresh action is explicitly opt-in", () => {
 });
 
 test("Worker accepts a trailing slash on the GPT read route", async () => {
-  const expected = { schemaVersion: 5, markdown: "ok" };
+  const expected = { schemaVersion: 6, markdown: "ok" };
   const env = {
     RUN_TOKEN_REQUIRED: "true",
     RUN_TOKEN: "smoke-token",
@@ -34,4 +34,10 @@ test("Worker accepts a trailing slash on the GPT read route", async () => {
   }), env);
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), expected);
+});
+
+test("health exposes the deployed release for propagation-safe smoke tests", async () => {
+  const response = await worker.fetch(new Request("https://example.test/health"), {});
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.4" });
 });
