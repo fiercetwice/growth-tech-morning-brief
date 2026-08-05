@@ -184,6 +184,7 @@ test("Discord webhook delivery also supports Discord URLs in WEBHOOK_URL", async
   assert.deepEqual(result, { sent: true, provider: "discord", messages: 1 });
 });
 
+
 test("compact report payload excludes raw history while retaining volume leaders", () => {
   const compact = compactSnapshotForReport({
     generatedAt: "2026-08-05T13:35:00.000Z",
