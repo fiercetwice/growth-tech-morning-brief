@@ -4,6 +4,13 @@ const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
+const REQUIRED_REPORT_SECTIONS = [
+  "Executive Summary",
+  "Overnight and Market Context",
+  "AI Cycle Dashboard",
+  "Sector Scorecard",
+  "Watchlist",
+];
 
 const CIKS = {
   NVDA: "0001045810", AMZN: "0001018724", MSFT: "0000789019",
@@ -50,7 +57,10 @@ export default {
       if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
       try {
         const options = await request.json().catch(() => ({}));
-        return json(await runReportNow(env, new Date(), { forceDelivery: options?.forceDelivery === true }));
+        return json(await runReportNow(env, new Date(), {
+          forceDelivery: options?.forceDelivery === true,
+          forceRegenerate: options?.forceRegenerate === true,
+        }));
       } catch (error) {
         console.error(error);
         return json({ error: "run_report_failed", message: errorMessage(error) }, 502);
@@ -73,7 +83,10 @@ export async function runScheduledBrief(env, now = new Date()) {
 
 export async function runReportNow(env, now = new Date(), options = {}) {
   const snapshot = await buildSnapshot(env, now, { force: true });
-  const report = await generateOrDeliverReport(env, now, { forceDelivery: options.forceDelivery === true });
+  const report = await generateOrDeliverReport(env, now, {
+    forceDelivery: options.forceDelivery === true,
+    forceRegenerate: options.forceRegenerate === true,
+  });
   return { snapshot, report };
 }
 
@@ -85,7 +98,7 @@ async function generateOrDeliverReport(env, now, options = {}) {
   const reportResults = { date: reportDate, generated: false, stored: false, email: null, webhook: null };
   try {
     let reportMarkdown;
-    if (reportObject) {
+    if (reportObject && !options.forceRegenerate) {
       reportMarkdown = await reportObject.text();
       reportResults.reused = true;
       reportResults.stored = true;
@@ -96,11 +109,16 @@ async function generateOrDeliverReport(env, now, options = {}) {
       const generatedReport = await generateGeminiReport(env, latestSnapshot);
       reportMarkdown = generatedReport.markdown;
       reportResults.geminiModel = generatedReport.model;
-      await storeReport(env, reportDate, reportMarkdown, { geminiModel: generatedReport.model });
+      reportResults.generation = generatedReport.metadata;
+      await storeReport(env, reportDate, reportMarkdown, generatedReport.metadata);
       reportResults.generated = true;
       reportResults.stored = true;
+      if (options.forceRegenerate) {
+        reportResults.replaced = Boolean(reportObject);
+        await resetDeliveryReceipt(env, reportDate, generatedReport.metadata);
+      }
     }
-    if (!reportObject) {
+    if (!reportObject || options.forceRegenerate) {
       reportResults.email = await settleDelivery(() => sendReportEmail(env, reportDate, reportMarkdown));
     }
     reportResults.webhook = await deliverReportWebhookOnce(env, reportDate, reportMarkdown, {
@@ -208,38 +226,138 @@ export function compactSnapshotForReport(snapshot) {
 export async function generateGeminiReport(env, snapshot) {
   if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not configured");
   const model = selectedGeminiModel(env);
-  const endpoint = `${GEMINI_API_BASE}/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
   const compact = compactSnapshotForReport(snapshot);
+  const requiredSymbols = compact.watchlist.filter((row) => !row.missing).map((row) => row.symbol);
+  const prompts = [
+    reportPrompt(compact),
+    reportPrompt(compact, { retry: true }),
+  ];
+  const failures = [];
+
+  for (const [index, prompt] of prompts.entries()) {
+    const attempt = index + 1;
+    const response = await requestGeminiReport(env, model, prompt);
+    const extracted = extractGeminiReport(response.body, model, env);
+    const metadata = reportMetadata(model, response.body, extracted, attempt);
+    if (!response.ok || extracted.finishReason !== "STOP" || !extracted.markdown) {
+      const diagnostic = geminiFailureDiagnostic(response.status, model, extracted, env);
+      failures.push(`attempt ${attempt}: ${diagnostic}`);
+      if (extracted.finishReason !== "MAX_TOKENS") break;
+      continue;
+    }
+    const validation = validateReportCompleteness(extracted.markdown, requiredSymbols);
+    metadata.validation = validation.ok ? "passed" : "failed";
+    metadata.validationErrors = validation.errors.join("; ");
+    if (validation.ok) return { markdown: extracted.markdown, model, metadata };
+    failures.push(`attempt ${attempt}: ${validation.errors.join("; ")}`);
+  }
+  throw new Error(`Gemini report incomplete after ${failures.length} attempt(s): ${failures.join(" | ")}`);
+}
+
+async function requestGeminiReport(env, model, prompt) {
+  const endpoint = `${GEMINI_API_BASE}/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
   const response = await fetch(endpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      contents: [{
-        role: "user",
-        parts: [{ text: reportPrompt(compact) }],
-      }],
-      generationConfig: { temperature: 0.25, maxOutputTokens: 1800 },
-    }),
+    body: JSON.stringify(geminiRequestBody(prompt)),
   });
-  const body = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(`Gemini report failed (${response.status}, model: ${model}): ${sanitizeGeminiMessage(body?.error?.message, env)}`);
-  }
-  const text = body?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error("Gemini report response did not include candidates[0].content.parts[0].text");
-  return { markdown: text, model };
+  return { ok: response.ok, status: response.status, body: await response.json().catch(() => null) };
 }
 
-function reportPrompt(compact) {
+function geminiRequestBody(prompt) {
+  return {
+    contents: [{
+      role: "user",
+      parts: [{ text: prompt }],
+    }],
+    generationConfig: {
+      temperature: 0.25,
+      thinkingConfig: { thinkingLevel: "low" },
+    },
+  };
+}
+
+function extractGeminiReport(body, model, env) {
+  const candidate = body?.candidates?.[0];
+  if (!candidate) {
+    return { finishReason: null, markdown: "", error: sanitizeGeminiMessage(body?.error?.message || "missing candidates[0]", env) };
+  }
+  const finishReason = candidate.finishReason ?? null;
+  const parts = candidate.content?.parts ?? [];
+  const markdown = parts
+    .filter((part) => typeof part.text === "string" && !part.thought)
+    .map((part) => part.text)
+    .join("")
+    .trim();
+  return {
+    finishReason,
+    markdown,
+    error: markdown ? null : `missing non-thought text for model ${model}`,
+  };
+}
+
+function geminiFailureDiagnostic(status, model, extracted, env) {
+  const finish = extracted.finishReason || "missing";
+  const message = extracted.error ? `: ${sanitizeGeminiMessage(extracted.error, env)}` : "";
+  return `Gemini report failed (${status}, model: ${model}, finishReason: ${finish})${message}`;
+}
+
+function reportMetadata(model, body, extracted, attempts) {
+  const usage = body?.usageMetadata ?? {};
+  return {
+    geminiModel: model,
+    finishReason: extracted.finishReason || "missing",
+    outputCharacters: extracted.markdown.length,
+    outputTokenCount: usage.candidatesTokenCount ?? usage.outputTokenCount ?? null,
+    thoughtsTokenCount: usage.thoughtsTokenCount ?? null,
+    totalTokenCount: usage.totalTokenCount ?? null,
+    generationAttempts: attempts,
+    generatedAt: new Date().toISOString(),
+    validation: "not_run",
+  };
+}
+
+function validateReportCompleteness(markdown, symbols) {
+  const errors = [];
+  const normalized = markdown.toLowerCase();
+  for (const section of REQUIRED_REPORT_SECTIONS) {
+    if (!normalized.includes(section.toLowerCase())) errors.push(`missing section: ${section}`);
+  }
+  for (const symbol of symbols) {
+    const pattern = new RegExp(`(^|[^A-Z])${escapeRegExp(symbol)}([^A-Z]|$)`);
+    if (!pattern.test(markdown)) errors.push(`missing watchlist symbol: ${symbol}`);
+  }
+  if (markdown.length < 500) errors.push("report is shorter than the minimum complete length");
+  if (endsIncomplete(markdown)) errors.push("report ends with an incomplete sentence");
+  return { ok: errors.length === 0, errors };
+}
+
+function endsIncomplete(markdown) {
+  const text = markdown.trim();
+  if (!text) return true;
+  if (/[.!?)]$/.test(text)) return false;
+  const lastLine = text.split("\n").filter(Boolean).at(-1) || "";
+  return !/^\s*[-*]?\s*[A-Z0-9.]+[:|]/.test(lastLine);
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function reportPrompt(compact, options = {}) {
   return [
     "Produce a concise institutional-style Growth Tech Morning Brief in Markdown.",
+    "Use exactly these top-level sections: Executive Summary; Overnight and Market Context; AI Cycle Dashboard; Sector Scorecard; Watchlist.",
+    "The Watchlist section must mention every successfully retrieved symbol from the supplied data.",
     "Cover major gainers and losers, volume spikes, market movements, AI-cycle signals, sector conclusions, catalysts, risks, and stock actions.",
+    "Keep each section concise and complete; prefer bullets and short sentences.",
     "Use only the supplied data; label unavailable items as n/a rather than inventing facts.",
     "Keep the report actionable, balanced, and suitable for a portfolio manager.",
+    options.retry ? "Retry instruction: the previous response was incomplete. Produce a shorter but complete report. Keep every required section and watchlist symbol while reducing commentary." : "",
     "",
     "Compact snapshot JSON:",
     JSON.stringify(compact),
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function selectedGeminiModel(env) {
@@ -255,15 +373,30 @@ function sanitizeGeminiMessage(message, env) {
 async function storeReport(env, reportDate, markdown, metadata = {}) {
   const options = {
     httpMetadata: { contentType: "text/markdown; charset=utf-8" },
-    customMetadata: {
+    customMetadata: stringifyMetadata({
       reportDate,
-      ...(metadata.geminiModel ? { geminiModel: metadata.geminiModel } : {}),
-    },
+      geminiModel: metadata.geminiModel,
+      finishReason: metadata.finishReason,
+      outputCharacters: metadata.outputCharacters,
+      outputTokenCount: metadata.outputTokenCount,
+      thoughtsTokenCount: metadata.thoughtsTokenCount,
+      totalTokenCount: metadata.totalTokenCount,
+      generationAttempts: metadata.generationAttempts,
+      generatedAt: metadata.generatedAt,
+      validation: metadata.validation,
+      validationErrors: metadata.validationErrors,
+    }),
   };
   await Promise.all([
     env.BRIEF_BUCKET.put(`reports/${reportDate}.md`, markdown, options),
     env.BRIEF_BUCKET.put("reports/latest.md", markdown, options),
   ]);
+}
+
+function stringifyMetadata(metadata) {
+  return Object.fromEntries(Object.entries(metadata)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => [key, String(value)]));
 }
 
 async function deliverLatestReport(env, now) {
@@ -312,6 +445,27 @@ async function storeDeliveryReceipt(env, reportDate, webhook) {
       reason: webhook?.reason,
       error: webhook?.error,
       messages: webhook?.messages ?? null,
+      expectedChunks: webhook?.chunks?.expected ?? null,
+      deliveredChunks: webhook?.chunks?.delivered ?? null,
+      failedChunks: webhook?.chunks?.failed ?? null,
+      timestamp: new Date().toISOString(),
+    },
+  };
+  await env.BRIEF_BUCKET.put(`deliveries/${reportDate}.json`, JSON.stringify(payload, null, 2), {
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+  });
+}
+
+async function resetDeliveryReceipt(env, reportDate, metadata = {}) {
+  if (!env.BRIEF_BUCKET?.put) return;
+  const payload = {
+    date: reportDate,
+    updatedAt: new Date().toISOString(),
+    report: stringifyMetadata({ geminiModel: metadata.geminiModel, generatedAt: metadata.generatedAt }),
+    discord: {
+      sent: false,
+      skipped: true,
+      reason: "report_regenerated",
       timestamp: new Date().toISOString(),
     },
   };
@@ -355,10 +509,22 @@ export async function sendReportWebhook(env, reportDate, markdown) {
   const discordUrl = env.DISCORD_WEBHOOK_URL || (isDiscordWebhook(env.WEBHOOK_URL) ? env.WEBHOOK_URL : null);
   if (discordUrl) {
     const chunks = discordMessageChunks(reportDate, markdown);
+    let delivered = 0;
     for (const [index, content] of chunks.entries()) {
-      await postWebhookJson(discordUrl, discordPayload(content), `Discord webhook delivery failed (${index + 1}/${chunks.length})`);
+      try {
+        await postWebhookJson(discordUrl, discordPayload(content), `Discord webhook delivery failed (${index + 1}/${chunks.length})`);
+        delivered += 1;
+      } catch (error) {
+        error.chunks = { expected: chunks.length, delivered, failed: chunks.length - delivered };
+        throw error;
+      }
     }
-    return { sent: true, provider: "discord", messages: chunks.length };
+    return {
+      sent: true,
+      provider: "discord",
+      messages: chunks.length,
+      chunks: { expected: chunks.length, delivered, failed: chunks.length - delivered },
+    };
   }
   if (!env.WEBHOOK_URL) return { skipped: true, reason: "webhook_not_configured" };
   await postWebhookJson(env.WEBHOOK_URL, { date: reportDate, markdown }, "Webhook delivery failed");
@@ -374,15 +540,36 @@ function discordPayload(content) {
 }
 
 async function postWebhookJson(url, payload, label) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  let response = await postJson(url, payload);
+  if (response.status === 429) {
+    await sleep(await discordRetryDelayMs(response));
+    response = await postJson(url, payload);
+  }
   if (!response.ok) {
     const body = await response.text().catch(() => "");
     throw new Error(`${label} (${response.status})${body ? `: ${body}` : ""}`);
   }
+}
+
+function postJson(url, payload) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function discordRetryDelayMs(response) {
+  const header = Number(response.headers.get("retry-after"));
+  if (Number.isFinite(header)) return Math.max(0, header * 1000);
+  const body = await response.clone().json().catch(() => null);
+  const retryAfter = Number(body?.retry_after);
+  if (Number.isFinite(retryAfter)) return Math.max(0, retryAfter * 1000);
+  return 1000;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isDiscordWebhook(url) {
@@ -396,21 +583,23 @@ function isDiscordWebhook(url) {
 }
 
 function discordMessageChunks(reportDate, markdown) {
-  const prefix = `**Growth Tech Morning Brief — ${reportDate}**\n`;
   const maxLength = 1900;
-  const text = `${prefix}${markdown}`.trim();
+  const text = markdown.trim();
   if (text.length <= maxLength) return [text];
   const chunks = [];
-  let remaining = markdown.trim();
+  let remaining = text;
   while (remaining) {
-    const available = maxLength - prefix.length;
+    const partLabel = `Part ${chunks.length + 1}\n`;
+    const available = chunks.length ? maxLength - partLabel.length : maxLength;
     let chunk = remaining.slice(0, available);
     const breakAt = chunk.lastIndexOf("\n\n");
+    const lineBreakAt = chunk.lastIndexOf("\n");
     if (breakAt > 200) chunk = chunk.slice(0, breakAt);
-    chunks.push(`${prefix}${chunk}`.trim());
+    else if (lineBreakAt > 200) chunk = chunk.slice(0, lineBreakAt);
+    chunks.push(chunks.length ? `${partLabel}${chunk}`.trim() : chunk.trim());
     remaining = remaining.slice(chunk.length).trim();
   }
-  return chunks;
+  return chunks.map((chunk, index) => chunk.replace(/^Part \d+/, `Part ${index + 1}/${chunks.length}`));
 }
 
 async function settleDelivery(delivery) {
@@ -418,7 +607,7 @@ async function settleDelivery(delivery) {
     return await delivery();
   } catch (error) {
     console.error(error);
-    return { failed: true, error: errorMessage(error) };
+    return { failed: true, error: errorMessage(error), ...(error?.chunks ? { chunks: error.chunks } : {}) };
   }
 }
 
