@@ -1,5 +1,7 @@
 const YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart";
 const SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts";
+const GEMINI_GENERATE_CONTENT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 
 const CIKS = {
@@ -37,9 +39,37 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    ctx.waitUntil(buildSnapshot(env, new Date(controller.scheduledTime)).catch((error) => console.error(error)));
+    ctx.waitUntil(runScheduledBrief(env, new Date(controller.scheduledTime)).catch((error) => console.error(error)));
   },
 };
+
+export async function runScheduledBrief(env, now = new Date()) {
+  const snapshot = await buildSnapshot(env, now);
+  if (snapshot.skipped) return snapshot;
+  if (!env.BRIEF_BUCKET?.get || !env.BRIEF_BUCKET?.put) return { snapshot, report: { skipped: true, reason: "r2_not_configured" } };
+
+  const reportDate = zonedParts(now, "America/New_York").date;
+  if (await env.BRIEF_BUCKET.get(`reports/${reportDate}.md`)) {
+    return { snapshot, report: { skipped: true, reason: "report_already_exists", date: reportDate } };
+  }
+
+  const reportResults = { date: reportDate, generated: false, stored: false, email: null, webhook: null };
+  try {
+    const latestObject = await env.BRIEF_BUCKET.get("snapshots/latest.json");
+    if (!latestObject) throw new Error("snapshots/latest.json was not found after snapshot creation");
+    const latestSnapshot = await latestObject.json();
+    const reportMarkdown = await generateGeminiReport(env, latestSnapshot);
+    await storeReport(env, reportDate, reportMarkdown);
+    reportResults.generated = true;
+    reportResults.stored = true;
+    reportResults.email = await settleDelivery(() => sendReportEmail(env, reportDate, reportMarkdown));
+    reportResults.webhook = await settleDelivery(() => sendReportWebhook(env, reportDate, reportMarkdown));
+  } catch (error) {
+    reportResults.error = errorMessage(error);
+    console.error(error);
+  }
+  return { snapshot, report: reportResults };
+}
 
 export async function buildSnapshot(env, now = new Date(), options = {}) {
   const ny = zonedParts(now, "America/New_York");
@@ -109,6 +139,124 @@ export function toBrief(snapshot) {
   };
   brief.markdown = renderMarkdown(brief);
   return brief;
+}
+
+export function compactSnapshotForReport(snapshot) {
+  const brief = toBrief(snapshot);
+  const ranked = [...brief.watchlist].filter((row) => !row.missing && Number.isFinite(row.changePercent))
+    .sort((a, b) => b.changePercent - a.changePercent);
+  const volumeLeaders = [...snapshot.watchlist].filter((row) => !row.missing && Number.isFinite(row.history?.at(-1)?.volume))
+    .map((row) => ({ symbol: row.symbol, volume: row.history.at(-1).volume }))
+    .sort((a, b) => b.volume - a.volume)
+    .slice(0, 5);
+  return {
+    schemaVersion: brief.schemaVersion,
+    generatedAt: brief.generatedAt,
+    session: brief.session,
+    coverage: brief.coverage,
+    executiveSummary: brief.executiveSummary,
+    majorGainers: ranked.slice(0, 5),
+    majorLosers: ranked.slice(-5).reverse(),
+    volumeLeaders,
+    watchlist: brief.watchlist,
+  };
+}
+
+export async function generateGeminiReport(env, snapshot) {
+  if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not configured");
+  const compact = compactSnapshotForReport(snapshot);
+  const response = await fetch(GEMINI_GENERATE_CONTENT, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+    body: JSON.stringify({
+      contents: [{
+        role: "user",
+        parts: [{ text: reportPrompt(compact) }],
+      }],
+      generationConfig: { temperature: 0.25, maxOutputTokens: 1800 },
+    }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(`Gemini report failed (${response.status}): ${body?.error?.message ?? "unknown error"}`);
+  const text = body?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error("Gemini report response did not include candidates[0].content.parts[0].text");
+  return text;
+}
+
+function reportPrompt(compact) {
+  return [
+    "Produce a concise institutional-style Growth Tech Morning Brief in Markdown.",
+    "Cover major gainers and losers, volume spikes, market movements, AI-cycle signals, sector conclusions, catalysts, risks, and stock actions.",
+    "Use only the supplied data; label unavailable items as n/a rather than inventing facts.",
+    "Keep the report actionable, balanced, and suitable for a portfolio manager.",
+    "",
+    "Compact snapshot JSON:",
+    JSON.stringify(compact),
+  ].join("\n");
+}
+
+async function storeReport(env, reportDate, markdown) {
+  await Promise.all([
+    env.BRIEF_BUCKET.put(`reports/${reportDate}.md`, markdown, { httpMetadata: { contentType: "text/markdown; charset=utf-8" } }),
+    env.BRIEF_BUCKET.put("reports/latest.md", markdown, { httpMetadata: { contentType: "text/markdown; charset=utf-8" } }),
+  ]);
+}
+
+export async function sendReportEmail(env, reportDate, markdown) {
+  if (!env.RESEND_API_KEY || !env.REPORT_TO_EMAIL || !env.REPORT_FROM_EMAIL) {
+    return { skipped: true, reason: "email_not_configured" };
+  }
+  const response = await fetch(RESEND_EMAILS, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.RESEND_API_KEY}`,
+      "content-type": "application/json",
+      "idempotency-key": `growth-tech-morning-brief-${reportDate}`,
+    },
+    body: JSON.stringify({
+      from: env.REPORT_FROM_EMAIL,
+      to: [env.REPORT_TO_EMAIL],
+      subject: `Growth Tech Morning Brief — ${reportDate}`,
+      text: markdown,
+      html: markdownToHtml(markdown),
+    }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(`Resend email failed (${response.status}): ${body?.message ?? body?.error ?? "unknown error"}`);
+  return { sent: true, id: body?.id ?? null };
+}
+
+export async function sendReportWebhook(env, reportDate, markdown) {
+  if (!env.WEBHOOK_URL) return { skipped: true, reason: "webhook_not_configured" };
+  const response = await fetch(env.WEBHOOK_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ date: reportDate, markdown }),
+  });
+  if (!response.ok) throw new Error(`Webhook delivery failed (${response.status})`);
+  return { sent: true };
+}
+
+async function settleDelivery(delivery) {
+  try {
+    return await delivery();
+  } catch (error) {
+    console.error(error);
+    return { failed: true, error: errorMessage(error) };
+  }
+}
+
+function markdownToHtml(markdown) {
+  return markdown.split(/\n{2,}/).map((block) => {
+    const escaped = escapeHtml(block).replace(/\n/g, "<br>");
+    if (block.startsWith("# ")) return `<h1>${escaped.slice(2)}</h1>`;
+    if (block.startsWith("## ")) return `<h2>${escaped.slice(3)}</h2>`;
+    return `<p>${escaped}</p>`;
+  }).join("\n");
+}
+
+function escapeHtml(value) {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
 function compactRow(row) {
@@ -382,6 +530,7 @@ function number(value) {
 
 function finitePair(a, b) { return Number.isFinite(a) && Number.isFinite(b); }
 function round(value) { return Number.isFinite(value) ? Math.round(value * 100) / 100 : null; }
+function errorMessage(error) { return error instanceof Error ? error.message : String(error); }
 
 function json(value, status = 200) {
   return new Response(JSON.stringify(value, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8" } });
