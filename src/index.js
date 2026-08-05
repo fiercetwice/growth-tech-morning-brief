@@ -34,6 +34,23 @@ const MARKET_CONTEXT_GROUPS = {
   ],
 };
 const REQUIRED_CONTEXT_LABELS = ["Futures", "Rates", "USD", "Oil", "Macro Events", "Earnings"];
+const SECTOR_MEMBERS = {
+  GPU: ["NVDA", "TSM", "AVGO"],
+  "AI Cloud": ["AMZN", "MSFT", "GOOGL", "ORCL"],
+  "GPU Cloud": ["CRWV"],
+  Networking: ["ANET", "AVGO"],
+  Cooling: ["VRT"],
+  Power: ["CEG"],
+  Cybersecurity: ["FTNT"],
+  "Cloud Software": ["MSFT", "AMZN", "GOOGL", "META", "ORCL"],
+};
+const AI_CYCLE_SEGMENTS = {
+  "Hyperscaler AI CapEx": ["MSFT", "AMZN", "GOOGL", "META"],
+  "GPU Demand": ["NVDA", "TSM", "AVGO"],
+  "AI Cloud": ["CRWV"],
+  "Enterprise AI": ["MSFT", "ORCL"],
+  Inference: ["NVDA", "ANET", "AVGO"],
+};
 
 const CIKS = {
   NVDA: "0001045810", AMZN: "0001018724", MSFT: "0000789019",
@@ -191,7 +208,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
   const snapshot = {
     schemaVersion: 3,
     generatedAt: now.toISOString(),
-    session: "regular_open_plus_5m",
+    session: marketSession(now),
     sources: {
       price: "Yahoo Finance chart endpoint (unofficial)",
       fundamentals: "SEC EDGAR CompanyFacts",
@@ -279,14 +296,14 @@ async function fetchNasdaqCalendar(kind, date, env) {
 
 export function normalizeNasdaqMacroCalendar(body, date, now = new Date()) {
   const rows = Array.isArray(body?.data?.rows) ? body.data.rows : [];
-  const events = rows.slice(0, 25).map((row) => ({
+  const events = rows.map((row) => ({
     time: cleanText(row.time ?? row.releaseTime),
     country: cleanText(row.country),
     event: cleanText(row.eventName ?? row.event ?? row.name),
     actual: cleanText(row.actual),
     consensus: cleanText(row.consensus ?? row.forecast),
     previous: cleanText(row.previous),
-  })).filter((row) => row.event);
+  })).filter((row) => row.event && growthTechMacroRelevant(row)).slice(0, 15);
   return {
     status: "available",
     source: "Nasdaq public economic calendar (unofficial)",
@@ -362,12 +379,124 @@ function cleanText(value) {
   return text && text !== "--" && text.toLowerCase() !== "n/a" ? text : null;
 }
 
+function growthTechMacroRelevant(row) {
+  const country = (row.country ?? "").toUpperCase().replace(/[^A-Z]/g, "");
+  if (["US", "USA", "UNITEDSTATES"].includes(country)) return true;
+  return /fed|fomc|ecb|boj|pboc|inflation|cpi|ppi|payroll|employment|gdp|pmi|interest rate/i.test(row.event)
+    && /EU|EURO|CHINA|CN|JAPAN|JP|GLOBAL|WORLD/.test(country);
+}
+
+export function marketSession(now = new Date()) {
+  const ny = zonedParts(now, "America/New_York");
+  const minutes = ny.hour * 60 + ny.minute;
+  if (minutes < 4 * 60) return "closed";
+  if (minutes < 9 * 60 + 30) return "premarket";
+  if (minutes < 16 * 60) return "regular_trading";
+  if (minutes < 20 * 60) return "after_hours";
+  return "closed";
+}
+
+function buildDecisionFramework(rows) {
+  const sectorScorecard = Object.fromEntries(Object.entries(SECTOR_MEMBERS).map(([sector, symbols]) => {
+    const members = rows.filter((row) => symbols.includes(row.symbol));
+    return [sector, aggregateDecision(members)];
+  }));
+  const aiCycle = Object.fromEntries(Object.entries(AI_CYCLE_SEGMENTS).map(([segment, symbols]) => {
+    const members = rows.filter((row) => symbols.includes(row.symbol));
+    return [segment, {
+      rating: "Insufficient Data",
+      trend: "Unclear",
+      evidence: members.map((row) => `${row.symbol} ${signed(row.changePercent)}%`).join(", ") || "No covered symbols",
+      limitation: "Price, reported financials, and trailing valuation do not measure demand, backlog, CapEx guidance, or estimate revisions.",
+    }];
+  }));
+  return {
+    methodology: "Deterministic rules; the AI explains but must not change supplied ratings or actions.",
+    aiCycle,
+    sectorScorecard,
+  };
+}
+
+function aggregateDecision(rows) {
+  if (!rows.length) return { fundamentals: "Unavailable", valuation: "Unavailable", momentum: "Unavailable", action: "Wait", symbols: [] };
+  const growth = median(rows.map((row) => row.reportedGrowth?.revenueTtmYoY).filter(Number.isFinite));
+  const valuation = median(rows.map((row) => row.valuation?.selectedPercentile).filter(Number.isFinite));
+  const momentum = median(rows.map(momentumScore).filter(Number.isFinite));
+  const fundamentalsLabel = growth === null ? "Unavailable" : growth >= 15 ? "Strong" : growth >= 5 ? "Moderate" : growth >= 0 ? "Stable" : "Weak";
+  const valuationLabel = valuation === null ? "Unavailable" : valuation >= 80 ? "High" : valuation <= 30 ? "Low" : "Moderate";
+  const momentumLabel = momentum > 0 ? "Positive" : momentum < 0 ? "Negative" : "Mixed";
+  return {
+    fundamentals: fundamentalsLabel,
+    valuation: valuationLabel,
+    momentum: momentumLabel,
+    action: decisionAction(fundamentalsLabel, valuationLabel, momentumLabel),
+    symbols: rows.map((row) => row.symbol),
+    metrics: { medianReportedRevenueTtmYoY: growth, medianHistoricalValuationPercentile: valuation },
+  };
+}
+
+function stockAction(row) {
+  const growth = row.reportedGrowth?.revenueTtmYoY;
+  const fundamentals = !Number.isFinite(growth) ? "Unavailable" : growth >= 15 ? "Strong" : growth >= 5 ? "Moderate" : growth >= 0 ? "Stable" : "Weak";
+  const percentile = row.valuation?.selectedPercentile;
+  const valuation = !Number.isFinite(percentile) ? "Unavailable" : percentile >= 80 ? "High" : percentile <= 30 ? "Low" : "Moderate";
+  const score = momentumScore(row);
+  const momentum = score > 0 ? "Positive" : score < 0 ? "Negative" : "Mixed";
+  return decisionAction(fundamentals, valuation, momentum);
+}
+
+function decisionAction(fundamentals, valuation, momentum) {
+  if (fundamentals === "Weak" && valuation === "High") return "Avoid";
+  if (momentum === "Negative") return fundamentals === "Strong" && valuation !== "High" ? "Hold" : "Wait";
+  if (fundamentals === "Strong" && valuation !== "High" && momentum === "Positive") return "Buy";
+  return "Hold";
+}
+
+function momentumScore(row) {
+  if (!Number.isFinite(row.changePercent) && !Number.isFinite(row.positionIn52WeekRange)) return null;
+  const daily = Number.isFinite(row.changePercent) ? (row.changePercent >= 1 ? 1 : row.changePercent <= -1 ? -1 : 0) : 0;
+  const range = Number.isFinite(row.positionIn52WeekRange) ? (row.positionIn52WeekRange >= 70 ? 1 : row.positionIn52WeekRange <= 30 ? -1 : 0) : 0;
+  return daily + range;
+}
+
+function catalystFor(row, earnings) {
+  if (earnings) return `Earnings scheduled today${earnings.time ? ` (${earnings.time})` : ""}`;
+  return "n/a — no company-specific catalyst in snapshot";
+}
+
+function riskFor(row) {
+  const risks = [];
+  if ((row.valuation?.selectedPercentile ?? 0) >= 80) risks.push("valuation at/above 80th historical percentile");
+  if ((row.reportedGrowth?.revenueTtmYoY ?? 0) < 0) risks.push("reported TTM revenue contraction");
+  if ((row.positionIn52WeekRange ?? 0) >= 90) risks.push("price near 52-week high");
+  if (momentumScore(row) < 0) risks.push("negative rule-based momentum");
+  return risks.join("; ") || "no quantified risk flag in snapshot";
+}
+
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : round((sorted[middle - 1] + sorted[middle]) / 2);
+}
+
 export function toBrief(snapshot) {
   const rows = snapshot.watchlist.map(compactRow);
+  const earningsBySymbol = new Map((snapshot.calendars?.earnings?.events ?? []).map((event) => [event.symbol, event]));
+  for (const row of rows) {
+    if (row.missing) continue;
+    row.catalyst = catalystFor(row, earningsBySymbol.get(row.symbol));
+    row.risk = riskFor(row);
+    row.action = stockAction(row);
+  }
   const valid = rows.filter((row) => !row.missing);
   const ranked = [...valid].filter((row) => Number.isFinite(row.changePercent)).sort((a, b) => b.changePercent - a.changePercent);
   const expensive = [...valid].filter((row) => Number.isFinite(row.valuation?.selectedPercentile))
     .sort((a, b) => b.valuation.selectedPercentile - a.valuation.selectedPercentile);
+  const buyCandidates = [...valid].filter((row) => row.action === "Buy")
+    .sort((a, b) => (b.reportedGrowth?.revenueTtmYoY ?? -Infinity) - (a.reportedGrowth?.revenueTtmYoY ?? -Infinity));
+  const avoidCandidates = [...valid].filter((row) => row.action === "Avoid")
+    .sort((a, b) => (a.reportedGrowth?.revenueTtmYoY ?? Infinity) - (b.reportedGrowth?.revenueTtmYoY ?? Infinity));
   const dataQuality = snapshotDataQuality(snapshot);
   const brief = {
     schemaVersion: 4,
@@ -381,8 +510,13 @@ export function toBrief(snapshot) {
       strongest: ranked.slice(0, 3).map((row) => `${row.symbol} ${signed(row.changePercent)}%`),
       weakest: ranked.slice(-3).reverse().map((row) => `${row.symbol} ${signed(row.changePercent)}%`),
       highestValuationPercentile: expensive.slice(0, 3).map((row) => `${row.symbol} ${row.valuation.selectedPercentile} percentile`),
+      aiCycle: "Insufficient Data — direct demand, backlog, CapEx guidance, utilization, and estimate revisions are not in the snapshot",
+      catalyst: valid.filter((row) => !row.catalyst.startsWith("n/a")).map((row) => `${row.symbol}: ${row.catalyst}`).join("; ") || "None in snapshot",
+      bestOpportunity: buyCandidates[0]?.symbol ?? "None — no stock meets the deterministic Buy rule",
+      avoid: avoidCandidates[0]?.symbol ?? "None — no stock meets the deterministic Avoid rule",
       dataQuality: `${snapshot.coverage.failed ? `${snapshot.coverage.failed} symbol(s) failed` : "All requested symbols available"}; market context ${dataQuality.available}/${dataQuality.total} current`,
     },
+    decisionFramework: buildDecisionFramework(valid),
     watchlist: rows,
   };
   brief.markdown = renderMarkdown(brief);
@@ -406,6 +540,7 @@ export function compactSnapshotForReport(snapshot) {
     marketContext: brief.marketContext,
     calendars: brief.calendars,
     executiveSummary: brief.executiveSummary,
+    decisionFramework: brief.decisionFramework,
     majorGainers: ranked.slice(0, 5),
     majorLosers: ranked.slice(-5).reverse(),
     volumeLeaders,
@@ -578,6 +713,7 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
       errors.push(`missing Executive Summary field: ${label}`);
     }
   }
+  validateExecutiveDecisions(executive, compact, errors);
 
   const overnight = sectionBody(markdown, "Overnight and Market Context");
   for (const label of ["Sourced Facts", "Analysis"]) {
@@ -595,7 +731,13 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
     if (!new RegExp(escapeRegExp(header), "i").test(dashboard)) errors.push(`missing AI Cycle Dashboard column: ${header}`);
   }
   for (const row of REQUIRED_AI_CYCLE_ROWS) {
-    if (!new RegExp(escapeRegExp(row), "i").test(dashboard)) errors.push(`missing AI Cycle Dashboard row: ${row}`);
+    const cells = markdownTableRow(dashboard, row, { allowLabelFormatting: true });
+    const expected = compact?.decisionFramework?.aiCycle?.[row];
+    if (!cells) errors.push(`missing AI Cycle Dashboard row: ${row}`);
+    else if (cells.length < 5) errors.push(`incomplete AI Cycle Dashboard row: ${row}`);
+    else if (expected && (normalizeCell(cells[1]) !== normalizeCell(expected.rating) || normalizeCell(cells[2]) !== normalizeCell(expected.trend))) {
+      errors.push(`AI Cycle rating/trend contradicts deterministic framework: ${row}`);
+    }
   }
 
   const scorecard = sectionBody(markdown, "Sector Scorecard");
@@ -604,8 +746,13 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
   }
   for (const row of REQUIRED_SECTOR_ROWS) {
     const cells = markdownTableRow(scorecard, row, { allowLabelFormatting: true });
+    const expected = compact?.decisionFramework?.sectorScorecard?.[row];
     if (!cells) errors.push(`missing Sector Scorecard row: ${row}`);
     else if (cells.length < 7 || !validAction(cells[4])) errors.push(`invalid Sector Scorecard fields: ${row}`);
+    else if (expected && [expected.fundamentals, expected.valuation, expected.momentum, expected.action]
+      .some((value, index) => normalizeCell(cells[index + 1]) !== normalizeCell(value))) {
+      errors.push(`Sector Scorecard contradicts deterministic framework: ${row}`);
+    }
   }
 
   const watchlist = sectionBody(markdown, "Watchlist");
@@ -614,12 +761,45 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
   }
   for (const symbol of symbols) {
     const cells = markdownTableRow(watchlist, symbol, { allowLabelFormatting: true, allowDollar: true });
+    const expected = compact?.watchlist?.find((row) => row.symbol === symbol);
     if (!cells) errors.push(`missing watchlist symbol: ${symbol}`);
     else if (cells.length < 9 || !validAction(cells[8])) errors.push(`incomplete watchlist fields: ${symbol}`);
+    else if (expected && normalizeCell(cells[8]) !== normalizeCell(expected.action)) errors.push(`Watchlist action contradicts deterministic framework: ${symbol}`);
+    if (cells && expected && /\b(?:buy|hold|wait|avoid)\b/i.test(cells[6])) errors.push(`Watchlist catalyst contains an action: ${symbol}`);
   }
+  validateUnsupportedClaims(markdown, compact, errors);
   if (markdown.length < 500) errors.push("report is shorter than the minimum complete length");
   if (endsIncomplete(markdown)) errors.push("report ends with an incomplete sentence");
   return { ok: errors.length === 0, errors };
+}
+
+function validateExecutiveDecisions(executive, compact, errors) {
+  if (!compact?.executiveSummary) return;
+  for (const [label, key] of [["Best Opportunity", "bestOpportunity"], ["Avoid", "avoid"]]) {
+    const line = executive.split("\n").find((candidate) => new RegExp(`${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(candidate));
+    const expected = compact.executiveSummary[key];
+    const expectedSymbol = /^[A-Z]{1,6}$/.test(expected) ? expected : null;
+    if (expectedSymbol && (!line || !new RegExp(`\\b${escapeRegExp(expectedSymbol)}\\b`).test(line))) {
+      errors.push(`Executive Summary ${label} contradicts deterministic framework`);
+    }
+    if (!expectedSymbol && line && !/\bnone\b/i.test(line)) errors.push(`Executive Summary ${label} must state none`);
+  }
+}
+
+function validateUnsupportedClaims(markdown, compact, errors) {
+  const unsupported = [
+    [/\b(?:GPU|AI|inference) demand (?:is |remains |looks )?(?:robust|strong|accelerating|rising)\b/i, "unsupported demand claim"],
+    [/\b(?:capex|capital expenditure) cycle (?:is |remains )?(?:intact|accelerating|rising|strong)\b/i, "unsupported CapEx-cycle claim"],
+    [/\binstitutional (?:buying|selling|volume|flows?)\b/i, "unsupported institutional-flow claim"],
+  ];
+  for (const [pattern, label] of unsupported) if (pattern.test(markdown)) errors.push(label);
+  if (!compact?.watchlist?.some((row) => Number.isFinite(row?.reportedGrowth?.revenueTtmYoY)) && /fundamentals?\s+(?:are |is )?(?:strong|weak|improving|deteriorating)/i.test(markdown)) {
+    errors.push("fundamental claim made without reported growth data");
+  }
+}
+
+function normalizeCell(value) {
+  return String(value ?? "").replace(/[\s*`_]/g, "").toLowerCase();
 }
 
 function sectionBody(markdown, section) {
@@ -685,29 +865,33 @@ function reportPrompt(compact, options = {}) {
     "Do not add, remove, or rename top-level sections, table columns, required rows, or Executive Summary labels.",
     "Use only supplied data as sourced facts. Never describe volume as institutional, claim an earnings/macro catalyst, or infer demand from price action as fact.",
     "When a supplied context category has status available, cite its values and as-of time; do not call it unavailable. When its status is stale, cite it and explicitly flag it stale. Only write unavailable when its supplied status is unavailable.",
-    "When forward estimates, company-specific catalysts, or risks are not supplied, write 'unavailable' or 'n/a — not in snapshot'.",
-    "Keep sourced facts separate from analysis. Analysis may infer cautiously from supplied price, volume, range, and trailing valuation data.",
+    "The decisionFramework object is authoritative and deterministic. Copy every supplied AI-cycle rating/trend, sector Fundamentals/Valuation/Momentum/Action, and watchlist Action exactly; explain them but never override them.",
+    "Reported growth comes from SEC filings and is backward-looking. Do not call it an analyst estimate, guidance, demand, backlog, or forward growth.",
+    "When forward estimates are not supplied, write 'n/a — not in snapshot'. Use each watchlist row's supplied catalyst, risk, and action verbatim or as a faithful concise paraphrase.",
+    "Keep sourced facts separate from analysis. Price action may describe momentum only; it cannot establish demand, CapEx, institutional flows, or fundamental strength.",
+    `Label market context as ${compact.session}; do not call regular-trading quotes overnight futures or premarket indications.`,
     "Allowed stock and sector actions are Buy, Hold, Wait, or Avoid.",
     "In table Action cells, write one action only; do not add qualifiers in the same cell.",
     "",
     "# Executive Summary",
     "Exactly five bullets labeled: **AI Cycle:**; **Catalyst:**; **Risk:**; **Best Opportunity:**; **Avoid:**.",
+    "Use executiveSummary.aiCycle, catalyst, bestOpportunity, and avoid exactly; do not promote a Hold/Wait name to Best Opportunity or invent an Avoid.",
     "",
     "# Overnight and Market Context",
     "Include **Sourced Facts:** and **Analysis:** followed by six separate bullet lines labeled: **Futures:**, **Rates:**, **USD:**, **Oil:**, **Macro Events:**, and **Earnings:**.",
     "For each field, state the supplied source status and as-of time. Use actual/consensus/previous for macro events and time/EPS forecast for earnings when supplied. Do not invent news or event causality.",
     "",
     "# AI Cycle Dashboard",
-    "Markdown table columns: Segment | Rating | Trend | Sourced Facts | Analysis.",
+    "Markdown table columns: Segment | Rating | Trend | Sourced Facts | Analysis. Copy Rating and Trend exactly from decisionFramework.aiCycle.",
     `Required rows: ${REQUIRED_AI_CYCLE_ROWS.join("; ")}.`,
     "",
     "# Sector Scorecard",
-    "Markdown table columns: Sector | Fundamentals | Valuation | Momentum | Action | Sourced Facts | Analysis.",
+    "Markdown table columns: Sector | Fundamentals | Valuation | Momentum | Action | Sourced Facts | Analysis. Copy the four decision fields exactly from decisionFramework.sectorScorecard.",
     `Required rows: ${REQUIRED_SECTOR_ROWS.join("; ")}.`,
     "",
     "# Watchlist",
     "Markdown table columns: Symbol | Price | Daily Change | 52W Position | Forward P/E or P/S | Historical Valuation Percentile | Catalyst | Risk | Action.",
-    "Include one row for every successfully retrieved symbol. Use n/a for forward valuation because the snapshot contains trailing metrics only.",
+    "Include one row for every successfully retrieved symbol. Use n/a for forward valuation because the snapshot contains reported and trailing metrics only. Copy each supplied watchlist Action exactly.",
     "Do not substitute trailing P/E or P/S into the Forward P/E or P/S column. Historical valuation percentile may use the supplied trailing valuation history.",
     options.retry ? "Retry instruction: the previous response was incomplete. Produce a shorter but complete report. Keep every required section and watchlist symbol while reducing commentary." : "",
     "",
@@ -1062,6 +1246,7 @@ function compactRow(row) {
       selectedPercentile: usePe ? row.valuation.trailingPEPercentile5Y : row.valuation.trailingPSPercentile5Y,
       fundamentalAsOf: row.valuation.fundamentalAsOf,
     } : null,
+    reportedGrowth: row.reportedGrowth ?? null,
     missing: false,
   };
 }
@@ -1255,6 +1440,7 @@ function assembleSymbol(symbol, chart, fundamentals) {
       trailingPSPercentile5Y: percentile(latestValuation.trailingPS, valuationHistory.map((x) => x.trailingPS)),
       fundamentalAsOf: latestValuation.fundamentalAsOf,
     } : null,
+    reportedGrowth: fundamentals.available ? reportedGrowth(fundamentals) : null,
     history: chart.history,
     fundamentals: fundamentals.available ? {
       quarterlyRevenue: fundamentals.quarterlyRevenue,
@@ -1264,6 +1450,35 @@ function assembleSymbol(symbol, chart, fundamentals) {
     valuationHistory,
     missing: false,
   };
+}
+
+export function reportedGrowth(fundamentals) {
+  const revenue = fundamentals.quarterlyRevenue ?? [];
+  const eps = fundamentals.quarterlyEps ?? [];
+  return {
+    revenueTtmYoY: ttmGrowth(revenue),
+    revenueLatestQuarterYoY: latestQuarterGrowth(revenue),
+    epsTtmYoY: ttmGrowth(eps),
+    epsLatestQuarterYoY: latestQuarterGrowth(eps),
+    asOf: [...revenue, ...eps].map((row) => row.filed).filter(Boolean).sort().at(-1) ?? null,
+    basis: "reported SEC filings; not analyst estimates",
+  };
+}
+
+function ttmGrowth(rows) {
+  if (rows.length < 8) return null;
+  const current = rows.slice(-4).reduce((sum, row) => sum + row.value, 0);
+  const prior = rows.slice(-8, -4).reduce((sum, row) => sum + row.value, 0);
+  return prior !== 0 ? round(((current - prior) / Math.abs(prior)) * 100) : null;
+}
+
+function latestQuarterGrowth(rows) {
+  if (rows.length < 5) return null;
+  const latest = rows.at(-1)?.value;
+  const priorYear = rows.at(-5)?.value;
+  return Number.isFinite(latest) && Number.isFinite(priorYear) && priorYear !== 0
+    ? round(((latest - priorYear) / Math.abs(priorYear)) * 100)
+    : null;
 }
 
 export function buildValuationHistory(prices, fundamentals) {
