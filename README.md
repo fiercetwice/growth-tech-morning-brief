@@ -39,6 +39,11 @@ curl "https://growth-tech-morning-brief.ck-market-tools.workers.dev/latest" \
   -H "Authorization: Bearer YOUR_RUN_TOKEN"
 ```
 
+
+## GitHub Actions deployment
+
+The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets.
+
 ## Custom GPT Action
 
 Paste `openapi/gpt-action.yaml` into the Custom GPT Action editor. Configure Authentication as **API Key**, set the authentication type to **Bearer**, and store the existing `RUN_TOKEN` as the secret. Do not paste the token into the OpenAPI file.
