@@ -28,7 +28,7 @@ function r2(initial = {}) {
 function yahooChart(symbol = "NVDA") {
   return {
     chart: { result: [{
-      meta: { regularMarketPrice: 110, regularMarketPreviousClose: 100, currency: "USD", shortName: symbol },
+      meta: { regularMarketPrice: 110, regularMarketPreviousClose: 100, regularMarketTime: 1785935700, currency: "USD", shortName: symbol },
       timestamp: [1785849300, 1785935700],
       indicators: { quote: [{ close: [100, 110], volume: [1000, 5000] }], adjclose: [{ adjclose: [100, 110] }] },
     }] },
@@ -52,8 +52,14 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "- **Avoid:** Avoid chasing unsupported narratives or unavailable catalysts.",
     "",
     "# Overnight and Market Context",
-    `- **Sourced Facts:** ${symbolText} has supplied price, daily change, volume, range, and trailing valuation data. Futures, rates, USD, oil, macro events, and earnings are unavailable.`,
+    `- **Sourced Facts:** ${symbolText} has supplied price, daily change, volume, range, and trailing valuation data.`,
     "- **Analysis:** Market context is mixed; no unsupported macro or earnings claim is made.",
+    "- **Futures:** S&P 500 +10.0%, Nasdaq 100 +10.0%; Yahoo as of 2026-08-05T13:15:00Z.",
+    "- **Rates:** U.S. 10Y yield 11.0%; Yahoo as of 2026-08-05T13:15:00Z.",
+    "- **USD:** Dollar Index 110 (+10.0%); Yahoo as of 2026-08-05T13:15:00Z.",
+    "- **Oil:** WTI 110 (+10.0%), Brent 110 (+10.0%); Yahoo as of 2026-08-05T13:15:00Z.",
+    "- **Macro Events:** unavailable — calendar source failed in fixture.",
+    "- **Earnings:** unavailable — calendar source failed in fixture.",
     "",
     "# AI Cycle Dashboard",
     "| Segment | Rating | Trend | Sourced Facts | Analysis |",
@@ -323,6 +329,19 @@ test("openai-compatible route uses only the preconfigured HTTPS base URL", async
 
   assert.equal(result.report.aiProvider, "openai-compatible");
   assert.equal(result.report.aiModel, "research-model");
+});
+
+test("strict schema rejects unavailable claims when context data was supplied", () => {
+  const markdown = completeReport(["NVDA"]).replace(
+    "**Futures:** S&P 500 +10.0%, Nasdaq 100 +10.0%; Yahoo as of 2026-08-05T13:15:00Z.",
+    "**Futures:** unavailable — not in snapshot.",
+  );
+  const validation = validateReportCompleteness(markdown, ["NVDA"], {
+    marketContext: { futures: { status: "available" } },
+    calendars: {},
+  });
+  assert.equal(validation.ok, false);
+  assert.match(validation.errors.join("; "), /available context incorrectly marked unavailable: Futures/);
 });
 
 test("strict schema rejects a market recap that only has the five section names", () => {
