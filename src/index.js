@@ -227,16 +227,25 @@ export async function sendReportEmail(env, reportDate, markdown) {
 }
 
 export async function sendReportWebhook(env, reportDate, markdown) {
-  if (!env.WEBHOOK_URL) return { skipped: true, reason: "webhook_not_configured" };
-  if (isDiscordWebhook(env.WEBHOOK_URL)) {
+  const discordUrl = env.DISCORD_WEBHOOK_URL || (isDiscordWebhook(env.WEBHOOK_URL) ? env.WEBHOOK_URL : null);
+  if (discordUrl) {
     const chunks = discordMessageChunks(reportDate, markdown);
     for (const [index, content] of chunks.entries()) {
-      await postWebhookJson(env.WEBHOOK_URL, { content }, `Discord webhook delivery failed (${index + 1}/${chunks.length})`);
+      await postWebhookJson(discordUrl, discordPayload(content), `Discord webhook delivery failed (${index + 1}/${chunks.length})`);
     }
     return { sent: true, provider: "discord", messages: chunks.length };
   }
+  if (!env.WEBHOOK_URL) return { skipped: true, reason: "webhook_not_configured" };
   await postWebhookJson(env.WEBHOOK_URL, { date: reportDate, markdown }, "Webhook delivery failed");
   return { sent: true, provider: "generic" };
+}
+
+function discordPayload(content) {
+  return {
+    username: "Stock Analyst Bot",
+    avatar_url: "https://i.imgur.com/4M34hi2.png",
+    content,
+  };
 }
 
 async function postWebhookJson(url, payload, label) {
