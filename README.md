@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.4.3 — AI report edition
+# Growth Tech Morning Brief v0.4.4 — AI report edition
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -52,6 +52,16 @@ curl -X POST \
   --data '{"forceDelivery":true}'
 ```
 
+Regenerate today's stored report before retrying delivery. The previous stored report is preserved if Gemini does not return a complete, validated report:
+
+```bash
+curl -X POST \
+  "https://growth-tech-morning-brief.ck-market-tools.workers.dev/run-report" \
+  -H "Authorization: Bearer YOUR_RUN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"forceRegenerate":true,"forceDelivery":true}'
+```
+
 Deliver the latest stored report to the configured webhook:
 
 ```bash
@@ -75,7 +85,9 @@ The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull 
 
 ## AI report generation and delivery
 
-On the valid 09:35 AM ET scheduled run, the Worker writes the stock snapshot, reads `snapshots/latest.json` back from R2, sends a compact snapshot to Gemini, and stores the generated Markdown report at both `reports/YYYY-MM-DD.md` and `reports/latest.md`. The default Gemini model is `gemini-3.5-flash`, and `GEMINI_MODEL` can override it without changing code. The duplicate daylight-saving cron expression is ignored unless it maps to 09:35 AM ET. An existing dated report prevents duplicate Gemini generation, but delivery is retried until `deliveries/YYYY-MM-DD.json` records a successful Discord receipt.
+On the valid 09:35 AM ET scheduled run, the Worker writes the stock snapshot, reads `snapshots/latest.json` back from R2, sends a compact snapshot to Gemini, and stores the generated Markdown report at both `reports/YYYY-MM-DD.md` and `reports/latest.md`. The default Gemini model is `gemini-3.5-flash`, and `GEMINI_MODEL` can override it without changing code. Gemini requests use low thinking effort, do not set an application-level output token ceiling, require a normal `STOP` finish reason, join all non-thought response text parts, and validate required sections plus every retrieved watchlist symbol before anything is stored or delivered. The duplicate daylight-saving cron expression is ignored unless it maps to 09:35 AM ET. An existing dated report prevents duplicate Gemini generation, but delivery is retried until `deliveries/YYYY-MM-DD.json` records a successful Discord receipt.
+
+If Gemini returns `MAX_TOKENS` or a report that fails completeness validation, the Worker retries once with a shorter-but-complete prompt. If the retry is still incomplete, the report is rejected and the previous stored report remains unchanged. Use `forceRegenerate` when `/run-report` should replace an existing dated report; use `forceDelivery` by itself when the stored report should be resent without calling Gemini.
 
 Configure these secrets or environment variables outside the repository:
 
@@ -103,7 +115,7 @@ R2 object layout:
 - `briefs/YYYY-MM-DD.json`: compact daily brief.
 - `briefs/latest.json`: response served by `/latest`.
 - `reports/YYYY-MM-DD.md`: Gemini-generated Markdown report.
-- `reports/latest.md`: latest Gemini-generated Markdown report.
+- `reports/latest.md`: latest Gemini-generated Markdown report. R2 custom metadata includes report date, Gemini model, finish reason, output/thinking/total token counts when returned, generation attempt count, generated timestamp, and validation status.
 - `deliveries/YYYY-MM-DD.json`: Discord delivery receipt with success, failure, timestamp and message count diagnostics.
 
 ## Configuration
