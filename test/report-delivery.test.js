@@ -4,8 +4,10 @@ import worker, { compactSnapshotForReport, runScheduledBrief, sendReportEmail, s
 
 function r2(initial = {}) {
   const objects = new Map(Object.entries(initial));
+  const putOptions = new Map();
   return {
     objects,
+    putOptions,
     async get(key) {
       if (!objects.has(key)) return null;
       const body = objects.get(key);
@@ -16,7 +18,10 @@ function r2(initial = {}) {
         async text() { return body; },
       };
     },
-    async put(key, value) { objects.set(key, value); },
+    async put(key, value, options) {
+      objects.set(key, value);
+      putOptions.set(key, options);
+    },
   };
 }
 
@@ -65,7 +70,10 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ entityName: "NVIDIA", facts: { "us-gaap": {} } });
     if (url.startsWith("https://generativelanguage.googleapis.com")) {
-      assert.equal(init.headers["x-goog-api-key"], "gemini-test-key");
+      const geminiUrl = new URL(url);
+      assert.equal(geminiUrl.pathname, "/v1beta/models/gemini-3.5-flash:generateContent");
+      assert.equal(geminiUrl.searchParams.get("key"), "gemini-test-key");
+      assert.equal(init.headers["x-goog-api-key"], undefined);
       const body = JSON.parse(init.body);
       assert.match(body.contents[0].parts[0].text, /institutional-style Growth Tech Morning Brief/);
       assert.match(body.contents[0].parts[0].text, /volume spikes/);
@@ -88,11 +96,16 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
   }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
 
   assert.equal(result.report.generated, true);
+  assert.equal(result.report.geminiModel, "gemini-3.5-flash");
   assert.equal(result.report.stored, true);
   assert.deepEqual(result.report.email, { sent: true, id: "email_123" });
   assert.deepEqual(result.report.webhook, { sent: true, provider: "generic" });
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), "# Growth Tech Morning Brief\n\nAction: Hold NVDA.");
   assert.equal(bucket.objects.get("reports/latest.md"), "# Growth Tech Morning Brief\n\nAction: Hold NVDA.");
+  assert.deepEqual(bucket.putOptions.get("reports/latest.md").customMetadata, {
+    reportDate: "2026-08-05",
+    geminiModel: "gemini-3.5-flash",
+  });
 });
 
 test("delivery failures are isolated after the R2 report is stored", async () => {
@@ -122,6 +135,81 @@ test("delivery failures are isolated after the R2 report is stored", async () =>
   assert.match(result.report.email.error, /Resend email failed \(429\)/);
   assert.equal(result.report.webhook.failed, true);
   assert.match(result.report.webhook.error, /Webhook delivery failed \(502\)/);
+});
+
+test("Gemini model can be overridden with GEMINI_MODEL", async () => {
+  const bucket = r2();
+  const env = {
+    WATCHLIST: "NVDA",
+    GEMINI_API_KEY: "gemini-test-key",
+    GEMINI_MODEL: "gemini-3.5-flash-preview",
+    BRIEF_BUCKET: bucket,
+  };
+
+  const result = await withFetchStub((url) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    if (url.startsWith("https://generativelanguage.googleapis.com")) {
+      const geminiUrl = new URL(url);
+      assert.equal(geminiUrl.pathname, "/v1beta/models/gemini-3.5-flash-preview:generateContent");
+      assert.equal(geminiUrl.searchParams.get("key"), "gemini-test-key");
+      return responseJson({ candidates: [{ content: { parts: [{ text: "override markdown" }] } }] });
+    }
+    throw new Error(`Unexpected fetch ${url}`);
+  }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
+
+  assert.equal(result.report.generated, true);
+  assert.equal(result.report.geminiModel, "gemini-3.5-flash-preview");
+  assert.equal(bucket.objects.get("reports/2026-08-05.md"), "override markdown");
+});
+
+test("Gemini 404 diagnostics include status and model without exposing the API key", async () => {
+  const env = {
+    WATCHLIST: "NVDA",
+    GEMINI_API_KEY: "gemini-secret-key",
+    BRIEF_BUCKET: r2(),
+  };
+
+  const result = await withFetchStub((url) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    if (url.startsWith("https://generativelanguage.googleapis.com")) {
+      return responseJson({ error: { message: "models/gemini-old is unavailable for gemini-secret-key" } }, 404);
+    }
+    throw new Error(`Unexpected fetch ${url}`);
+  }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
+
+  assert.match(result.report.error, /Gemini report failed \(404, model: gemini-3.5-flash\):/);
+  assert.match(result.report.error, /models\/gemini-old is unavailable for \[redacted\]/);
+  assert.doesNotMatch(result.report.error, /gemini-secret-key/);
+});
+
+test("successful Gemini generation stores the report and delivers Discord", async () => {
+  const bucket = r2();
+  const env = {
+    WATCHLIST: "NVDA",
+    GEMINI_API_KEY: "gemini-test-key",
+    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token",
+    BRIEF_BUCKET: bucket,
+  };
+
+  const result = await withFetchStub((url, init) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    if (url.startsWith("https://generativelanguage.googleapis.com")) {
+      const geminiUrl = new URL(url);
+      assert.equal(geminiUrl.pathname, "/v1beta/models/gemini-3.5-flash:generateContent");
+      return responseJson({ candidates: [{ content: { parts: [{ text: "discord markdown" }] } }] });
+    }
+    assert.equal(url, env.DISCORD_WEBHOOK_URL);
+    assert.match(JSON.parse(init.body).content, /discord markdown/);
+    return new Response(null, { status: 204 });
+  }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
+
+  assert.equal(result.report.generated, true);
+  assert.equal(result.report.geminiModel, "gemini-3.5-flash");
+  assert.equal(bucket.objects.get("reports/2026-08-05.md"), "discord markdown");
+  assert.deepEqual(result.report.webhook, { sent: true, provider: "discord", messages: 1 });
 });
 
 test("existing dated report prevents duplicate report generation but still evaluates delivery", async () => {

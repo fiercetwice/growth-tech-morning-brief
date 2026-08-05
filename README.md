@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.4.2 — AI report edition
+# Growth Tech Morning Brief v0.4.3 — AI report edition
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -75,11 +75,12 @@ The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull 
 
 ## AI report generation and delivery
 
-On the valid 09:35 AM ET scheduled run, the Worker writes the stock snapshot, reads `snapshots/latest.json` back from R2, sends a compact snapshot to Gemini 2.5 Flash, and stores the generated Markdown report at both `reports/YYYY-MM-DD.md` and `reports/latest.md`. The duplicate daylight-saving cron expression is ignored unless it maps to 09:35 AM ET. An existing dated report prevents duplicate Gemini generation, but delivery is retried until `deliveries/YYYY-MM-DD.json` records a successful Discord receipt.
+On the valid 09:35 AM ET scheduled run, the Worker writes the stock snapshot, reads `snapshots/latest.json` back from R2, sends a compact snapshot to Gemini, and stores the generated Markdown report at both `reports/YYYY-MM-DD.md` and `reports/latest.md`. The default Gemini model is `gemini-3.5-flash`, and `GEMINI_MODEL` can override it without changing code. The duplicate daylight-saving cron expression is ignored unless it maps to 09:35 AM ET. An existing dated report prevents duplicate Gemini generation, but delivery is retried until `deliveries/YYYY-MM-DD.json` records a successful Discord receipt.
 
 Configure these secrets or environment variables outside the repository:
 
 - `GEMINI_API_KEY`: required for AI report generation.
+- `GEMINI_MODEL`: optional Gemini model override. Defaults to `gemini-3.5-flash`.
 - `RESEND_API_KEY`, `REPORT_TO_EMAIL`, `REPORT_FROM_EMAIL`: optional email delivery through Resend.
 - `DISCORD_WEBHOOK_URL`: optional Discord delivery using a `Stock Analyst Bot` username, avatar, and Markdown `content`.
 - `WEBHOOK_URL`: optional generic webhook delivery. Discord URLs are also detected here for backward compatibility; non-Discord URLs receive `{ date, markdown }` JSON.
@@ -111,6 +112,7 @@ R2 object layout:
 - `RUN_TOKEN_REQUIRED`: keep `true` for public workers.dev deployments.
 - `SEC_USER_AGENT`: optional descriptive SEC user agent with a contact email.
 - `GEMINI_API_KEY`: Gemini API key used by scheduled report generation.
+- `GEMINI_MODEL`: optional Gemini model override. Defaults to `gemini-3.5-flash`.
 - `RESEND_API_KEY`: optional Resend API key for email delivery.
 - `REPORT_TO_EMAIL`: optional report recipient email address.
 - `REPORT_FROM_EMAIL`: optional verified sender address for Resend.
