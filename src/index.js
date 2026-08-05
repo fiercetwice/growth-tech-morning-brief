@@ -1,4 +1,5 @@
 const YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart";
+const NASDAQ_API_BASE = "https://api.nasdaq.com/api/calendar";
 const SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts";
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
@@ -18,6 +19,21 @@ const REQUIRED_EXECUTIVE_LABELS = ["AI Cycle", "Catalyst", "Risk", "Best Opportu
 const REQUIRED_AI_CYCLE_ROWS = ["Hyperscaler AI CapEx", "GPU Demand", "AI Cloud", "Enterprise AI", "Inference"];
 const REQUIRED_SECTOR_ROWS = ["GPU", "AI Cloud", "GPU Cloud", "Networking", "Cooling", "Power", "Cybersecurity", "Cloud Software"];
 const ALLOWED_AI_PROVIDERS = new Set(["gemini", "deepseek", "openai-compatible"]);
+const MARKET_CONTEXT_GROUPS = {
+  futures: [
+    { symbol: "ES=F", label: "S&P 500" },
+    { symbol: "NQ=F", label: "Nasdaq 100" },
+    { symbol: "YM=F", label: "Dow" },
+    { symbol: "RTY=F", label: "Russell 2000" },
+  ],
+  rates: [{ symbol: "^TNX", label: "U.S. 10Y yield", unit: "%" }],
+  usd: [{ symbol: "DX-Y.NYB", label: "U.S. Dollar Index" }],
+  oil: [
+    { symbol: "CL=F", label: "WTI crude" },
+    { symbol: "BZ=F", label: "Brent crude" },
+  ],
+};
+const REQUIRED_CONTEXT_LABELS = ["Futures", "Rates", "USD", "Oil", "Macro Events", "Earnings"];
 
 const CIKS = {
   NVDA: "0001045810", AMZN: "0001018724", MSFT: "0000789019",
@@ -154,13 +170,17 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
   }
 
   const symbols = parseSymbols(env.WATCHLIST);
-  const results = await Promise.allSettled(symbols.map(async (symbol) => {
+  const [results, marketContext, calendars] = await Promise.all([
+    Promise.allSettled(symbols.map(async (symbol) => {
     const chart = await fetchYahooChart(symbol, now, env);
     const fundamentals = await fetchSecFundamentals(symbol, env, now).catch((error) => ({
       available: false, reason: error.message,
     }));
     return assembleSymbol(symbol, chart, fundamentals);
-  }));
+    })),
+    buildMarketContext(env, now),
+    buildCalendarContext(env, now, symbols),
+  ]);
 
   const watchlist = results.map((result, index) => result.status === "fulfilled"
     ? result.value
@@ -169,15 +189,19 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
   if (!succeeded) throw new Error("All Yahoo chart requests failed");
 
   const snapshot = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     generatedAt: now.toISOString(),
     session: "regular_open_plus_5m",
     sources: {
       price: "Yahoo Finance chart endpoint (unofficial)",
       fundamentals: "SEC EDGAR CompanyFacts",
+      marketContext: "Yahoo Finance chart endpoint (unofficial)",
+      calendars: "Nasdaq public calendar endpoints (unofficial)",
       methodology: "Point-in-time TTM multiples use only filings available by each price date",
     },
     coverage: { requested: symbols.length, succeeded, failed: symbols.length - succeeded },
+    marketContext,
+    calendars,
     watchlist,
   };
 
@@ -194,22 +218,170 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
   return snapshot;
 }
 
+export async function buildMarketContext(env, now = new Date()) {
+  const groups = await Promise.all(Object.entries(MARKET_CONTEXT_GROUPS).map(async ([category, instruments]) => {
+    const settled = await Promise.allSettled(instruments.map(async (instrument) => {
+      const chart = await fetchYahooChart(instrument.symbol, now, env, { historyDays: 10 });
+      return marketContextRow(instrument, chart, now);
+    }));
+    const items = settled.filter((result) => result.status === "fulfilled").map((result) => result.value);
+    const failures = settled.filter((result) => result.status === "rejected");
+    const stale = items.some((item) => item.stale);
+    return [category, {
+      status: items.length ? (stale ? "stale" : "available") : "unavailable",
+      source: "Yahoo Finance chart endpoint (unofficial)",
+      asOf: latestTimestamp(items.map((item) => item.asOf)),
+      items,
+      ...(failures.length ? { failed: failures.length, reason: failures.map((result) => errorMessage(result.reason)).join("; ") } : {}),
+    }];
+  }));
+  return Object.fromEntries(groups);
+}
+
+export async function buildCalendarContext(env, now = new Date(), symbols = []) {
+  const date = zonedParts(now, "America/New_York").date;
+  const [macro, earnings] = await Promise.all([
+    fetchNasdaqCalendar("economicevents", date, env).then((body) => normalizeNasdaqMacroCalendar(body, date, now))
+      .catch((error) => unavailableCalendar("Nasdaq public economic calendar (unofficial)", date, error)),
+    fetchNasdaqCalendar("earnings", date, env).then((body) => normalizeNasdaqEarningsCalendar(body, date, symbols, now))
+      .catch((error) => unavailableCalendar("Nasdaq public earnings calendar (unofficial)", date, error)),
+  ]);
+  return { macroEvents: macro, earnings };
+}
+
+function marketContextRow(instrument, chart, now) {
+  const scale = instrument.scale ?? 1;
+  const asOf = chart.asOf;
+  return {
+    symbol: instrument.symbol,
+    label: instrument.label,
+    value: round(Number.isFinite(chart.price) ? chart.price * scale : null),
+    previousClose: round(Number.isFinite(chart.previousClose) ? chart.previousClose * scale : null),
+    change: round(Number.isFinite(chart.change) ? chart.change * scale : null),
+    changePercent: round(chart.changePercent),
+    unit: instrument.unit ?? chart.currency ?? null,
+    asOf,
+    stale: !asOf || now.getTime() - Date.parse(asOf) > 4 * 60 * 60 * 1000,
+  };
+}
+
+async function fetchNasdaqCalendar(kind, date, env) {
+  const url = new URL(`${NASDAQ_API_BASE}/${kind}`);
+  url.searchParams.set("date", date);
+  const response = await fetch(url, { headers: nasdaqHeaders(env) });
+  const body = await response.json().catch(() => null);
+  const providerError = body?.status?.bCodeMessage?.[0]?.errorMessage;
+  if (!response.ok || providerError || !body?.data) {
+    throw new Error(`Nasdaq ${kind} calendar failed (${response.status}): ${providerError || "missing data"}`);
+  }
+  return body;
+}
+
+export function normalizeNasdaqMacroCalendar(body, date, now = new Date()) {
+  const rows = Array.isArray(body?.data?.rows) ? body.data.rows : [];
+  const events = rows.slice(0, 25).map((row) => ({
+    time: cleanText(row.time ?? row.releaseTime),
+    country: cleanText(row.country),
+    event: cleanText(row.eventName ?? row.event ?? row.name),
+    actual: cleanText(row.actual),
+    consensus: cleanText(row.consensus ?? row.forecast),
+    previous: cleanText(row.previous),
+  })).filter((row) => row.event);
+  return {
+    status: "available",
+    source: "Nasdaq public economic calendar (unofficial)",
+    date,
+    asOf: now.toISOString(),
+    events,
+    empty: events.length === 0,
+  };
+}
+
+export function normalizeNasdaqEarningsCalendar(body, date, symbols = [], now = new Date()) {
+  const rows = Array.isArray(body?.data?.rows) ? body.data.rows : [];
+  const wanted = new Set(symbols.map((symbol) => symbol.toUpperCase()));
+  const normalized = rows.map((row) => ({
+    symbol: cleanText(row.symbol)?.toUpperCase() ?? null,
+    name: cleanText(row.name),
+    time: cleanText(row.time),
+    epsForecast: cleanText(row.epsForecast ?? row.epsEstimate),
+    fiscalQuarterEnding: cleanText(row.fiscalQuarterEnding),
+    marketCap: cleanText(row.marketCap),
+  })).filter((row) => row.symbol);
+  const events = [...normalized.filter((row) => wanted.has(row.symbol)), ...normalized.filter((row) => !wanted.has(row.symbol))]
+    .filter((row, index, all) => all.findIndex((candidate) => candidate.symbol === row.symbol) === index)
+    .slice(0, 25);
+  return {
+    status: "available",
+    source: "Nasdaq public earnings calendar (unofficial)",
+    date: body?.data?.asOf ?? date,
+    asOf: now.toISOString(),
+    events,
+    watchlistMatches: events.filter((row) => wanted.has(row.symbol)).map((row) => row.symbol),
+    empty: events.length === 0,
+  };
+}
+
+function unavailableCalendar(source, date, error) {
+  return { status: "unavailable", source, date, asOf: null, events: [], reason: errorMessage(error) };
+}
+
+function unavailableMarketContext(reason) {
+  return Object.fromEntries(Object.keys(MARKET_CONTEXT_GROUPS).map((category) => [category, {
+    status: "unavailable", source: "Yahoo Finance chart endpoint (unofficial)", asOf: null, items: [], reason,
+  }]));
+}
+
+function unavailableCalendars(reason) {
+  return {
+    macroEvents: unavailableCalendar("Nasdaq public economic calendar (unofficial)", null, reason),
+    earnings: unavailableCalendar("Nasdaq public earnings calendar (unofficial)", null, reason),
+  };
+}
+
+function snapshotDataQuality(snapshot) {
+  const categories = {
+    futures: snapshot.marketContext?.futures?.status ?? "unavailable",
+    rates: snapshot.marketContext?.rates?.status ?? "unavailable",
+    usd: snapshot.marketContext?.usd?.status ?? "unavailable",
+    oil: snapshot.marketContext?.oil?.status ?? "unavailable",
+    macroEvents: snapshot.calendars?.macroEvents?.status ?? "unavailable",
+    earnings: snapshot.calendars?.earnings?.status ?? "unavailable",
+  };
+  const available = Object.values(categories).filter((status) => status === "available").length;
+  return { categories, available, total: Object.keys(categories).length, complete: available === Object.keys(categories).length };
+}
+
+function latestTimestamp(values) {
+  return values.filter(Boolean).sort().at(-1) ?? null;
+}
+
+function cleanText(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim();
+  return text && text !== "--" && text.toLowerCase() !== "n/a" ? text : null;
+}
+
 export function toBrief(snapshot) {
   const rows = snapshot.watchlist.map(compactRow);
   const valid = rows.filter((row) => !row.missing);
   const ranked = [...valid].filter((row) => Number.isFinite(row.changePercent)).sort((a, b) => b.changePercent - a.changePercent);
   const expensive = [...valid].filter((row) => Number.isFinite(row.valuation?.selectedPercentile))
     .sort((a, b) => b.valuation.selectedPercentile - a.valuation.selectedPercentile);
+  const dataQuality = snapshotDataQuality(snapshot);
   const brief = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     generatedAt: snapshot.generatedAt,
     session: snapshot.session,
     coverage: snapshot.coverage,
+    dataQuality,
+    marketContext: snapshot.marketContext ?? unavailableMarketContext("not in snapshot"),
+    calendars: snapshot.calendars ?? unavailableCalendars("not in snapshot"),
     executiveSummary: {
       strongest: ranked.slice(0, 3).map((row) => `${row.symbol} ${signed(row.changePercent)}%`),
       weakest: ranked.slice(-3).reverse().map((row) => `${row.symbol} ${signed(row.changePercent)}%`),
       highestValuationPercentile: expensive.slice(0, 3).map((row) => `${row.symbol} ${row.valuation.selectedPercentile} percentile`),
-      dataQuality: snapshot.coverage.failed ? `${snapshot.coverage.failed} symbol(s) failed` : "All requested symbols available",
+      dataQuality: `${snapshot.coverage.failed ? `${snapshot.coverage.failed} symbol(s) failed` : "All requested symbols available"}; market context ${dataQuality.available}/${dataQuality.total} current`,
     },
     watchlist: rows,
   };
@@ -230,6 +402,9 @@ export function compactSnapshotForReport(snapshot) {
     generatedAt: brief.generatedAt,
     session: brief.session,
     coverage: brief.coverage,
+    dataQuality: brief.dataQuality,
+    marketContext: brief.marketContext,
+    calendars: brief.calendars,
     executiveSummary: brief.executiveSummary,
     majorGainers: ranked.slice(0, 5),
     majorLosers: ranked.slice(-5).reverse(),
@@ -260,7 +435,7 @@ export async function generateAiReport(env, snapshot, override = null) {
       if (!isTokenLimitFinish(extracted.finishReason)) break;
       continue;
     }
-    const validation = validateReportCompleteness(extracted.markdown, requiredSymbols);
+    const validation = validateReportCompleteness(extracted.markdown, requiredSymbols, compact);
     metadata.validation = validation.ok ? "passed" : "failed";
     metadata.validationErrors = validation.errors.join("; ");
     if (validation.ok) return { markdown: extracted.markdown, provider, model, metadata };
@@ -389,7 +564,7 @@ function reportMetadata(route, body, extracted, attempts) {
   };
 }
 
-export function validateReportCompleteness(markdown, symbols) {
+export function validateReportCompleteness(markdown, symbols, compact = null) {
   const errors = [];
   for (const section of REQUIRED_REPORT_SECTIONS) {
     if (!sectionBody(markdown, section)) errors.push(`missing section: ${section}`);
@@ -408,6 +583,12 @@ export function validateReportCompleteness(markdown, symbols) {
   for (const label of ["Sourced Facts", "Analysis"]) {
     if (!new RegExp(escapeRegExp(label), "i").test(overnight)) errors.push(`missing Overnight field: ${label}`);
   }
+  for (const label of REQUIRED_CONTEXT_LABELS) {
+    if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(overnight)) {
+      errors.push(`missing Overnight context field: ${label}`);
+    }
+  }
+  validateAvailableContextIsUsed(overnight, compact, errors);
 
   const dashboard = sectionBody(markdown, "AI Cycle Dashboard");
   for (const header of ["Rating", "Trend", "Sourced Facts", "Analysis"]) {
@@ -461,6 +642,27 @@ function markdownTableRow(section, label, options = {}) {
   return line.split("|").slice(1, -1).map((cell) => cell.trim());
 }
 
+function validateAvailableContextIsUsed(overnight, compact, errors) {
+  if (!compact) return;
+  const categories = [
+    ["Futures", compact.marketContext?.futures],
+    ["Rates", compact.marketContext?.rates],
+    ["USD", compact.marketContext?.usd],
+    ["Oil", compact.marketContext?.oil],
+    ["Macro Events", compact.calendars?.macroEvents],
+    ["Earnings", compact.calendars?.earnings],
+  ];
+  for (const [label, context] of categories) {
+    const line = overnight.split("\n").find((candidate) => new RegExp(`${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(candidate));
+    if (context?.status === "available" && (!line || /\bunavailable\b|not in snapshot/i.test(line))) {
+      errors.push(`available context incorrectly marked unavailable: ${label}`);
+    }
+    if (context?.status === "unavailable" && (!line || !/\bunavailable\b/i.test(line))) {
+      errors.push(`unavailable context not flagged unavailable: ${label}`);
+    }
+  }
+}
+
 function validAction(value) {
   return /^(Buy|Hold|Wait|Avoid)$/i.test(value.replace(/[\s*`_]/g, ""));
 }
@@ -482,7 +684,8 @@ function reportPrompt(compact, options = {}) {
     "Produce a concise institutional sell-side Growth Tech Morning Brief in Markdown using the exact schema below.",
     "Do not add, remove, or rename top-level sections, table columns, required rows, or Executive Summary labels.",
     "Use only supplied data as sourced facts. Never describe volume as institutional, claim an earnings/macro catalyst, or infer demand from price action as fact.",
-    "When futures, rates, USD, oil, macro events, earnings, forward estimates, catalysts, or risks are not supplied, write 'unavailable' or 'n/a — not in snapshot'.",
+    "When a supplied context category has status available, cite its values and as-of time; do not call it unavailable. When its status is stale, cite it and explicitly flag it stale. Only write unavailable when its supplied status is unavailable.",
+    "When forward estimates, company-specific catalysts, or risks are not supplied, write 'unavailable' or 'n/a — not in snapshot'.",
     "Keep sourced facts separate from analysis. Analysis may infer cautiously from supplied price, volume, range, and trailing valuation data.",
     "Allowed stock and sector actions are Buy, Hold, Wait, or Avoid.",
     "In table Action cells, write one action only; do not add qualifiers in the same cell.",
@@ -491,7 +694,8 @@ function reportPrompt(compact, options = {}) {
     "Exactly five bullets labeled: **AI Cycle:**; **Catalyst:**; **Risk:**; **Best Opportunity:**; **Avoid:**.",
     "",
     "# Overnight and Market Context",
-    "Include **Sourced Facts:** and **Analysis:**. Explicitly flag unavailable futures, rates, USD, oil, macro, and earnings data.",
+    "Include **Sourced Facts:** and **Analysis:** followed by six separate bullet lines labeled: **Futures:**, **Rates:**, **USD:**, **Oil:**, **Macro Events:**, and **Earnings:**.",
+    "For each field, state the supplied source status and as-of time. Use actual/consensus/previous for macro events and time/EPS forecast for earnings when supplied. Do not invent news or event causality.",
     "",
     "# AI Cycle Dashboard",
     "Markdown table columns: Segment | Rating | Trend | Sourced Facts | Analysis.",
@@ -866,7 +1070,7 @@ function renderMarkdown(brief) {
   const lines = [
     `# Growth Tech Morning Brief — ${brief.generatedAt.slice(0, 10)}`,
     "",
-    `Coverage: ${brief.coverage.succeeded}/${brief.coverage.requested}. Session: 9:35 AM ET.`,
+    `Coverage: ${brief.coverage.succeeded}/${brief.coverage.requested}. Market context: ${brief.dataQuality.available}/${brief.dataQuality.total} current. Session: 9:35 AM ET.`,
     "",
     `Strongest: ${brief.executiveSummary.strongest.join(", ") || "n/a"}`,
     `Weakest: ${brief.executiveSummary.weakest.join(", ") || "n/a"}`,
@@ -896,9 +1100,11 @@ function authorized(request, env) {
 function fmt(value) { return Number.isFinite(value) ? String(value) : "n/a"; }
 function signed(value) { return Number.isFinite(value) ? `${value >= 0 ? "+" : ""}${value}` : "n/a"; }
 
-async function fetchYahooChart(symbol, now, env) {
+async function fetchYahooChart(symbol, now, env, options = {}) {
   const end = Math.floor(now.getTime() / 1000) + 86400;
-  const start = end - Math.round(HISTORY_YEARS * 365.25 * 86400);
+  const start = options.historyDays
+    ? end - Math.round(options.historyDays * 86400)
+    : end - Math.round(HISTORY_YEARS * 365.25 * 86400);
   const url = new URL(`${YAHOO_CHART}/${encodeURIComponent(symbol)}`);
   Object.entries({ period1: start, period2: end, interval: "1d", events: "div,splits", includeAdjustedClose: "true" })
     .forEach(([key, value]) => url.searchParams.set(key, String(value)));
@@ -933,6 +1139,7 @@ export function normalizeYahooChart(result) {
     currency: meta.currency ?? null,
     exchange: meta.exchangeName ?? null,
     name: meta.longName ?? meta.shortName ?? null,
+    asOf: Number.isFinite(Number(meta.regularMarketTime)) ? new Date(Number(meta.regularMarketTime) * 1000).toISOString() : null,
     price: latest,
     previousClose: previous,
     change: finitePair(latest, previous) ? latest - previous : null,
@@ -1089,6 +1296,16 @@ export function zonedParts(date, timeZone) {
 
 function yahooHeaders(env) {
   return { accept: "application/json", "user-agent": env.YAHOO_USER_AGENT || "Mozilla/5.0 growth-tech-morning-brief/0.2" };
+}
+
+function nasdaqHeaders(env) {
+  return {
+    accept: "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.9",
+    origin: "https://www.nasdaq.com",
+    referer: "https://www.nasdaq.com/market-activity/",
+    "user-agent": env.NASDAQ_USER_AGENT || "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+  };
 }
 
 function parseSymbols(value = "") {
