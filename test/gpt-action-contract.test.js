@@ -40,7 +40,7 @@ test("Worker accepts a trailing slash on the GPT read route", async () => {
 test("health exposes the deployed release for propagation-safe smoke tests", async () => {
   const response = await worker.fetch(new Request("https://example.test/health"), {});
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.5" });
+  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.6" });
 });
 
 test("post-deploy failures print actionable diagnostics before exiting", () => {
@@ -48,7 +48,8 @@ test("post-deploy failures print actionable diagnostics before exiting", () => {
   const failureIndex = deployWorkflow.indexOf('if [ -n "$failures" ]');
   assert.ok(summaryIndex >= 0 && summaryIndex < failureIndex);
   assert.match(deployWorkflow, /Discord delivery incomplete:/);
-  assert.match(deployWorkflow, /chunks delivered/);
+  assert.match(deployWorkflow, /deliveries completed/);
+  assert.match(deployWorkflow, /storage and Discord delivery were not attempted/);
   assert.match(deployWorkflow, /echo "::error::\$failure"/);
   assert.match(deployWorkflow, /GITHUB_STEP_SUMMARY/);
 });
