@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.5.5 — verbose decision audit
+# Growth Tech Morning Brief v0.5.6 — staged candidate research
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -107,7 +107,11 @@ Gemini defaults to `gemini-3.5-flash` with low thinking. DeepSeek uses its offic
 
 Every provider must return a normally completed response. The Worker validates a six-section schema: Today's Verdict, Decision Reasoning, Opportunities, Rejected Candidates, Market and AI-Cycle Context, and What Could Change the Call. The reasoning section must disclose the universe searched, gate, and conclusion. Each opportunity must explain admission, possible mispricing, evidence for and against, strategic position, today's action, confidence, entry/exit condition, catalyst, risk/reward, and invalidation. Buy/Sell calls require a material fresh event or same-day earnings; a large price move without material news is Watch-only. Trim calls require that evidence or an extreme valuation/range setup. The validator also rejects unsupported demand, CapEx-cycle, or institutional-flow claims.
 
-`REPORT_MODE` selects `standard` or `verbose` generation and defaults to `verbose` in the deployed configuration. Verbose reports must audit every gated candidate supplied to the model (up to ten), expand a No-Trade Opportunities section into threshold/near-miss/failure/portfolio reasoning, and include a Data and Pipeline Audit. Every generated report and R2 metadata record identify the report mode and engine version. Authenticated forced runs may override the mode with `{"forceRegenerate":true,"reportMode":"standard"}` or `{"forceRegenerate":true,"verbose":true}`.
+`REPORT_MODE` selects `standard` or `verbose` generation and defaults to `verbose` in the deployed configuration. Verbose reports must audit every staged research packet supplied to synthesis (up to 12), expand a No-Trade Opportunities section into threshold/near-miss/failure/portfolio reasoning, and include a Data and Pipeline Audit. Every generated report and R2 metadata record identify the report mode and engine version. Authenticated forced runs may override the mode with `{"forceRegenerate":true,"reportMode":"standard"}` or `{"forceRegenerate":true,"verbose":true}`.
+
+v0.5.6 uses staged generation. Deterministic code screens the full market, then the Worker researches up to 12 admitted candidates in bounded batches (three by default). Each batch returns validated structured JSON covering catalysts, supporting and conflicting evidence, mispricing, risk/reward, missing evidence, invalidation, and the action-gate result. The packets are stored under `research/` in R2. Final synthesis receives those compact packets and the market regime instead of the duplicate raw candidate payload. A failed batch is retried once with its exact validation errors; if it still fails, every affected symbol remains visible as `research incomplete` and cannot receive an actionable call.
+
+Final synthesis uses explicit output budgets: 24,000 tokens in verbose mode and 12,000 in standard mode by default. A failed synthesis is repaired once using the exact provider or schema failure. The previous stored report remains untouched if both attempts fail, and the response identifies report storage, email, and Discord delivery as not attempted.
 
 The report omits exhaustive sector and full-watchlist tables, but it is not length-constrained when additional reasoning improves the decision. It includes the strongest rejected setups so a No-Trade verdict remains auditable.
 
@@ -128,7 +132,7 @@ Configure these secrets or environment variables outside the repository:
 - `OPENAI_COMPAT_BASE_URL`: required preconfigured credential-free HTTPS base URL for that route.
 - `OPENAI_COMPAT_MODEL`: required default model for that route unless `AI_MODEL` is set.
 - `RESEND_API_KEY`, `REPORT_TO_EMAIL`, `REPORT_FROM_EMAIL`: optional email delivery through Resend.
-- `DISCORD_WEBHOOK_URL`: optional Discord delivery using a `Stock Analyst Bot` username, avatar, and Markdown `content`.
+- `DISCORD_WEBHOOK_URL`: optional Discord delivery using one concise verdict message plus the complete report as a Markdown attachment. Transient `429` and `5xx` responses receive bounded retries.
 - `WEBHOOK_URL`: optional generic webhook delivery. Discord URLs are also detected here for backward compatibility; non-Discord URLs receive `{ date, markdown }` JSON.
 
 Report storage is independent from delivery. Email or webhook failures are logged and returned in scheduled-run diagnostics without deleting or invalidating the stored R2 report.
@@ -150,7 +154,8 @@ R2 object layout:
 - `briefs/latest.json`: response served by `/latest`.
 - `reports/YYYY-MM-DD.md`: AI-generated Markdown report.
 - `reports/latest.md`: latest AI-generated Markdown report. R2 custom metadata includes report date, provider, model, finish reason, output/thinking/total token counts when returned, generation attempt count, generated timestamp, and validation status.
-- `deliveries/YYYY-MM-DD.json`: Discord delivery receipt with success, failure, timestamp and message count diagnostics.
+- `research/YYYY-MM-DD.json` and `research/latest.json`: validated candidate packets, batch attempts, failures, and funnel counts.
+- `deliveries/YYYY-MM-DD.json`: Discord delivery receipt with success, failure, timestamp, report fingerprint, and attachment diagnostics.
 
 ## Configuration
 
@@ -159,8 +164,12 @@ R2 object layout:
 - `DISCOVERY_LIMIT`: maximum liquid, relevant full-market movers enriched with news and sent to the opportunity gate; defaults to 6 and is capped at 25.
 - `DISCOVERY_MIN_MARKET_CAP`: minimum market capitalization for discovery; defaults to $250 million.
 - `DISCOVERY_MIN_DOLLAR_VOLUME`: minimum current-session price × volume; defaults to $5 million.
-- `SEC_REFRESH_LIMIT`: maximum uncached or expired SEC network refreshes per invocation; defaults to 3. Fresh cache entries are reused, and an expired entry remains available as stale data when the refresh budget is exhausted. Together with the default discovery limit, this keeps the full report pipeline within the Workers Free 50-external-subrequest ceiling.
+- `SEC_REFRESH_LIMIT`: maximum uncached or expired SEC network refreshes per invocation; deployed default 2. Fresh cache entries are reused, and an expired entry remains available as stale data when the refresh budget is exhausted. Together with the bounded research pipeline and focused market series, this keeps the full report pipeline within the Workers Free 50-external-subrequest ceiling.
 - `REPORT_MODE`: `standard` or `verbose`; the deployed default is `verbose`. A request-level override requires `forceRegenerate: true`.
+- `RESEARCH_BATCH_SIZE`: candidate count per independent AI research call; defaults to 3 and is capped at 5.
+- `RESEARCH_MAX_TOKENS`: output budget for each structured research batch; defaults to 4,000.
+- `AI_VERBOSE_MAX_TOKENS`: final verbose synthesis output budget; defaults to 24,000.
+- `AI_STANDARD_MAX_TOKENS`: final standard synthesis output budget; defaults to 12,000.
 - `RUN_TOKEN_REQUIRED`: keep `true` for public workers.dev deployments.
 - `SEC_USER_AGENT`: optional descriptive SEC user agent with a contact email.
 - `YAHOO_USER_AGENT`: optional user agent for Yahoo quote and market-context requests.
@@ -174,7 +183,7 @@ R2 object layout:
 - `RESEND_API_KEY`: optional Resend API key for email delivery.
 - `REPORT_TO_EMAIL`: optional report recipient email address.
 - `REPORT_FROM_EMAIL`: optional verified sender address for Resend.
-- `DISCORD_WEBHOOK_URL`: optional Discord webhook URL that receives the generated Markdown report as message `content`.
+- `DISCORD_WEBHOOK_URL`: optional Discord webhook URL that receives a verdict summary and the full Markdown report as an attached `.md` file.
 - `WEBHOOK_URL`: optional generic endpoint that receives the generated Markdown report. Discord webhook URLs are supported directly for backward compatibility.
 
 Two UTC cron expressions cover daylight-saving time. The Worker checks New York local time, so only the 09:35 ET trigger runs.

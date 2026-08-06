@@ -165,7 +165,7 @@ test("market context preserves partial coverage and flags stale quotes", async (
     const context = await buildMarketContext({}, new Date("2026-08-05T13:35:00Z"));
     assert.equal(context.futures.status, "stale");
     assert.equal(context.futures.items.length, 1);
-    assert.equal(context.futures.failed, 3);
+    assert.equal(context.futures.failed, 1);
     assert.equal(context.rates.status, "unavailable");
   } finally {
     globalThis.fetch = originalFetch;

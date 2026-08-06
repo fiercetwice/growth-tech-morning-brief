@@ -9,7 +9,7 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.5";
+const SERVICE_VERSION = "0.5.6";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -29,21 +29,22 @@ const REPORT_MODES = new Set(["standard", "verbose"]);
 const DEFAULT_DISCOVERY_LIMIT = 6;
 const DEFAULT_MIN_MARKET_CAP = 250_000_000;
 const DEFAULT_MIN_DOLLAR_VOLUME = 5_000_000;
-const DEFAULT_SEC_REFRESH_LIMIT = 3;
+const DEFAULT_SEC_REFRESH_LIMIT = 2;
+const DEFAULT_RESEARCH_BATCH_SIZE = 3;
+const DEFAULT_VERBOSE_MAX_TOKENS = 24_000;
+const DEFAULT_STANDARD_MAX_TOKENS = 12_000;
+const DEFAULT_RESEARCH_MAX_TOKENS = 4_000;
+const MAX_AI_ATTEMPTS = 2;
+const MAX_DISCORD_ATTEMPTS = 4;
 const ALLOWED_AI_PROVIDERS = new Set(["gemini", "deepseek", "openai-compatible"]);
 const MARKET_CONTEXT_GROUPS = {
   futures: [
     { symbol: "ES=F", label: "S&P 500" },
     { symbol: "NQ=F", label: "Nasdaq 100" },
-    { symbol: "YM=F", label: "Dow" },
-    { symbol: "RTY=F", label: "Russell 2000" },
   ],
   rates: [{ symbol: "^TNX", label: "U.S. 10Y yield", unit: "%" }],
   usd: [{ symbol: "DX-Y.NYB", label: "U.S. Dollar Index" }],
-  oil: [
-    { symbol: "CL=F", label: "WTI crude" },
-    { symbol: "BZ=F", label: "Brent crude" },
-  ],
+  oil: [{ symbol: "CL=F", label: "WTI crude" }],
 };
 const SECTOR_MEMBERS = {
   GPU: ["NVDA", "TSM", "AVGO"],
@@ -174,10 +175,11 @@ async function generateOrDeliverReport(env, now, options = {}) {
       reportResults.aiModel = generatedReport.model;
       reportResults.reportMode = generatedReport.reportMode;
       reportResults.reportEngineVersion = SERVICE_VERSION;
+      reportResults.research = generatedReport.research?.funnel ?? null;
       if (generatedReport.provider === "gemini") reportResults.geminiModel = generatedReport.model;
       reportResults.generation = generatedReport.metadata;
-      await storeReport(env, reportDate, reportMarkdown, generatedReport.metadata);
       reportResults.generated = true;
+      await storeReport(env, reportDate, reportMarkdown, generatedReport.metadata);
       reportResults.stored = true;
       if (options.forceRegenerate) {
         reportResults.replaced = Boolean(reportObject);
@@ -193,6 +195,23 @@ async function generateOrDeliverReport(env, now, options = {}) {
     });
   } catch (error) {
     reportResults.error = errorMessage(error);
+    const metadata = error?.reportMetadata;
+    if (metadata) {
+      reportResults.aiProvider = metadata.aiProvider;
+      reportResults.aiModel = metadata.aiModel;
+      reportResults.reportMode = metadata.reportMode;
+      reportResults.reportEngineVersion = metadata.engineVersion ?? SERVICE_VERSION;
+      reportResults.generation = metadata;
+      reportResults.research = {
+        batches: metadata.researchBatches ?? null,
+        researched: metadata.researchComplete ?? null,
+        incomplete: metadata.researchIncomplete ?? null,
+      };
+    }
+    const failureStage = reportResults.generated ? "report_storage_failed" : "generation_failed";
+    reportResults.storage = { skipped: true, reason: failureStage };
+    reportResults.email = { skipped: true, reason: failureStage };
+    reportResults.webhook = { skipped: true, reason: failureStage };
     console.error(error);
   }
   return reportResults;
@@ -865,40 +884,298 @@ export async function generateAiReport(env, snapshot, override = null, options =
   const compact = compactSnapshotForReport(snapshot);
   compact.reportMode = selectedReportMode(env, options.reportMode);
   compact.engineVersion = SERVICE_VERSION;
-  const requiredSymbols = [
-    ...(snapshot.watchlist ?? []).filter((row) => !row.missing).map((row) => row.symbol),
-    ...(snapshot.discovery?.candidates ?? []).filter((row) => !row.missing).map((row) => row.symbol),
-  ];
-  const prompts = [
-    reportPrompt(compact),
-    reportPrompt(compact, { retry: true }),
-  ];
+  const research = await researchCandidates(env, route, compact);
+  research.storage = await storeResearchPackets(env, compact, research);
+  const synthesis = synthesisContext(compact, research);
+  const requiredSymbols = research.packets.map((packet) => packet.symbol);
   const failures = [];
+  let lastMetadata = null;
 
-  for (const [index, prompt] of prompts.entries()) {
-    const attempt = index + 1;
-    const response = await requestAiReport(env, route, prompt);
+  for (let attempt = 1; attempt <= MAX_AI_ATTEMPTS; attempt += 1) {
+    const prompt = reportPrompt(synthesis, {
+      retry: attempt > 1,
+      validationErrors: failures.at(-1),
+    });
+    const response = await requestAiReport(env, route, prompt, {
+      maxTokens: reportMaxTokens(env, synthesis.reportMode),
+    });
     const extracted = extractAiReport(response.body, route, env);
     const metadata = reportMetadata(route, response.body, extracted, attempt);
+    metadata.pipeline = "staged-research-v1";
+    metadata.researchBatches = research.batches.length;
+    metadata.researchComplete = research.funnel.researched;
+    metadata.researchIncomplete = research.funnel.incomplete;
+    metadata.researchPacketStorage = research.storage?.stored === true ? "stored" : research.storage?.reason ?? "failed";
+    lastMetadata = metadata;
     if (!response.ok || extracted.finishReason !== "STOP" || !extracted.markdown) {
       const diagnostic = aiFailureDiagnostic(response.status, route, extracted, env);
       failures.push(`attempt ${attempt}: ${diagnostic}`);
-      if (!isTokenLimitFinish(extracted.finishReason)) break;
       continue;
     }
-    const validation = validateReportCompleteness(extracted.markdown, requiredSymbols, compact);
+    const validation = validateReportCompleteness(extracted.markdown, requiredSymbols, synthesis);
     metadata.validation = validation.ok ? "passed" : "failed";
     metadata.validationErrors = validation.errors.join("; ");
     if (validation.ok) return {
       markdown: extracted.markdown,
       provider,
       model,
-      reportMode: compact.reportMode,
-      metadata: { ...metadata, reportMode: compact.reportMode, engineVersion: SERVICE_VERSION },
+      reportMode: synthesis.reportMode,
+      research,
+      metadata: { ...metadata, reportMode: synthesis.reportMode, engineVersion: SERVICE_VERSION },
     };
     failures.push(`attempt ${attempt}: ${validation.errors.join("; ")}`);
   }
-  throw new Error(`AI report incomplete after ${failures.length} attempt(s) (${provider}/${model}): ${failures.join(" | ")}`);
+  const error = new Error(`AI report incomplete after ${failures.length} attempt(s) (${provider}/${model}): ${failures.join(" | ")}`);
+  error.reportMetadata = {
+    ...(lastMetadata ?? {}),
+    aiProvider: provider,
+    aiModel: model,
+    reportMode: synthesis.reportMode,
+    engineVersion: SERVICE_VERSION,
+    pipeline: "staged-research-v1",
+    researchBatches: research.batches.length,
+    researchComplete: research.funnel.researched,
+    researchIncomplete: research.funnel.incomplete,
+    researchPacketStorage: research.storage?.stored === true ? "stored" : research.storage?.reason ?? "failed",
+    validation: "failed",
+    validationErrors: failures.join(" | "),
+  };
+  throw error;
+}
+
+async function researchCandidates(env, route, compact) {
+  const candidates = (compact.opportunityGate?.candidates ?? []).slice(0, 12);
+  const batchSize = Math.max(1, Math.min(5, Math.round(nonNegativeNumber(env.RESEARCH_BATCH_SIZE, DEFAULT_RESEARCH_BATCH_SIZE)) || DEFAULT_RESEARCH_BATCH_SIZE));
+  const batches = [];
+  for (let index = 0; index < candidates.length; index += batchSize) batches.push(candidates.slice(index, index + batchSize));
+  const results = await Promise.all(batches.map((batch, index) => researchCandidateBatch(env, route, compact, batch, index + 1)));
+  const packets = results.flatMap((result) => result.packets);
+  return {
+    schemaVersion: "candidate-research-v1",
+    generatedAt: new Date().toISOString(),
+    provider: route.provider,
+    model: route.model,
+    batchSize,
+    batches: results.map(({ packets: ignored, ...result }) => result),
+    funnel: {
+      screened: compact.discovery?.scanned ?? null,
+      admitted: candidates.length,
+      researched: packets.filter((packet) => packet.status === "complete").length,
+      incomplete: packets.filter((packet) => packet.status !== "complete").length,
+      actionable: packets.filter((packet) => packet.gateResult === "pass").length,
+      rejected: packets.filter((packet) => packet.gateResult !== "pass").length,
+    },
+    packets,
+  };
+}
+
+async function researchCandidateBatch(env, route, compact, candidates, batchNumber) {
+  const failures = [];
+  for (let attempt = 1; attempt <= MAX_AI_ATTEMPTS; attempt += 1) {
+    const prompt = candidateResearchPrompt(compact, candidates, {
+      batchNumber,
+      retry: attempt > 1,
+      validationErrors: failures.at(-1),
+    });
+    const response = await requestAiReport(env, route, prompt, {
+      maxTokens: positiveInteger(env.RESEARCH_MAX_TOKENS, DEFAULT_RESEARCH_MAX_TOKENS),
+    });
+    const extracted = extractAiReport(response.body, route, env);
+    if (!response.ok || extracted.finishReason !== "STOP" || !extracted.markdown) {
+      failures.push(aiFailureDiagnostic(response.status, route, extracted, env));
+      continue;
+    }
+    const parsed = parseJsonObject(extracted.markdown);
+    const validation = validateResearchBatch(parsed, candidates);
+    if (!validation.ok) {
+      failures.push(validation.errors.join("; "));
+      continue;
+    }
+    return {
+      batchNumber,
+      symbols: candidates.map((row) => row.symbol),
+      attempts: attempt,
+      status: "complete",
+      failures,
+      packets: parsed.candidates.map((packet) => normalizeResearchPacket(packet, candidates.find((row) => row.symbol === packet.symbol))),
+    };
+  }
+  const failure = failures.join(" | ") || "unknown research failure";
+  return {
+    batchNumber,
+    symbols: candidates.map((row) => row.symbol),
+    attempts: MAX_AI_ATTEMPTS,
+    status: "incomplete",
+    failures,
+    packets: candidates.map((candidate) => incompleteResearchPacket(candidate, failure)),
+  };
+}
+
+function candidateResearchPrompt(compact, candidates, options = {}) {
+  return [
+    "Research this bounded Growth-Tech candidate batch. Return JSON only, without Markdown fences.",
+    "Use only the supplied evidence. Do not infer that a headline caused a move unless the linkage is direct.",
+    "Discovery names cannot pass the action gate when valuation, fundamentals, liquidity context, or a verified fresh company catalyst is missing.",
+    "Price movement alone may support Watch, never Buy/Sell. Trim requires a verified catalyst or the supplied extremeTrim flag.",
+    "Return {\"candidates\":[...]} with exactly one object per supplied symbol and these fields:",
+    "symbol, catalystSummary, evidenceFor (array), evidenceAgainst (array), mispricingThesis, strategicPosition (Buy/Hold/Avoid), todayAction (Buy now/Buy on weakness/Trim/Sell/Watch/No action), confidence (High/Medium/Low), entryExitCondition, riskReward, invalidation, missingEvidence (array), sourceQuality, gateResult (pass/fail), gateReason.",
+    options.retry ? `Repair the previous failure exactly: ${options.validationErrors}` : "",
+    `Batch: ${options.batchNumber}`,
+    "Market context:",
+    JSON.stringify({ session: compact.session, marketContext: compact.marketContext, calendars: compact.calendars, materialNews: compact.news }),
+    "Candidates:",
+    JSON.stringify(candidates),
+  ].filter(Boolean).join("\n");
+}
+
+function validateResearchBatch(parsed, candidates) {
+  const errors = [];
+  if (!parsed || !Array.isArray(parsed.candidates)) return { ok: false, errors: ["response must contain candidates array"] };
+  const expected = candidates.map((row) => row.symbol);
+  const actual = parsed.candidates.map((row) => row?.symbol);
+  for (const symbol of expected) if (!actual.includes(symbol)) errors.push(`missing candidate: ${symbol}`);
+  for (const symbol of actual) if (!expected.includes(symbol)) errors.push(`unexpected candidate: ${symbol}`);
+  if (actual.length !== expected.length) errors.push(`expected ${expected.length} candidate objects, received ${actual.length}`);
+  const requiredStrings = ["catalystSummary", "mispricingThesis", "strategicPosition", "todayAction", "confidence", "entryExitCondition", "riskReward", "invalidation", "sourceQuality", "gateResult", "gateReason"];
+  for (const row of parsed.candidates) {
+    for (const field of requiredStrings) if (typeof row?.[field] !== "string" || !row[field].trim()) errors.push(`${row?.symbol ?? "unknown"} missing ${field}`);
+    for (const field of ["evidenceFor", "evidenceAgainst", "missingEvidence"]) if (!Array.isArray(row?.[field])) errors.push(`${row?.symbol ?? "unknown"} ${field} must be an array`);
+    if (!["Buy", "Hold", "Avoid"].includes(row?.strategicPosition)) errors.push(`${row?.symbol ?? "unknown"} invalid strategicPosition`);
+    if (!TODAY_ACTIONS.includes(row?.todayAction)) errors.push(`${row?.symbol ?? "unknown"} invalid todayAction`);
+    if (!["High", "Medium", "Low"].includes(row?.confidence)) errors.push(`${row?.symbol ?? "unknown"} invalid confidence`);
+    if (!["pass", "fail"].includes(row?.gateResult)) errors.push(`${row?.symbol ?? "unknown"} invalid gateResult`);
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+function normalizeResearchPacket(packet, candidate) {
+  const discoveryBlocked = candidate?.sourceType === "discovery"
+    && (!candidate?.valuation || !candidate?.reportedGrowth || !candidate?.setup?.verifiedCatalyst);
+  const actionable = ["Buy now", "Buy on weakness", "Sell"].includes(packet.todayAction)
+    ? candidate?.setup?.verifiedCatalyst
+    : packet.todayAction === "Trim"
+      ? candidate?.setup?.verifiedCatalyst || candidate?.setup?.extremeTrim
+      : false;
+  const gateResult = packet.gateResult === "pass" && actionable && !discoveryBlocked ? "pass" : "fail";
+  return {
+    ...packet,
+    status: "complete",
+    gateResult,
+    todayAction: gateResult === "pass" ? packet.todayAction : (["Watch", "No action"].includes(packet.todayAction) ? packet.todayAction : "Watch"),
+    gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, !actionable ? "action lacks deterministic catalyst/trim eligibility" : null].filter(Boolean).join("; "),
+    sourceSnapshot: {
+      symbol: candidate.symbol,
+      sourceType: candidate.sourceType,
+      price: candidate.price,
+      changePercent: candidate.changePercent,
+      positionIn52WeekRange: candidate.positionIn52WeekRange,
+      marketCap: candidate.marketCap,
+      dollarVolume: candidate.dollarVolume,
+      relativeVolume: candidate.relativeVolume,
+      valuation: candidate.valuation,
+      reportedGrowth: candidate.reportedGrowth,
+      setup: candidate.setup,
+      news: candidate.news,
+    },
+  };
+}
+
+function incompleteResearchPacket(candidate, failure) {
+  return {
+    symbol: candidate.symbol,
+    status: "incomplete",
+    gateResult: "fail",
+    todayAction: "No action",
+    confidence: "Low",
+    catalystSummary: "Research incomplete",
+    evidenceFor: [],
+    evidenceAgainst: [],
+    mispricingThesis: "Unavailable because the candidate research batch did not complete.",
+    strategicPosition: "Avoid",
+    entryExitCondition: "Research must complete before action.",
+    riskReward: "Not assessed.",
+    invalidation: "Not assessed.",
+    missingEvidence: [failure],
+    sourceQuality: "incomplete",
+    gateReason: `research incomplete: ${failure}`,
+    sourceSnapshot: { symbol: candidate.symbol, sourceType: candidate.sourceType, setup: candidate.setup },
+  };
+}
+
+function synthesisContext(compact, research) {
+  return {
+    schemaVersion: compact.schemaVersion,
+    engineVersion: compact.engineVersion,
+    reportMode: compact.reportMode,
+    generatedAt: compact.generatedAt,
+    session: compact.session,
+    coverage: compact.coverage,
+    dataQuality: compact.dataQuality,
+    marketContext: compact.marketContext,
+    calendars: compact.calendars,
+    news: {
+      monetaryPolicy: compact.news?.monetaryPolicy,
+      company: compact.news?.company ? { ...compact.news.company, items: undefined } : undefined,
+    },
+    decisionFramework: {
+      methodology: compact.decisionFramework?.methodology,
+      aiCycle: compact.decisionFramework?.aiCycle,
+    },
+    opportunityGate: {
+      ...compact.opportunityGate,
+      candidates: research.packets.map((packet) => ({
+        symbol: packet.symbol,
+        setup: packet.sourceSnapshot?.setup,
+        researchStatus: packet.status,
+        researchGateResult: packet.gateResult,
+      })),
+    },
+    discovery: compact.discovery ? {
+      status: compact.discovery.status,
+      source: compact.discovery.source,
+      scanned: compact.discovery.scanned,
+      eligibleAfterLiquidityAndRelevance: compact.discovery.eligibleAfterLiquidityAndRelevance,
+      filters: compact.discovery.filters,
+      admittedSymbols: (compact.discovery.candidates ?? []).map((row) => row.symbol),
+    } : null,
+    research: {
+      schemaVersion: research.schemaVersion,
+      funnel: research.funnel,
+      batches: research.batches,
+      packets: research.packets,
+      storage: research.storage,
+    },
+  };
+}
+
+async function storeResearchPackets(env, compact, research) {
+  if (!env.BRIEF_BUCKET?.put) return { stored: false, reason: "r2_not_configured" };
+  const reportDate = compact.generatedAt ? zonedParts(new Date(compact.generatedAt), "America/New_York").date : "unknown-date";
+  const body = JSON.stringify(research, null, 2);
+  const options = { httpMetadata: { contentType: "application/json; charset=utf-8" } };
+  try {
+    await Promise.all([
+      env.BRIEF_BUCKET.put(`research/${reportDate}.json`, body, options),
+      env.BRIEF_BUCKET.put("research/latest.json", body, options),
+    ]);
+    return { stored: true, datedKey: `research/${reportDate}.json`, latestKey: "research/latest.json" };
+  } catch (error) {
+    return { stored: false, reason: `research_packet_storage_failed: ${errorMessage(error)}` };
+  }
+}
+
+function parseJsonObject(text) {
+  const cleaned = String(text ?? "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  try { return JSON.parse(cleaned); } catch { return null; }
+}
+
+function reportMaxTokens(env, mode) {
+  return positiveInteger(mode === "verbose" ? env.AI_VERBOSE_MAX_TOKENS : env.AI_STANDARD_MAX_TOKENS, mode === "verbose" ? DEFAULT_VERBOSE_MAX_TOKENS : DEFAULT_STANDARD_MAX_TOKENS);
+}
+
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 // Backward-compatible export for callers that explicitly expect Gemini.
@@ -906,41 +1183,42 @@ export async function generateGeminiReport(env, snapshot) {
   return generateAiReport(env, snapshot, { provider: "gemini" });
 }
 
-async function requestAiReport(env, route, prompt) {
-  if (route.provider === "gemini") return requestGeminiReport(env, route, prompt);
-  return requestOpenAiCompatibleReport(env, route, prompt);
+async function requestAiReport(env, route, prompt, options = {}) {
+  if (route.provider === "gemini") return requestGeminiReport(env, route, prompt, options);
+  return requestOpenAiCompatibleReport(env, route, prompt, options);
 }
 
-async function requestGeminiReport(env, route, prompt) {
+async function requestGeminiReport(env, route, prompt, options = {}) {
   const endpoint = `${GEMINI_API_BASE}/${encodeURIComponent(route.model)}:generateContent?key=${encodeURIComponent(route.apiKey)}`;
   const response = await fetch(endpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(geminiRequestBody(prompt)),
+    body: JSON.stringify(geminiRequestBody(prompt, options)),
   });
   return { ok: response.ok, status: response.status, body: await response.json().catch(() => null) };
 }
 
-async function requestOpenAiCompatibleReport(env, route, prompt) {
+async function requestOpenAiCompatibleReport(env, route, prompt, options = {}) {
   const response = await fetch(`${route.baseUrl}/chat/completions`, {
     method: "POST",
     headers: { authorization: `Bearer ${route.apiKey}`, "content-type": "application/json" },
-    body: JSON.stringify(openAiCompatibleRequestBody(route, prompt)),
+    body: JSON.stringify(openAiCompatibleRequestBody(route, prompt, options)),
   });
   return { ok: response.ok, status: response.status, body: await response.json().catch(() => null) };
 }
 
-function openAiCompatibleRequestBody(route, prompt) {
+function openAiCompatibleRequestBody(route, prompt, options = {}) {
   return {
     model: route.model,
     messages: [{ role: "user", content: prompt }],
     temperature: 0.25,
     stream: false,
+    ...(options.maxTokens ? { max_tokens: options.maxTokens } : {}),
     ...(route.provider === "deepseek" ? { thinking: { type: "disabled" } } : {}),
   };
 }
 
-function geminiRequestBody(prompt) {
+function geminiRequestBody(prompt, options = {}) {
   return {
     contents: [{
       role: "user",
@@ -948,6 +1226,7 @@ function geminiRequestBody(prompt) {
     }],
     generationConfig: {
       temperature: 0.25,
+      ...(options.maxTokens ? { maxOutputTokens: options.maxTokens } : {}),
       thinkingConfig: { thinkingLevel: "low" },
     },
   };
@@ -992,10 +1271,6 @@ function normalizeFinishReason(reason) {
   if (reason.toLowerCase() === "stop") return "STOP";
   if (["length", "max_tokens"].includes(reason.toLowerCase())) return "MAX_TOKENS";
   return reason.toUpperCase();
-}
-
-function isTokenLimitFinish(reason) {
-  return reason === "MAX_TOKENS";
 }
 
 function aiFailureDiagnostic(status, route, extracted, env) {
@@ -1071,7 +1346,7 @@ function validateDecisionAudit(markdown, compact, errors) {
       errors.push(`missing Data and Pipeline Audit field: ${label}`);
     }
   }
-  const candidates = (compact?.opportunityGate?.candidates ?? []).slice(0, 10);
+  const candidates = compact?.opportunityGate?.candidates ?? [];
   const audited = [
     sectionBody(markdown, "Decision Reasoning"),
     sectionBody(markdown, "Opportunities"),
@@ -1083,7 +1358,7 @@ function validateDecisionAudit(markdown, compact, errors) {
     }
   }
   const opportunities = sectionBody(markdown, "Opportunities");
-  if (!/^###\s+/m.test(opportunities) && /no high-conviction trade|no actionable opportunity/i.test(opportunities)) {
+  if (!/^###\s+/m.test(opportunities) && isNoTradeStatement(opportunities)) {
     for (const label of ["Threshold Result", "Best Near-Miss", "Why It Failed", "Portfolio Action"]) {
       if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(opportunities)) {
         errors.push(`verbose no-trade Opportunities missing field: ${label}`);
@@ -1116,10 +1391,18 @@ function validateOpportunities(markdown, symbols, compact, errors) {
     if (action === "Trim" && !candidates.get(symbol)?.setup?.verifiedCatalyst && !candidates.get(symbol)?.setup?.extremeTrim) {
       errors.push(`trim call lacks verified catalyst or extreme setup: ${symbol}`);
     }
+    if (["Buy now", "Buy on weakness", "Trim", "Sell"].includes(action) && candidates.get(symbol)?.researchGateResult && candidates.get(symbol)?.researchGateResult !== "pass") {
+      errors.push(`actionable call failed structured research gate: ${symbol}`);
+    }
   }
-  if (!matches.length && !/no high-conviction trade|no actionable opportunity/i.test(opportunities)) {
+  if (!matches.length && !isNoTradeStatement(opportunities)) {
     errors.push("Opportunities must state that no setup clears the threshold");
   }
+}
+
+function isNoTradeStatement(text) {
+  return /no\s+(?:high[- ]conviction\s+)?(?:trade|actionable\s+opportunit(?:y|ies)|setup|candidate)s?\b[^.\n]{0,100}\b(?:today|clear(?:s|ed)?|meet(?:s|ing)?|met|pass(?:es|ed)?|qualif(?:y|ies|ied)|threshold|gate)/i.test(text)
+    || /(?:no|none\s+of\s+the)\s+(?:setup|candidate|opportunit(?:y|ies))s?\b[^.\n]{0,100}\b(?:clear(?:s|ed)?|meet(?:s|ing)?|met|pass(?:es|ed)?|qualif(?:y|ies|ied))\b[^.\n]{0,60}\b(?:threshold|gate|action)/i.test(text);
 }
 
 function validateUnsupportedClaims(markdown, compact, errors) {
@@ -1198,7 +1481,8 @@ function reportPrompt(compact, options = {}) {
     `Produce an evidence-rich, decision-focused Growth Tech Morning Brief in Markdown in ${compact.reportMode} mode.`,
     "Answer one question: after screening both the core watchlist and a broader movers universe, is there a sufficiently strong, time-sensitive reason to buy, sell, trim, or investigate a stock today?",
     "Do not recommend a trade merely because a stock ranks highest. Default to 'No high-conviction trade today' unless an absolute setup threshold is cleared.",
-    `Use only opportunityGate.candidates. Include at most ${compact.opportunityGate.maximumOpportunities} names. A >=3% move without verified news may be Watch only, never Buy/Sell.`,
+    `Use only research.packets. Include at most ${compact.opportunityGate.maximumOpportunities} actionable names. A >=3% move without verified news may be Watch only, never Buy/Sell.`,
+    "Only a complete research packet whose gateResult is pass may receive Buy now, Buy on weakness, Trim, or Sell. Incomplete or failed packets must remain Watch/No action and be disclosed.",
     "Buy now, Buy on weakness, and Sell require a verified fresh company event or same-day earnings. Trim requires either that evidence or the supplied extremeTrim flag.",
     "Show the reasoning chain. For each call explain why it was considered, what the market may be mispricing, evidence for and against, strategic position, today's action, confidence, entry/exit condition, catalyst, risk/reward, and falsifiable invalidation.",
     "Discovery candidates are not pre-approved investments. Explicitly discuss market cap, dollar liquidity, missing fundamental/valuation data, and source quality before any actionable call.",
@@ -1208,7 +1492,7 @@ function reportPrompt(compact, options = {}) {
     `Label market context as ${compact.session}; do not call regular-trading quotes overnight futures or premarket indications.`,
     `Allowed Today's Actions: ${TODAY_ACTIONS.join(", ")}.`,
     verbose
-      ? "Verbose mode is an audit trail, not filler: expose the candidate funnel, analyze every gated candidate supplied (up to ten), state missing or failed inputs, and fully explain why each setup passed or failed. Do not silently omit a candidate or data-source failure."
+      ? "Verbose mode is an audit trail, not filler: expose research.funnel, analyze every research packet supplied, state incomplete batches and missing or failed inputs, and fully explain why each setup passed or failed. Do not silently omit a candidate or data-source failure."
       : "Standard mode must remain auditable: explain the funnel and strongest rejected setups without exhaustive low-value tables.",
     "Depth is preferred over brevity when it adds decision value. Do not add exhaustive sector, dashboard, or full-watchlist tables.",
     "",
@@ -1220,7 +1504,7 @@ function reportPrompt(compact, options = {}) {
     "Exactly three bullets labeled **Verdict:**, **Confidence:**, and **Why Today:**.",
     "",
     "# Decision Reasoning",
-    "Use three labeled paragraphs: **Universe Searched:** with core and discovery coverage counts, **Opportunity Gate:** explaining which signals admitted candidates and the evidence standard, and **Conclusion:** explaining why the strongest setups passed or failed today.",
+    "Use three labeled paragraphs: **Universe Searched:** with screened, admitted, researched, incomplete, actionable, and rejected funnel counts, **Opportunity Gate:** explaining which signals admitted candidates and the evidence standard, and **Conclusion:** explaining why the strongest setups passed or failed today.",
     "",
     "# Opportunities",
     verbose
@@ -1230,7 +1514,7 @@ function reportPrompt(compact, options = {}) {
     "",
     "# Rejected Candidates",
     verbose
-      ? "Audit every supplied opportunityGate candidate, up to ten, that is not actionable. Use `### SYMBOL — Rejected/Watch` and fields **Admission Signal:**, **Evidence Supporting:**, **Evidence Missing or Conflicting:**, **Rejection Reason:**, and **Promotion Trigger:**."
+      ? "Audit every supplied research packet that is not actionable. Use `### SYMBOL — Rejected/Watch` and fields **Admission Signal:**, **Evidence Supporting:**, **Evidence Missing or Conflicting:**, **Rejection Reason:**, and **Promotion Trigger:**. Mark incomplete research explicitly."
       : "Discuss up to five of the strongest candidates that failed the action threshold. For each, state the admission signal, missing evidence or conflicting evidence, and what would promote it to an actionable setup. If none exist, say so explicitly.",
     "",
     ...(verbose ? [
@@ -1244,9 +1528,9 @@ function reportPrompt(compact, options = {}) {
     "",
     "# What Could Change the Call",
     "Use specific earnings, macro events, price levels, verified news, or data gaps that could change today's calls.",
-    options.retry ? `Retry instruction: the previous response failed validation. Preserve every ${verbose ? "verbose" : "standard"} section and required label; reduce repetition but retain the complete reasoning chain.` : "",
+    options.retry ? `Repair instruction: the previous response failed for exactly this reason: ${options.validationErrors}. Preserve every ${verbose ? "verbose" : "standard"} section and required label; reduce repetition but retain the complete reasoning chain.` : "",
     "",
-    "Compact snapshot JSON:",
+    "Synthesis context JSON (structured research packets plus market context):",
     JSON.stringify(compact),
   ].filter(Boolean).join("\n");
 }
@@ -1348,6 +1632,11 @@ async function storeReport(env, reportDate, markdown, metadata = {}) {
       generatedAt: metadata.generatedAt,
       validation: metadata.validation,
       validationErrors: metadata.validationErrors,
+      pipeline: metadata.pipeline,
+      researchBatches: metadata.researchBatches,
+      researchComplete: metadata.researchComplete,
+      researchIncomplete: metadata.researchIncomplete,
+      researchPacketStorage: metadata.researchPacketStorage,
       reportMode: metadata.reportMode,
       engineVersion: metadata.engineVersion ?? SERVICE_VERSION,
     }),
@@ -1410,6 +1699,8 @@ async function storeDeliveryReceipt(env, reportDate, webhook) {
       reason: webhook?.reason,
       error: webhook?.error,
       messages: webhook?.messages ?? null,
+      attachment: webhook?.attachment ?? null,
+      fingerprint: webhook?.fingerprint ?? null,
       expectedChunks: webhook?.chunks?.expected ?? null,
       deliveredChunks: webhook?.chunks?.delivered ?? null,
       failedChunks: webhook?.chunks?.failed ?? null,
@@ -1478,22 +1769,21 @@ export async function sendReportEmail(env, reportDate, markdown) {
 export async function sendReportWebhook(env, reportDate, markdown) {
   const discordUrl = env.DISCORD_WEBHOOK_URL || (isDiscordWebhook(env.WEBHOOK_URL) ? env.WEBHOOK_URL : null);
   if (discordUrl) {
-    const chunks = discordMessageChunks(reportDate, markdown);
-    let delivered = 0;
-    for (const [index, content] of chunks.entries()) {
-      try {
-        await postWebhookJson(discordUrl, discordPayload(content), `Discord webhook delivery failed (${index + 1}/${chunks.length})`);
-        delivered += 1;
-      } catch (error) {
-        error.chunks = { expected: chunks.length, delivered, failed: chunks.length - delivered };
-        throw error;
-      }
+    const fingerprint = await reportFingerprint(markdown);
+    try {
+      await postDiscordReport(discordUrl, reportDate, markdown, fingerprint);
+    } catch (error) {
+      error.chunks = { expected: 1, delivered: 0, failed: 1 };
+      error.fingerprint = fingerprint;
+      throw error;
     }
     return {
       sent: true,
       provider: "discord",
-      messages: chunks.length,
-      chunks: { expected: chunks.length, delivered, failed: chunks.length - delivered },
+      messages: 1,
+      attachment: `growth-tech-morning-brief-${reportDate}.md`,
+      fingerprint,
+      chunks: { expected: 1, delivered: 1, failed: 0 },
     };
   }
   if (!env.WEBHOOK_URL) return { skipped: true, reason: "webhook_not_configured" };
@@ -1509,16 +1799,44 @@ function discordPayload(content) {
   };
 }
 
+async function postDiscordReport(url, reportDate, markdown, fingerprint) {
+  const summary = discordReportSummary(reportDate, markdown, fingerprint);
+  const filename = `growth-tech-morning-brief-${reportDate}.md`;
+  await postWithRetry(async () => {
+    const form = new FormData();
+    form.append("payload_json", JSON.stringify(discordPayload(summary)));
+    form.append("files[0]", new Blob([markdown], { type: "text/markdown; charset=utf-8" }), filename);
+    return fetch(url, { method: "POST", body: form });
+  }, "Discord report attachment delivery failed");
+}
+
+function discordReportSummary(reportDate, markdown, fingerprint) {
+  const title = markdown.split("\n").find((line) => /^#\s+/.test(line))?.replace(/^#\s+/, "")
+    || `Growth Tech Morning Brief — ${reportDate}`;
+  const verdict = sectionBody(markdown, "Today's Verdict") || "The complete report is attached.";
+  const summary = `**${title}**\n${verdict}\n\nFull verbose report attached. ID: \`${fingerprint.slice(0, 12)}\``;
+  return summary.length <= 1800 ? summary : `${summary.slice(0, 1740).trim()}…\n\nFull verbose report attached. ID: \`${fingerprint.slice(0, 12)}\``;
+}
+
+async function reportFingerprint(markdown) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(markdown));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 async function postWebhookJson(url, payload, label) {
-  let response = await postJson(url, payload);
-  if (response.status === 429) {
-    await sleep(await discordRetryDelayMs(response));
-    response = await postJson(url, payload);
+  await postWithRetry(() => postJson(url, payload), label, 1);
+}
+
+async function postWithRetry(request, label, maxAttempts = MAX_DISCORD_ATTEMPTS) {
+  let response;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    response = await request();
+    if (response.ok) return response;
+    if (attempt >= maxAttempts || (response.status !== 429 && response.status < 500)) break;
+    await sleep(await discordRetryDelayMs(response, attempt));
   }
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`${label} (${response.status})${body ? `: ${body}` : ""}`);
-  }
+  const body = await response?.text().catch(() => "");
+  throw new Error(`${label} (${response?.status ?? "unknown"})${body ? `: ${body}` : ""}`);
 }
 
 function postJson(url, payload) {
@@ -1529,13 +1847,13 @@ function postJson(url, payload) {
   });
 }
 
-async function discordRetryDelayMs(response) {
+async function discordRetryDelayMs(response, attempt = 1) {
   const header = Number(response.headers.get("retry-after"));
   if (Number.isFinite(header)) return Math.max(0, header * 1000);
   const body = await response.clone().json().catch(() => null);
   const retryAfter = Number(body?.retry_after);
   if (Number.isFinite(retryAfter)) return Math.max(0, retryAfter * 1000);
-  return 1000;
+  return Math.min(8000, 500 * (2 ** (attempt - 1)));
 }
 
 function sleep(ms) {
@@ -1552,32 +1870,12 @@ function isDiscordWebhook(url) {
   }
 }
 
-function discordMessageChunks(reportDate, markdown) {
-  const maxLength = 1900;
-  const text = markdown.trim();
-  if (text.length <= maxLength) return [text];
-  const chunks = [];
-  let remaining = text;
-  while (remaining) {
-    const partLabel = `Part ${chunks.length + 1}\n`;
-    const available = chunks.length ? maxLength - partLabel.length : maxLength;
-    let chunk = remaining.slice(0, available);
-    const breakAt = chunk.lastIndexOf("\n\n");
-    const lineBreakAt = chunk.lastIndexOf("\n");
-    if (breakAt > 200) chunk = chunk.slice(0, breakAt);
-    else if (lineBreakAt > 200) chunk = chunk.slice(0, lineBreakAt);
-    chunks.push(chunks.length ? `${partLabel}${chunk}`.trim() : chunk.trim());
-    remaining = remaining.slice(chunk.length).trim();
-  }
-  return chunks.map((chunk, index) => chunk.replace(/^Part \d+/, `Part ${index + 1}/${chunks.length}`));
-}
-
 async function settleDelivery(delivery) {
   try {
     return await delivery();
   } catch (error) {
     console.error(error);
-    return { failed: true, error: errorMessage(error), ...(error?.chunks ? { chunks: error.chunks } : {}) };
+    return { failed: true, error: errorMessage(error), ...(error?.chunks ? { chunks: error.chunks } : {}), ...(error?.fingerprint ? { fingerprint: error.fingerprint } : {}) };
   }
 }
 

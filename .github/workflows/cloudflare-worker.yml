@@ -125,6 +125,8 @@ jobs:
             reportMode: .report.reportMode,
             reportEngineVersion: .report.reportEngineVersion,
             validation: .report.generation.validation,
+            research: .report.research,
+            storage: .report.storage,
             webhook: .report.webhook
           }' <<< "$response")"
           echo "$summary"
@@ -135,16 +137,18 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          failures="$(jq -r --arg expected_version "$expected_version" '[
-            if .report.generated == true then empty else "Report generation did not complete: \(.report.error // "no error reported")" end,
-            if .report.stored == true then empty else "Generated report was not stored" end,
-            if .report.aiProvider == "deepseek" then empty else "Unexpected AI provider: \(.report.aiProvider // "missing")" end,
-            if .report.aiModel == "deepseek-v4-flash" then empty else "Unexpected AI model: \(.report.aiModel // "missing")" end,
-            if .report.reportMode == "verbose" then empty else "Unexpected report mode: \(.report.reportMode // "missing")" end,
-            if .report.reportEngineVersion == $expected_version then empty else "Stale report engine: expected \($expected_version), received \(.report.reportEngineVersion // "missing")" end,
-            if .report.generation.validation == "passed" then empty else "Report validation failed: \(.report.generation.validation // "missing")" end,
-            if .report.webhook.sent == true then empty else "Discord delivery incomplete: \(.report.webhook.chunks.delivered // 0)/\(.report.webhook.chunks.expected // "unknown") chunks delivered; \(.report.webhook.error // .report.webhook.reason // "no error reported")" end
-          ] | .[]' <<< "$response")"
+          failures="$(jq -r --arg expected_version "$expected_version" '
+            if .report.generated != true then
+              ["Report generation did not complete: \(.report.error // "no error reported"); storage and Discord delivery were not attempted"]
+            else [
+              if .report.stored == true then empty else "Generated report was not stored" end,
+              if .report.aiProvider == "deepseek" then empty else "Unexpected AI provider: \(.report.aiProvider // "missing")" end,
+              if .report.aiModel == "deepseek-v4-flash" then empty else "Unexpected AI model: \(.report.aiModel // "missing")" end,
+              if .report.reportMode == "verbose" then empty else "Unexpected report mode: \(.report.reportMode // "missing")" end,
+              if .report.reportEngineVersion == $expected_version then empty else "Stale report engine: expected \($expected_version), received \(.report.reportEngineVersion // "missing")" end,
+              if .report.generation.validation == "passed" then empty else "Report validation failed: \(.report.generation.validation // "missing")" end,
+              if .report.webhook.sent == true then empty else "Discord delivery incomplete: \(.report.webhook.chunks.delivered // 0)/\(.report.webhook.chunks.expected // "unknown") deliveries completed; \(.report.webhook.error // .report.webhook.reason // "no error reported")" end
+            ] end | .[]' <<< "$response")"
 
           if [ -n "$failures" ]; then
             while IFS= read -r failure; do

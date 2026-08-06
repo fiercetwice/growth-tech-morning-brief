@@ -77,7 +77,7 @@ function verboseNoTradeReport(symbols = ["NVDA"]) {
   return [
     "# Growth Tech Morning Brief",
     "**Report Mode:** verbose",
-    "**Engine Version:** 0.5.5",
+    "**Engine Version:** 0.5.6",
     "",
     "# Today's Verdict",
     "- **Verdict:** No high-conviction trade today.",
@@ -123,7 +123,7 @@ function verboseNoTradeReport(symbols = ["NVDA"]) {
 test("verbose validation requires an auditable no-trade explanation", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.5",
+    engineVersion: "0.5.6",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
@@ -141,12 +141,49 @@ function geminiReport(text, finishReason = "STOP", usageMetadata = {}, parts = n
   };
 }
 
-async function withFetchStub(handler, run) {
+function researchFixtureResponse(url, init) {
+  if (!url.includes("generativelanguage.googleapis.com") && !url.endsWith("/chat/completions")) return null;
+  const request = JSON.parse(init.body);
+  const prompt = request.contents?.[0]?.parts?.[0]?.text ?? request.messages?.[0]?.content ?? "";
+  if (!prompt.startsWith("Research this bounded Growth-Tech candidate batch")) return null;
+  const candidates = JSON.parse(prompt.split("\nCandidates:\n").at(-1));
+  const content = JSON.stringify({ candidates: candidates.map((candidate) => ({
+    symbol: candidate.symbol,
+    catalystSummary: "No verified direct catalyst in the fixture.",
+    evidenceFor: ["The price move admitted the candidate for review."],
+    evidenceAgainst: ["No verified causal event or complete valuation evidence."],
+    mispricingThesis: "The fixture does not establish a mispricing.",
+    strategicPosition: "Hold",
+    todayAction: "Watch",
+    confidence: "Medium",
+    entryExitCondition: "Wait for verified evidence and a defined price level.",
+    riskReward: "Not asymmetric on supplied evidence.",
+    invalidation: "A verified fundamental catalyst would require reassessment.",
+    missingEvidence: ["forward estimates"],
+    sourceQuality: "mixed",
+    gateResult: "fail",
+    gateReason: "The absolute action threshold was not cleared.",
+  })) });
+  if (url.includes("generativelanguage.googleapis.com")) return responseJson(geminiReport(content));
+  return responseJson({ choices: [{ finish_reason: "stop", message: { content } }] });
+}
+
+function discordForm(init) {
+  assert.ok(init.body instanceof FormData);
+  return {
+    payload: JSON.parse(init.body.get("payload_json")),
+    file: init.body.get("files[0]"),
+  };
+}
+
+async function withFetchStub(handler, run, options = {}) {
   const originalFetch = globalThis.fetch;
   const calls = [];
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input);
     calls.push({ url, init });
+    const research = options.autoResearch === false ? null : researchFixtureResponse(url, init);
+    if (research) return research;
     return handler(url, init, calls);
   };
   try {
@@ -169,7 +206,7 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
     BRIEF_BUCKET: bucket,
   };
 
-  const result = await withFetchStub((url, init) => {
+  const result = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ entityName: "NVIDIA", facts: { "us-gaap": {} } });
     if (url.startsWith("https://generativelanguage.googleapis.com")) {
@@ -180,7 +217,7 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
       const body = JSON.parse(init.body);
       assert.match(body.contents[0].parts[0].text, /decision-focused Growth Tech Morning Brief/);
       assert.match(body.contents[0].parts[0].text, /No high-conviction trade today/);
-      assert.equal("maxOutputTokens" in body.generationConfig, false);
+      assert.equal(body.generationConfig.maxOutputTokens, 12000);
       assert.deepEqual(body.generationConfig.thinkingConfig, { thinkingLevel: "low" });
       return responseJson(geminiReport(markdown, "STOP", { candidatesTokenCount: 8192, thoughtsTokenCount: 12, totalTokenCount: 8204 }));
     }
@@ -274,7 +311,7 @@ test("Gemini model can be overridden with GEMINI_MODEL", async () => {
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
 });
 
-test("DeepSeek route uses the official OpenAI-compatible endpoint without an output ceiling", async () => {
+test("DeepSeek route sets an explicit output budget", async () => {
   const bucket = r2();
   const markdown = completeReport(["NVDA"], "DeepSeek generated this complete report.");
   const env = {
@@ -284,7 +321,7 @@ test("DeepSeek route uses the official OpenAI-compatible endpoint without an out
     BRIEF_BUCKET: bucket,
   };
 
-  const result = await withFetchStub((url, init) => {
+  const result = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
     assert.equal(url, "https://api.deepseek.com/chat/completions");
@@ -292,7 +329,7 @@ test("DeepSeek route uses the official OpenAI-compatible endpoint without an out
     const body = JSON.parse(init.body);
     assert.equal(body.model, "deepseek-v4-flash");
     assert.deepEqual(body.thinking, { type: "disabled" });
-    assert.equal("max_tokens" in body, false);
+    assert.equal(body.max_tokens, 12000);
     assert.match(body.messages[0].content, /Today's Verdict/);
     return responseJson({
       choices: [{ finish_reason: "stop", message: { role: "assistant", content: markdown } }],
@@ -340,9 +377,9 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiProvider, "deepseek");
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
-  assert.equal(body.report.reportEngineVersion, "0.5.5");
+  assert.equal(body.report.reportEngineVersion, "0.5.6");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.5");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.6");
   assert.equal(bucket.objects.get("reports/latest.md"), markdown);
 });
 
@@ -362,7 +399,7 @@ test("run-report rejects provider/model overrides unless regeneration is explici
 
 test("openai-compatible route uses only the preconfigured HTTPS base URL", async () => {
   const markdown = completeReport(["NVDA"], "Compatible endpoint generated this report.");
-  const result = await withFetchStub((url, init) => {
+  const result = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
     assert.equal(url, "https://models.example.test/v1/chat/completions");
@@ -411,6 +448,84 @@ test("semantic validation rejects unsupported demand and CapEx conclusions", () 
   assert.equal(validation.ok, false);
   assert.ok(validation.errors.includes("unsupported demand claim"));
   assert.ok(validation.errors.includes("unsupported CapEx-cycle claim"));
+});
+
+test("semantic no-trade validation accepts equivalent threshold wording", () => {
+  const markdown = completeReport(["NVDA"]).replace(
+    "No actionable opportunity clears the threshold.",
+    "No setup met the action threshold today; NVDA remains the best near-miss but lacks a verified catalyst.",
+  );
+  assert.deepEqual(validateReportCompleteness(markdown, ["NVDA"]), { ok: true, errors: [] });
+});
+
+test("candidate research runs in bounded batches, persists packets, and feeds compact synthesis", async () => {
+  const bucket = r2();
+  const symbols = ["NVDA", "AMZN", "MSFT", "ANET"];
+  const report = completeReport(symbols, "Staged synthesis used validated research packets.");
+  const researchPrompts = [];
+  let synthesisPrompt = "";
+
+  const result = await withFetchStub((url, init) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    if (url.startsWith("https://generativelanguage.googleapis.com")) {
+      const request = JSON.parse(init.body);
+      const prompt = request.contents[0].parts[0].text;
+      if (prompt.startsWith("Research this bounded Growth-Tech candidate batch")) {
+        researchPrompts.push(prompt);
+        assert.equal(request.generationConfig.maxOutputTokens, 4000);
+        return researchFixtureResponse(url, init);
+      }
+      synthesisPrompt = prompt;
+      assert.equal(request.generationConfig.maxOutputTokens, 12000);
+      return responseJson(geminiReport(report));
+    }
+    throw new Error(`Unexpected fetch ${url}`);
+  }, () => runScheduledBrief({
+    WATCHLIST: symbols.join(","),
+    GEMINI_API_KEY: "key",
+    RESEARCH_BATCH_SIZE: "2",
+    BRIEF_BUCKET: bucket,
+  }, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
+
+  assert.equal(researchPrompts.length, 2);
+  assert.deepEqual(researchPrompts.map((prompt) => JSON.parse(prompt.split("\nCandidates:\n").at(-1)).length), [2, 2]);
+  assert.match(synthesisPrompt, /"schemaVersion":"candidate-research-v1"/);
+  assert.doesNotMatch(synthesisPrompt, /"sectorScorecard"/);
+  assert.doesNotMatch(synthesisPrompt, /"history"/);
+  assert.deepEqual(result.report.research, { screened: 0, admitted: 4, researched: 4, incomplete: 0, actionable: 0, rejected: 4 });
+  const stored = JSON.parse(bucket.objects.get("research/2026-08-05.json"));
+  assert.equal(stored.packets.length, 4);
+  assert.equal(bucket.objects.get("research/latest.json"), bucket.objects.get("research/2026-08-05.json"));
+});
+
+test("an exhausted research batch becomes visible incomplete evidence instead of aborting synthesis", async () => {
+  const bucket = r2();
+  const report = completeReport(["NVDA"], "The incomplete candidate batch is disclosed and no action is taken.");
+  let researchCalls = 0;
+  let synthesisPrompt = "";
+
+  const result = await withFetchStub((url, init) => {
+    if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
+    if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
+    if (url.startsWith("https://generativelanguage.googleapis.com")) {
+      const prompt = JSON.parse(init.body).contents[0].parts[0].text;
+      if (prompt.startsWith("Research this bounded Growth-Tech candidate batch")) {
+        researchCalls += 1;
+        return responseJson(geminiReport("{}"));
+      }
+      synthesisPrompt = prompt;
+      return responseJson(geminiReport(report));
+    }
+    throw new Error(`Unexpected fetch ${url}`);
+  }, () => runScheduledBrief({ WATCHLIST: "NVDA", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
+
+  assert.equal(researchCalls, 2);
+  assert.equal(result.report.generated, true);
+  assert.deepEqual(result.report.research, { screened: 0, admitted: 1, researched: 0, incomplete: 1, actionable: 0, rejected: 1 });
+  assert.match(synthesisPrompt, /"status":"incomplete"/);
+  assert.match(synthesisPrompt, /research incomplete/);
+  assert.equal(JSON.parse(bucket.objects.get("research/2026-08-05.json")).packets[0].status, "incomplete");
 });
 
 test("actionable calls require the symbol to clear the absolute setup gate", () => {
@@ -471,6 +586,13 @@ test("Gemini 404 diagnostics include status and model without exposing the API k
   assert.match(result.report.error, /AI report failed \(404, provider: gemini, model: gemini-3.5-flash, finishReason: missing\):/);
   assert.match(result.report.error, /models\/gemini-old is unavailable for \[redacted\]/);
   assert.doesNotMatch(result.report.error, /gemini-secret-key/);
+  assert.equal(result.report.aiProvider, "gemini");
+  assert.equal(result.report.aiModel, "gemini-3.5-flash");
+  assert.equal(result.report.reportMode, "standard");
+  assert.equal(result.report.reportEngineVersion, "0.5.6");
+  assert.equal(result.report.generation.validation, "failed");
+  assert.deepEqual(result.report.storage, { skipped: true, reason: "generation_failed" });
+  assert.deepEqual(result.report.webhook, { skipped: true, reason: "generation_failed" });
 });
 
 test("successful Gemini generation stores the report and delivers Discord", async () => {
@@ -483,8 +605,8 @@ test("successful Gemini generation stores the report and delivers Discord", asyn
     BRIEF_BUCKET: bucket,
   };
 
-  const discordContents = [];
-  const result = await withFetchStub((url, init) => {
+  const discordFiles = [];
+  const result = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
     if (url.startsWith("https://generativelanguage.googleapis.com")) {
@@ -493,20 +615,20 @@ test("successful Gemini generation stores the report and delivers Discord", asyn
       return responseJson(geminiReport(markdown));
     }
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
-    discordContents.push(JSON.parse(init.body).content);
+    const { payload, file } = discordForm(init);
+    assert.match(payload.content, /Discord delivery receives/);
+    discordFiles.push(await file.text());
     return new Response(null, { status: 204 });
   }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
 
   assert.equal(result.report.generated, true);
   assert.equal(result.report.geminiModel, "gemini-3.5-flash");
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
-  assert.match(discordContents.join("\n"), /Discord delivery receives/);
-  assert.deepEqual(result.report.webhook, {
-    sent: true,
-    provider: "discord",
-    messages: discordContents.length,
-    chunks: { expected: discordContents.length, delivered: discordContents.length, failed: 0 },
-  });
+  assert.deepEqual(discordFiles, [markdown]);
+  assert.equal(result.report.webhook.sent, true);
+  assert.equal(result.report.webhook.provider, "discord");
+  assert.equal(result.report.webhook.messages, 1);
+  assert.deepEqual(result.report.webhook.chunks, { expected: 1, delivered: 1, failed: 0 });
 });
 
 test("Gemini joins multiple non-thought parts and excludes thought parts", async () => {
@@ -543,7 +665,7 @@ test("MAX_TOKENS triggers exactly one concise retry", async () => {
       geminiCalls += 1;
       const request = JSON.parse(init.body);
       if (geminiCalls === 1) return responseJson(geminiReport("truncated", "MAX_TOKENS"));
-      assert.match(request.contents[0].parts[0].text, /previous response failed validation/);
+      assert.match(request.contents[0].parts[0].text, /previous response failed for exactly this reason/);
       return responseJson(geminiReport(completed, "STOP"));
     }
     throw new Error(`Unexpected fetch ${url}`);
@@ -633,13 +755,14 @@ test("forceRegenerate replaces an existing incomplete report after validation su
     BRIEF_BUCKET: bucket,
   };
 
-  const discordContents = [];
-  const response = await withFetchStub((url, init) => {
+  const discordFiles = [];
+  const response = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
     if (url.startsWith("https://generativelanguage.googleapis.com")) return responseJson(geminiReport(markdown));
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
-    discordContents.push(JSON.parse(init.body).content);
+    const { file } = discordForm(init);
+    discordFiles.push(await file.text());
     return new Response(null, { status: 204 });
   }, () => worker.fetch(new Request("https://example.test/run-report", {
     method: "POST",
@@ -648,7 +771,7 @@ test("forceRegenerate replaces an existing incomplete report after validation su
   }), env));
 
   assert.equal(response.status, 200);
-  assert.match(discordContents.join("\n"), /Regeneration produces/);
+  assert.match(discordFiles.join("\n"), /Regeneration produces/);
   const body = await response.json();
   assert.equal(body.report.replaced, true);
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
@@ -696,7 +819,7 @@ test("existing dated report prevents duplicate report generation but still evalu
 
   assert.deepEqual(result.report, {
     date: "2026-08-05",
-    engineVersion: "0.5.5",
+    engineVersion: "0.5.6",
     generated: false,
     stored: true,
     email: null,
@@ -722,62 +845,62 @@ test("email delivery is skipped unless all Resend settings are present", async (
   assert.deepEqual(result, { skipped: true, reason: "email_not_configured" });
 });
 
-test("Discord webhooks receive content messages instead of generic JSON", async () => {
+test("Discord webhooks receive a concise verdict plus the complete Markdown attachment", async () => {
   const longMarkdown = `# Report\n\n${"AI-cycle signal. ".repeat(150)}`;
   const env = { DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token" };
 
-  const result = await withFetchStub((url, init) => {
+  const result = await withFetchStub(async (url, init) => {
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
-    const body = JSON.parse(init.body);
-    assert.equal("content" in body, true);
-    assert.equal("markdown" in body, false);
-    assert.equal(body.username, "Stock Analyst Bot");
-    assert.equal(body.avatar_url, "https://i.imgur.com/4M34hi2.png");
-    assert.doesNotMatch(body.content, /^\*\*Growth Tech Morning Brief — 2026-08-05\*\*/);
-    assert.ok(body.content.length <= 1900);
+    const { payload, file } = discordForm(init);
+    assert.equal(payload.username, "Stock Analyst Bot");
+    assert.equal(payload.avatar_url, "https://i.imgur.com/4M34hi2.png");
+    assert.match(payload.content, /Full verbose report attached/);
+    assert.ok(payload.content.length <= 1800);
+    assert.equal(file.name, "growth-tech-morning-brief-2026-08-05.md");
+    assert.equal(await file.text(), longMarkdown);
     return new Response(null, { status: 204 });
   }, () => sendReportWebhook(env, "2026-08-05", longMarkdown));
 
   assert.equal(result.sent, true);
   assert.equal(result.provider, "discord");
-  assert.ok(result.messages > 1);
+  assert.equal(result.messages, 1);
+  assert.equal(result.attachment, "growth-tech-morning-brief-2026-08-05.md");
+  assert.match(result.fingerprint, /^[a-f0-9]{64}$/);
 });
 
 test("Discord webhook delivery also supports Discord URLs in WEBHOOK_URL", async () => {
   const env = { WEBHOOK_URL: "https://discordapp.com/api/webhooks/123/token" };
-  const result = await withFetchStub((url, init) => {
+  const result = await withFetchStub(async (url, init) => {
     assert.equal(url, env.WEBHOOK_URL);
-    assert.match(JSON.parse(init.body).content, /Discord fallback/);
+    const { payload, file } = discordForm(init);
+    assert.match(payload.content, /Full verbose report attached/);
+    assert.equal(await file.text(), "Discord fallback");
     return new Response(null, { status: 204 });
   }, () => sendReportWebhook(env, "2026-08-05", "Discord fallback"));
 
-  assert.deepEqual(result, {
-    sent: true,
-    provider: "discord",
-    messages: 1,
-    chunks: { expected: 1, delivered: 1, failed: 0 },
-  });
+  assert.equal(result.sent, true);
+  assert.equal(result.provider, "discord");
+  assert.equal(result.messages, 1);
+  assert.deepEqual(result.chunks, { expected: 1, delivered: 1, failed: 0 });
 });
 
-test("complete Discord reports are delivered through every chunk", async () => {
+test("complete Discord reports use one attachment rather than many chunks", async () => {
   const markdown = `${completeReport(["NVDA"], "Chunked delivery remains complete.")}\n\n${"Additional context line for chunking.\n".repeat(120)}`;
   const env = { DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token" };
-  const contents = [];
+  const files = [];
 
-  const result = await withFetchStub((url, init) => {
+  const result = await withFetchStub(async (url, init) => {
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
-    const body = JSON.parse(init.body);
-    contents.push(body.content);
-    assert.ok(body.content.length < 2000);
+    const { payload, file } = discordForm(init);
+    files.push(await file.text());
+    assert.ok(payload.content.length < 2000);
     return new Response(null, { status: 204 });
   }, () => sendReportWebhook(env, "2026-08-05", markdown));
 
   assert.equal(result.sent, true);
-  assert.equal(result.messages, contents.length);
-  assert.ok(contents.length > 1);
-  assert.match(contents.at(1), /^Part 2\/\d+/);
-  assert.doesNotMatch(contents.join("\n"), /\*\*Growth Tech Morning Brief —/);
-  assert.deepEqual(result.chunks, { expected: contents.length, delivered: contents.length, failed: 0 });
+  assert.equal(result.messages, 1);
+  assert.deepEqual(files, [markdown]);
+  assert.deepEqual(result.chunks, { expected: 1, delivered: 1, failed: 0 });
 });
 
 test("Discord 429 responses are retried with the requested delay", async () => {
@@ -796,8 +919,22 @@ test("Discord 429 responses are retried with the requested delay", async () => {
     return new Response(null, { status: 204 });
   }, () => sendReportWebhook(env, "2026-08-05", completeReport(["NVDA"])));
 
-  assert.equal(calls, result.messages + 1);
+  assert.equal(calls, 2);
   assert.deepEqual(result.chunks, { expected: result.messages, delivered: result.messages, failed: 0 });
+});
+
+test("Discord transient server failures receive bounded retries", async () => {
+  const env = { DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token" };
+  let calls = 0;
+  const result = await withFetchStub((url) => {
+    assert.equal(url, env.DISCORD_WEBHOOK_URL);
+    calls += 1;
+    if (calls < 3) return new Response("temporary", { status: 502, headers: { "retry-after": "0" } });
+    return new Response(null, { status: 204 });
+  }, () => sendReportWebhook(env, "2026-08-05", completeReport(["NVDA"])));
+
+  assert.equal(calls, 3);
+  assert.equal(result.sent, true);
 });
 
 test("deliver-latest requires authorization", async () => {
@@ -833,11 +970,11 @@ test("deliver-latest sends the latest stored report to Discord", async () => {
     BRIEF_BUCKET: r2({ "reports/latest.md": "# Stored report" }),
   };
 
-  const response = await withFetchStub((url, init) => {
+  const response = await withFetchStub(async (url, init) => {
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
-    const body = JSON.parse(init.body);
-    assert.doesNotMatch(body.content, /\*\*Growth Tech Morning Brief — 2026-08-05\*\*/);
-    assert.match(body.content, /# Stored report/);
+    const { payload, file } = discordForm(init);
+    assert.match(payload.content, /Full verbose report attached/);
+    assert.equal(await file.text(), "# Stored report");
     return new Response(null, { status: 204 });
   }, () => worker.fetch(new Request("https://example.test/deliver-latest", {
     method: "POST",
@@ -847,12 +984,10 @@ test("deliver-latest sends the latest stored report to Discord", async () => {
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.date, "2026-08-05");
-  assert.deepEqual(body.webhook, {
-    sent: true,
-    provider: "discord",
-    messages: 1,
-    chunks: { expected: 1, delivered: 1, failed: 0 },
-  });
+  assert.equal(body.webhook.sent, true);
+  assert.equal(body.webhook.provider, "discord");
+  assert.equal(body.webhook.messages, 1);
+  assert.deepEqual(body.webhook.chunks, { expected: 1, delivered: 1, failed: 0 });
   assert.match(env.BRIEF_BUCKET.objects.get("deliveries/2026-08-05.json"), /"sent": true/);
 });
 
@@ -860,21 +995,19 @@ test("existing report with no delivery receipt retries Discord on scheduled run"
   const bucket = r2({ "reports/2026-08-05.md": "stored report" });
   const env = { WATCHLIST: "NVDA", DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token", BRIEF_BUCKET: bucket };
 
-  const result = await withFetchStub((url, init) => {
+  const result = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
-    assert.match(JSON.parse(init.body).content, /stored report/);
+    const { file } = discordForm(init);
+    assert.match(await file.text(), /stored report/);
     return new Response(null, { status: 204 });
   }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
 
   assert.equal(result.report.reused, true);
-  assert.deepEqual(result.report.webhook, {
-    sent: true,
-    provider: "discord",
-    messages: 1,
-    chunks: { expected: 1, delivered: 1, failed: 0 },
-  });
+  assert.equal(result.report.webhook.sent, true);
+  assert.equal(result.report.webhook.messages, 1);
+  assert.deepEqual(result.report.webhook.chunks, { expected: 1, delivered: 1, failed: 0 });
 });
 
 test("existing successful receipt prevents duplicate scheduled Discord delivery", async () => {
@@ -908,12 +1041,13 @@ test("run-report forceDelivery retries delivery without another Gemini API call"
     BRIEF_BUCKET: bucket,
   };
 
-  const response = await withFetchStub((url, init) => {
+  const response = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
     if (url.startsWith("https://generativelanguage.googleapis.com")) throw new Error("Gemini should not be called");
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
-    assert.match(JSON.parse(init.body).content, /stored report/);
+    const { file } = discordForm(init);
+    assert.match(await file.text(), /stored report/);
     return new Response(null, { status: 204 });
   }, () => worker.fetch(new Request("https://example.test/run-report", {
     method: "POST",
@@ -925,12 +1059,9 @@ test("run-report forceDelivery retries delivery without another Gemini API call"
   const body = await response.json();
   assert.equal(body.report.generated, false);
   assert.equal(body.report.reused, true);
-  assert.deepEqual(body.report.webhook, {
-    sent: true,
-    provider: "discord",
-    messages: 1,
-    chunks: { expected: 1, delivered: 1, failed: 0 },
-  });
+  assert.equal(body.report.webhook.sent, true);
+  assert.equal(body.report.webhook.messages, 1);
+  assert.deepEqual(body.report.webhook.chunks, { expected: 1, delivered: 1, failed: 0 });
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), "stored report");
 });
 
@@ -953,7 +1084,7 @@ test("Discord errors return useful diagnostics without exposing the webhook URL"
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.webhook.failed, true);
-  assert.match(body.webhook.error, /Discord webhook delivery failed \(1\/1\) \(404\): invalid webhook/);
+  assert.match(body.webhook.error, /Discord report attachment delivery failed \(404\): invalid webhook/);
   assert.doesNotMatch(JSON.stringify(body), /secret-token/);
 });
 
