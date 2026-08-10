@@ -151,7 +151,7 @@ components:
       properties:
         schemaVersion:
           type: integer
-          enum: [6]
+          enum: [7]
         generatedAt:
           type: string
           format: date-time
