@@ -14,18 +14,16 @@ const SERVICE_VERSION = "0.5.7";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
-  "Today's Verdict",
-  "Decision Reasoning",
-  "Opportunities",
-  "Rejected Candidates",
-  "Market and AI-Cycle Context",
-  "What Could Change the Call",
+  "Executive Summary",
+  "Overnight and Market Context",
+  "AI Cycle Dashboard",
+  "Sector Scorecard",
+  "Watchlist",
 ];
-const REQUIRED_VERDICT_LABELS = ["Verdict", "Confidence", "Why Today"];
-const REQUIRED_CONTEXT_LABELS = ["AI Cycle", "Market Regime", "Material News"];
-const REQUIRED_REASONING_LABELS = ["Universe Searched", "Opportunity Gate", "Conclusion"];
-const REQUIRED_AUDIT_LABELS = ["Funnel", "Available Evidence", "Missing Evidence", "Source Failures", "Confidence Impact"];
-const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Trim", "Sell", "Watch", "No action"];
+const REQUIRED_EXECUTIVE_LABELS = ["AI Cycle", "Key Catalyst", "Principal Risk", "Best Opportunity", "Avoid"];
+const REQUIRED_CONTEXT_LABELS = ["As Of", "Global Markets", "Futures", "Rates", "Dollar", "Oil"];
+const REQUIRED_AUDIT_LABELS = ["Funnel", "Packet Completion", "Field Completeness", "Material Missing Fields", "Source Failures"];
+const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Trim", "Sell", "Review position size", "Watch", "No action"];
 const REPORT_MODES = new Set(["standard", "verbose"]);
 const DEFAULT_DISCOVERY_LIMIT = 6;
 const DEFAULT_MIN_MARKET_CAP = 250_000_000;
@@ -505,12 +503,17 @@ async function enrichDiscoveryCandidates(candidates, env, now) {
         basis: "current Nasdaq screened price/market cap with trailing SEC filings; no historical percentile",
       };
       row.reportedGrowth = growth;
+      const netDebt = finitePair(facts.balanceSheet?.cash, facts.balanceSheet?.debt)
+        ? round(facts.balanceSheet.debt - facts.balanceSheet.cash)
+        : null;
       row.fundamentals = {
         ttmRevenue: round(ttmRevenue),
         ttmEps: round(ttmEps),
         cash: facts.balanceSheet?.cash ?? null,
         debt: facts.balanceSheet?.debt ?? null,
-        cashNetDebt: finitePair(facts.balanceSheet?.cash, facts.balanceSheet?.debt) ? round(facts.balanceSheet.cash - facts.balanceSheet.debt) : null,
+        netDebt,
+        netDebtStatus: !Number.isFinite(netDebt) ? "unavailable" : netDebt > 0 ? "net_debt" : netDebt < 0 ? "net_cash" : "neutral",
+        netDebtDefinition: "total debt minus cash; a negative value means net cash",
         asOf: row.fundamentalCoverage.asOf,
         cacheStatus: facts.cacheStatus ?? null,
       };
@@ -942,6 +945,11 @@ export function toBrief(snapshot) {
   const valid = [...rows, ...discoveredRows].filter((row) => !row.missing);
   const dataQuality = snapshotDataQuality(snapshot);
   const candidates = selectResearchCandidates(rows, discoveredRows, snapshot.eventLedger);
+  const validResearchUniverse = [...rows, ...discoveredRows].filter((row) => !row.missing);
+  const targetResearchCount = Math.min(MAX_RESEARCH_CANDIDATES, validResearchUniverse.length);
+  if (candidates.length !== targetResearchCount) {
+    throw new Error(`Research capacity invariant failed: expected ${targetResearchCount}, selected ${candidates.length}`);
+  }
   const brief = {
     schemaVersion: 7,
     generatedAt: snapshot.generatedAt,
@@ -971,6 +979,14 @@ export function toBrief(snapshot) {
       allowedTodayActions: TODAY_ACTIONS,
       defaultVerdict: "No high-conviction trade today",
       candidates,
+      researchCapacity: {
+        maximum: MAX_RESEARCH_CANDIDATES,
+        eligibleUniverse: validResearchUniverse.length,
+        target: targetResearchCount,
+        filled: candidates.length,
+        unfilled: Math.max(0, targetResearchCount - candidates.length),
+        excludedCore: rows.filter((row) => row.missing).map((row) => ({ symbol: row.symbol, reason: row.error || "price snapshot unavailable" })),
+      },
     },
     watchlist: rows,
   };
@@ -1031,6 +1047,7 @@ export function compactSnapshotForReport(snapshot) {
     opportunityGate: brief.opportunityGate,
     discovery: brief.discovery,
     eventLedger: brief.eventLedger,
+    watchlist: brief.watchlist,
   };
 }
 
@@ -1247,7 +1264,7 @@ function candidateResearchPrompt(compact, candidates, options = {}) {
     "Use only the supplied evidence. Do not infer that a headline caused a move unless the linkage is direct.",
     `Analyze only these batch symbols: ${[...candidateSymbols].join(", ")}. Do not place any other equity ticker in candidate fields; non-candidate market facts are context only.`,
     "Discovery names cannot pass the action gate when valuation, fundamentals, liquidity context, or a verified fresh company catalyst is missing.",
-    "Price movement alone may support Watch, never Buy/Sell. Trim requires a verified catalyst or the supplied extremeTrim flag.",
+    "Price movement alone may support Watch, never Buy/Sell. An extremeTrim flag without portfolio holdings is a valuation-risk flag only: use Review position size, never infer ownership, weight, cost basis, benchmark exposure, or a quantity to sell.",
     "Return {\"candidates\":[...]} with exactly one object per supplied symbol and these fields:",
     "symbol, catalystSummary, evidenceFor (array), evidenceAgainst (array), mispricingThesis, strategicPosition (Buy/Hold/Avoid), todayAction (Buy now/Buy on weakness/Trim/Sell/Watch/No action), confidence (High/Medium/Low), entryExitCondition, riskReward, invalidation, missingEvidence (array), sourceQuality, gateResult (pass/fail), gateReason.",
     options.retry ? `Repair the previous failure exactly: ${options.validationErrors}` : "",
@@ -1297,21 +1314,20 @@ function validateResearchBatch(parsed, candidates) {
   return { ok: errors.length === 0, errors };
 }
 
-function normalizeResearchPacket(packet, candidate) {
+export function normalizeResearchPacket(packet, candidate) {
   const discoveryBlocked = candidate?.sourceType === "discovery"
     && (!discoveryFinancialsComplete(candidate) || !candidate?.setup?.verifiedCatalyst);
-  const actionable = ["Buy now", "Buy on weakness", "Sell"].includes(packet.todayAction)
+  const actionable = ["Buy now", "Buy on weakness", "Sell", "Trim"].includes(packet.todayAction)
     ? candidate?.setup?.verifiedCatalyst
-    : packet.todayAction === "Trim"
-      ? candidate?.setup?.verifiedCatalyst || candidate?.setup?.extremeTrim
-      : false;
+    : false;
   const gateResult = packet.gateResult === "pass" && actionable && !discoveryBlocked ? "pass" : "fail";
+  const portfolioReview = packet.todayAction === "Trim" && candidate?.setup?.extremeTrim && !candidate?.setup?.verifiedCatalyst;
   return {
     ...packet,
     status: "complete",
     gateResult,
-    todayAction: gateResult === "pass" ? packet.todayAction : (["Watch", "No action"].includes(packet.todayAction) ? packet.todayAction : "Watch"),
-    gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, !actionable ? "action lacks deterministic catalyst/trim eligibility" : null].filter(Boolean).join("; "),
+    todayAction: gateResult === "pass" ? packet.todayAction : portfolioReview ? "Review position size" : (["Review position size", "Watch", "No action"].includes(packet.todayAction) ? packet.todayAction : "Watch"),
+    gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, portfolioReview ? "extreme valuation is a risk flag; no holdings or target allocation were supplied" : null, !actionable && !portfolioReview ? "action lacks deterministic catalyst eligibility" : null].filter(Boolean).join("; "),
     sourceSnapshot: {
       symbol: candidate.symbol,
       sourceType: candidate.sourceType,
@@ -1364,6 +1380,7 @@ function incompleteResearchPacket(candidate, failure) {
 export function synthesisContext(compact, research) {
   const researchSymbols = research.packets.map((packet) => packet.symbol);
   const researchSet = new Set(researchSymbols);
+  const packetBySymbol = new Map(research.packets.map((packet) => [packet.symbol, packet]));
   const knownSymbols = new Set(Object.keys(CIKS));
   const contextOnlySymbols = [...symbolsInValue({
     calendars: compact.calendars,
@@ -1397,6 +1414,7 @@ export function synthesisContext(compact, research) {
     decisionFramework: {
       methodology: compact.decisionFramework?.methodology,
       aiCycle: compact.decisionFramework?.aiCycle,
+      sectorScorecard: compact.decisionFramework?.sectorScorecard,
     },
     opportunityGate: {
       ...compact.opportunityGate,
@@ -1428,6 +1446,26 @@ export function synthesisContext(compact, research) {
       packets: research.packets,
       storage: research.storage,
     },
+    watchlist: (compact.watchlist ?? []).map((row) => ({
+      symbol: row.symbol,
+      name: row.name,
+      price: row.price,
+      changePercent: row.changePercent,
+      yearLow: row.yearLow,
+      yearHigh: row.yearHigh,
+      positionIn52WeekRange: row.positionIn52WeekRange,
+      valuation: row.valuation,
+      reportedGrowth: row.reportedGrowth,
+      catalyst: row.catalyst,
+      risk: row.risk,
+      deterministicAction: row.action,
+      expectedAction: !researchSet.has(row.symbol)
+        ? "Wait"
+        : packetBySymbol.get(row.symbol)?.status !== "complete"
+          ? "Wait"
+          : packetBySymbol.get(row.symbol)?.strategicPosition ?? "Wait",
+      researchStatus: researchSet.has(row.symbol) ? "researched" : "not_researched_today",
+    })),
   };
 }
 
@@ -1597,75 +1635,133 @@ function reportMetadata(route, body, extracted, attempts) {
 
 export function validateReportCompleteness(markdown, symbols, compact = null) {
   const errors = [];
+  validateTopLevelSections(markdown, errors);
   for (const section of REQUIRED_REPORT_SECTIONS) {
     if (!sectionBody(markdown, section)) errors.push(`missing section: ${section}`);
   }
 
-  const verdict = sectionBody(markdown, "Today's Verdict");
-  for (const label of REQUIRED_VERDICT_LABELS) {
-    if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(verdict)) {
-      errors.push(`missing Today's Verdict field: ${label}`);
-    }
+  const executive = sectionBody(markdown, "Executive Summary");
+  const executiveBullets = executive.split("\n").filter((line) => /^\s*[-*]\s+/.test(line));
+  if (executiveBullets.length !== 5) errors.push(`Executive Summary must contain exactly five bullets, received ${executiveBullets.length}`);
+  for (const label of REQUIRED_EXECUTIVE_LABELS) {
+    if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(executive)) errors.push(`missing Executive Summary field: ${label}`);
   }
-  const context = sectionBody(markdown, "Market and AI-Cycle Context");
+  const context = sectionBody(markdown, "Overnight and Market Context");
   for (const label of REQUIRED_CONTEXT_LABELS) {
     if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(context)) {
-      errors.push(`missing Market Context field: ${label}`);
+      errors.push(`missing Overnight and Market Context field: ${label}`);
     }
   }
-  const reasoning = sectionBody(markdown, "Decision Reasoning");
-  for (const label of REQUIRED_REASONING_LABELS) {
-    if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(reasoning)) {
-      errors.push(`missing Decision Reasoning field: ${label}`);
-    }
-  }
-  const rejected = sectionBody(markdown, "Rejected Candidates");
-  if (!rejected) errors.push("Rejected Candidates must explain the strongest failed setups");
-  validateDecisionAudit(markdown, compact, errors);
+  validateAvailableContextIsUsed(context, compact, errors);
+  validateDashboardTable(sectionBody(markdown, "AI Cycle Dashboard"), Object.keys(AI_CYCLE_SEGMENTS), "AI Cycle Dashboard", compact?.decisionFramework?.aiCycle, errors);
+  validateDashboardTable(sectionBody(markdown, "Sector Scorecard"), Object.keys(SECTOR_MEMBERS), "Sector Scorecard", compact?.decisionFramework?.sectorScorecard, errors);
+  validateWatchlistTable(sectionBody(markdown, "Watchlist"), compact, errors);
+  validateResearchAudit(markdown, compact, errors);
   validateTickerScope(markdown, compact, errors, symbols);
-  validateOpportunities(markdown, symbols, compact, errors);
+  validatePortfolioAndBalanceSheetClaims(markdown, compact, errors);
   validateUnsupportedClaims(markdown, compact, errors);
   if (markdown.length < 700) errors.push("report is shorter than the minimum insight length");
   if (endsIncomplete(markdown)) errors.push("report ends with an incomplete sentence");
   return { ok: errors.length === 0, errors };
 }
 
-function validateDecisionAudit(markdown, compact, errors) {
-  if (compact?.reportMode !== "verbose") return;
-  if (!/\*{0,2}Report Mode\*{0,2}\s*:\*{0,2}\s*verbose\b/i.test(markdown)) {
-    errors.push("verbose report must identify Report Mode: verbose");
+function validateTopLevelSections(markdown, errors) {
+  const headings = [...markdown.matchAll(/^#\s+(.+)$/gm)].map((match) => match[1].trim());
+  const sections = headings.filter((heading) => !/^Growth Tech Morning Brief\b/i.test(heading));
+  if (sections.length !== REQUIRED_REPORT_SECTIONS.length || sections.some((section, index) => section !== REQUIRED_REPORT_SECTIONS[index])) {
+    errors.push(`top-level sections must be exactly: ${REQUIRED_REPORT_SECTIONS.join("; ")}`);
   }
-  const expectedVersion = compact.engineVersion ?? SERVICE_VERSION;
-  if (!new RegExp(`\\*{0,2}Engine Version\\*{0,2}\\s*:\\*{0,2}\\s*${escapeRegExp(expectedVersion)}\\b`, "i").test(markdown)) {
-    errors.push("verbose report must identify the current engine version");
-  }
-  const audit = sectionBody(markdown, "Data and Pipeline Audit");
-  if (!audit) errors.push("missing section: Data and Pipeline Audit");
-  for (const label of REQUIRED_AUDIT_LABELS) {
-    if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(audit)) {
-      errors.push(`missing Data and Pipeline Audit field: ${label}`);
+}
+
+function validateDashboardTable(section, requiredRows, label, expected, errors) {
+  if (!/\|\s*(?:Segment|Sector)\s*\|/i.test(section)) errors.push(`${label} must contain a Markdown table`);
+  const table = parseMarkdownTable(section);
+  const headers = table.headers.map(normalizeCell);
+  const labelIndex = label === "AI Cycle Dashboard" ? headers.indexOf("segment") : headers.indexOf("sector");
+  for (const rowLabel of requiredRows) {
+    const row = table.rows.find((candidate) => normalizeCell(candidate[labelIndex]) === normalizeCell(rowLabel));
+    if (!row) {
+      errors.push(`${label} missing row: ${rowLabel}`);
+      continue;
     }
-  }
-  const candidates = compact?.opportunityGate?.candidates ?? [];
-  const audited = [
-    sectionBody(markdown, "Decision Reasoning"),
-    sectionBody(markdown, "Opportunities"),
-    sectionBody(markdown, "Rejected Candidates"),
-  ].join("\n");
-  for (const row of candidates) {
-    if (!new RegExp(`\\b${escapeRegExp(row.symbol)}\\b`).test(audited)) {
-      errors.push(`verbose report silently omitted gated candidate: ${row.symbol}`);
-    }
-  }
-  const opportunities = sectionBody(markdown, "Opportunities");
-  if (!/^###\s+/m.test(opportunities) && isNoTradeStatement(opportunities)) {
-    for (const label of ["Threshold Result", "Best Near-Miss", "Why It Failed", "Portfolio Action"]) {
-      if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(opportunities)) {
-        errors.push(`verbose no-trade Opportunities missing field: ${label}`);
+    const fields = label === "AI Cycle Dashboard" ? ["rating", "trend"] : ["fundamentals", "valuation", "momentum", "action"];
+    for (const field of fields) {
+      const index = headers.indexOf(normalizeCell(field));
+      if (expected?.[rowLabel]?.[field] !== undefined && normalizeCell(row[index]) !== normalizeCell(expected[rowLabel][field])) {
+        errors.push(`${label} ${rowLabel} changed deterministic ${field}`);
       }
     }
   }
+}
+
+function parseMarkdownTable(section) {
+  const lines = section.split("\n").filter((line) => /^\s*\|.*\|\s*$/.test(line));
+  if (lines.length < 2) return { headers: [], rows: [] };
+  const cells = (line) => line.split("|").slice(1, -1).map((cell) => cell.trim());
+  const headers = cells(lines[0]);
+  const rows = lines.slice(1).filter((line) => !/^\s*\|(?:\s*:?-+:?\s*\|)+\s*$/.test(line)).map(cells);
+  return { headers, rows };
+}
+
+function validateWatchlistTable(section, compact, errors) {
+  const expectedHeaders = ["Symbol", "Price", "Daily Change", "52-Week Position", "Valuation", "Historical Percentile", "Catalyst", "Risk", "Action", "Research Status"];
+  const table = parseMarkdownTable(section);
+  const normalizedHeaders = table.headers.map(normalizeCell);
+  for (const header of expectedHeaders) if (!normalizedHeaders.includes(normalizeCell(header))) errors.push(`Watchlist missing column: ${header}`);
+  const symbolIndex = normalizedHeaders.indexOf(normalizeCell("Symbol"));
+  const actionIndex = normalizedHeaders.indexOf(normalizeCell("Action"));
+  const statusIndex = normalizedHeaders.indexOf(normalizeCell("Research Status"));
+  const researchSymbols = new Set(compact?.researchSymbols ?? (compact?.research?.packets ?? []).map((packet) => packet.symbol));
+  for (const expected of compact?.watchlist ?? []) {
+    const row = table.rows.find((candidate) => normalizeCell(candidate[symbolIndex]) === normalizeCell(expected.symbol));
+    if (!row) {
+      errors.push(`Watchlist missing core symbol: ${expected.symbol}`);
+      continue;
+    }
+    const action = String(row[actionIndex] ?? "").replace(/[\s*`_]/g, "");
+    if (!/^(Buy|Hold|Wait|Avoid)$/i.test(action)) errors.push(`Watchlist invalid Action for ${expected.symbol}`);
+    if (!researchSymbols.has(expected.symbol)) {
+      if (!/^Wait$/i.test(action)) errors.push(`unresearched watchlist symbol must be Wait: ${expected.symbol}`);
+      if (!/not\s+researched/i.test(row[statusIndex] ?? "")) errors.push(`unresearched watchlist symbol must disclose research status: ${expected.symbol}`);
+    } else if (expected.expectedAction && normalizeCell(action) !== normalizeCell(expected.expectedAction)) {
+      errors.push(`Watchlist Action changed researched packet position: ${expected.symbol}`);
+    }
+  }
+}
+
+function validatePortfolioAndBalanceSheetClaims(markdown, compact, errors) {
+  for (const packet of compact?.research?.packets ?? []) {
+    const symbol = packet.symbol;
+    const lines = markdown.split("\n").filter((line) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(line));
+    const netDebt = packet.sourceSnapshot?.fundamentals?.netDebt;
+    if (Number.isFinite(netDebt) && netDebt < 0) for (const line of lines) {
+      if (/\b(?:debt load|balance[- ]sheet weakness|net debt position)\b/i.test(line) && !/\bnet cash\b/i.test(line)) {
+        errors.push(`negative netDebt misclassified instead of net cash: ${symbol}`);
+      }
+    }
+    const setup = packet.sourceSnapshot?.setup;
+    if (setup?.extremeTrim && !setup?.verifiedCatalyst) for (const line of lines) {
+      if (/\b(?:overweight|lock(?:ing)? in gains|sell a portion|trim (?:the |your |an? )?position|position is likely|benchmark weight)\b/i.test(line)) {
+        errors.push(`portfolio-specific Trim assumption without holdings: ${symbol}`);
+      }
+    }
+  }
+}
+
+function validateResearchAudit(markdown, compact, errors) {
+  if (compact?.reportMode !== "verbose") return;
+  if (!/\*{0,2}Report Mode\*{0,2}\s*:\*{0,2}\s*verbose\b/i.test(markdown)) errors.push("verbose report must identify Report Mode: verbose");
+  const expectedVersion = compact.engineVersion ?? SERVICE_VERSION;
+  if (!new RegExp(`\\*{0,2}Engine Version\\*{0,2}\\s*:\\*{0,2}\\s*${escapeRegExp(expectedVersion)}\\b`, "i").test(markdown)) errors.push("verbose report must identify the current engine version");
+  const audit = sectionBody(markdown, "Research Audit");
+  if (!audit) errors.push("missing subsection: Research Audit");
+  for (const label of REQUIRED_AUDIT_LABELS) if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(audit)) errors.push(`missing Research Audit field: ${label}`);
   validateFunnelAudit(audit, compact, errors);
+  const capacity = compact?.opportunityGate?.researchCapacity;
+  if (capacity && !new RegExp(`capacity\\s*[=:]\\s*${capacity.filled}\\/${capacity.target}`, "i").test(audit)) errors.push(`Research Audit must disclose capacity=${capacity.filled}/${capacity.target}`);
+  for (const packet of compact?.research?.packets ?? []) {
+    if (!new RegExp(`\\b${escapeRegExp(packet.symbol)}\\b`).test(markdown)) errors.push(`verbose report silently omitted gated candidate: ${packet.symbol}`);
+  }
 }
 
 function validateFunnelAudit(audit, compact, errors) {
@@ -1674,7 +1770,7 @@ function validateFunnelAudit(audit, compact, errors) {
   const funnelLine = audit.split("\n").find((line) => /\*{0,2}Funnel\*{0,2}\s*:/i.test(line)) ?? "";
   for (const field of ["screened", "admitted", "researched", "incomplete", "actionable", "rejected"]) {
     const match = new RegExp(`${field}\\s*[=:]\\s*(\\d+)`, "i").exec(funnelLine);
-    if (!match) errors.push(`Data and Pipeline Audit Funnel missing count: ${field}`);
+    if (!match) errors.push(`Research Audit Funnel missing count: ${field}`);
     else if (expected[field] !== null && Number(match[1]) !== Number(expected[field])) errors.push(`funnel count mismatch for ${field}: expected ${expected[field]}, received ${match[1]}`);
   }
 }
@@ -1684,64 +1780,19 @@ function validateTickerScope(markdown, compact, errors, fallbackSymbols = []) {
   const researchSymbols = new Set(compact?.researchSymbols ?? (packetSymbols.length ? packetSymbols : fallbackSymbols ?? []));
   const contextOnlySymbols = new Set(compact?.contextOnlySymbols ?? []);
   const knownEquities = new Set([...Object.keys(CIKS), ...(compact?.discovery?.admittedSymbols ?? []), ...contextOnlySymbols]);
-  const sections = [...REQUIRED_REPORT_SECTIONS, "Data and Pipeline Audit"];
-  for (const section of sections) {
-    const body = sectionBody(markdown, section);
-    const found = new Set(body.match(/\b[A-Z.]{2,8}\b/g) ?? []);
-    const marketContext = section === "Market and AI-Cycle Context";
-    for (const token of found) {
-      if (!knownEquities.has(token) || token === "SPY" || researchSymbols.has(token)) continue;
-      if (!marketContext || !contextOnlySymbols.has(token)) {
-        errors.push(`ticker reference outside research universe in ${section}: ${token}`);
-      }
+  const executive = sectionBody(markdown, "Executive Summary");
+  for (const token of new Set(executive.match(/\b[A-Z.]{2,8}\b/g) ?? [])) {
+    if (knownEquities.has(token) && token !== "SPY" && !researchSymbols.has(token)) {
+      errors.push(`ticker reference outside research universe in Executive Summary: ${token}`);
     }
   }
 
-  const marketContext = sectionBody(markdown, "Market and AI-Cycle Context");
-  for (const line of marketContext.split("\n")) {
+  for (const section of ["Overnight and Market Context", "AI Cycle Dashboard", "Sector Scorecard"]) for (const line of sectionBody(markdown, section).split("\n")) {
     const symbols = [...contextOnlySymbols].filter((symbol) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(line));
     if (symbols.length && /\b(?:buy(?: now| on weakness)?|sell|trim|hold|avoid|under(?:valued|rated)|overvalued|mispriced|target price|preferred entry|rating)\b/i.test(line)) {
       for (const symbol of symbols) errors.push(`context-only ticker received investment judgment: ${symbol}`);
     }
   }
-}
-
-function validateOpportunities(markdown, symbols, compact, errors) {
-  const opportunities = sectionBody(markdown, "Opportunities");
-  const matches = [...opportunities.matchAll(/^###\s+([A-Z.]{1,8})\s+[—-]\s+(.+)$/gm)];
-  const maximum = compact?.opportunityGate?.maximumOpportunities ?? 8;
-  if (matches.length > maximum) errors.push(`Opportunities must contain at most ${maximum} names`);
-  const candidates = new Map((compact?.opportunityGate?.candidates ?? []).map((row) => [row.symbol, row]));
-  const required = ["Why Considered", "Mispricing Thesis", "Evidence For", "Evidence Against", "Strategic Position", "Today's Action", "Confidence", "Entry/Exit Condition", "Verified Catalyst", "Risk/Reward", "Invalidation"];
-  for (const match of matches) {
-    const [heading, symbol, headingAction] = match;
-    const next = opportunities.slice(match.index + heading.length);
-    const block = next.slice(0, next.search(/^###\s+/m) < 0 ? undefined : next.search(/^###\s+/m));
-    const action = TODAY_ACTIONS.find((value) => normalizeCell(value) === normalizeCell(headingAction));
-    if (!action) errors.push(`invalid today's action: ${symbol}`);
-    if (!symbols?.includes(symbol)) errors.push(`opportunity is outside research universe: ${symbol}`);
-    if (!candidates.has(symbol)) errors.push(`opportunity did not clear absolute setup gate: ${symbol}`);
-    for (const label of required) if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(block)) {
-      errors.push(`missing opportunity field for ${symbol}: ${label}`);
-    }
-    if (["Buy now", "Buy on weakness", "Sell"].includes(action) && !candidates.get(symbol)?.setup?.verifiedCatalyst) {
-      errors.push(`actionable call lacks verified catalyst: ${symbol}`);
-    }
-    if (action === "Trim" && !candidates.get(symbol)?.setup?.verifiedCatalyst && !candidates.get(symbol)?.setup?.extremeTrim) {
-      errors.push(`trim call lacks verified catalyst or extreme setup: ${symbol}`);
-    }
-    if (["Buy now", "Buy on weakness", "Trim", "Sell"].includes(action) && candidates.get(symbol)?.researchGateResult && candidates.get(symbol)?.researchGateResult !== "pass") {
-      errors.push(`actionable call failed structured research gate: ${symbol}`);
-    }
-  }
-  if (!matches.length && !isNoTradeStatement(opportunities)) {
-    errors.push("Opportunities must state that no setup clears the threshold");
-  }
-}
-
-function isNoTradeStatement(text) {
-  return /no\s+(?:high[- ]conviction\s+)?(?:trade|actionable\s+opportunit(?:y|ies)|setup|candidate)s?\b[^.\n]{0,100}\b(?:today|clear(?:s|ed)?|meet(?:s|ing)?|met|pass(?:es|ed)?|qualif(?:y|ies|ied)|threshold|gate)/i.test(text)
-    || /(?:no|none\s+of\s+the)\s+(?:setup|candidate|opportunit(?:y|ies))s?\b[^.\n]{0,100}\b(?:clear(?:s|ed)?|meet(?:s|ing)?|met|pass(?:es|ed)?|qualif(?:y|ies|ied))\b[^.\n]{0,60}\b(?:threshold|gate|action)/i.test(text);
 }
 
 function validateUnsupportedClaims(markdown, compact, errors) {
@@ -1767,25 +1818,13 @@ function sectionBody(markdown, section) {
   return (next ? rest.slice(0, next.index) : rest).trim();
 }
 
-function markdownTableRow(section, label, options = {}) {
-  const escaped = escapeRegExp(label);
-  const prefix = options.allowLabelFormatting
-    ? `(?:\\*{0,2}|\`{0,1})${options.allowDollar ? "\\$?" : ""}${escaped}(?:\\*{0,2}|\`{0,1})`
-    : escaped;
-  const line = section.split("\n").find((candidate) => new RegExp(`^\\|\\s*${prefix}\\s*\\|`, "i").test(candidate));
-  if (!line) return null;
-  return line.split("|").slice(1, -1).map((cell) => cell.trim());
-}
-
 function validateAvailableContextIsUsed(overnight, compact, errors) {
   if (!compact) return;
   const categories = [
     ["Futures", compact.marketContext?.futures],
     ["Rates", compact.marketContext?.rates],
-    ["USD", compact.marketContext?.usd],
+    ["Dollar", compact.marketContext?.usd],
     ["Oil", compact.marketContext?.oil],
-    ["Macro Events", compact.calendars?.macroEvents],
-    ["Earnings", compact.calendars?.earnings],
   ];
   for (const [label, context] of categories) {
     const line = overnight.split("\n").find((candidate) => new RegExp(`${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(candidate));
@@ -1817,59 +1856,46 @@ function escapeRegExp(value) {
 function reportPrompt(compact, options = {}) {
   const verbose = compact.reportMode === "verbose";
   return [
-    `Produce an evidence-rich, decision-focused Growth Tech Morning Brief in Markdown in ${compact.reportMode} mode.`,
-    "Answer one question: after screening both the core watchlist and a broader movers universe, is there a sufficiently strong, time-sensitive reason to buy, sell, trim, or investigate a stock today?",
+    `Produce a concise, institutional sell-side Growth Tech Morning Brief in Markdown in ${compact.reportMode} mode.`,
+    "The main report has exactly five top-level sections in the exact order specified below. Do not add, remove, rename, or reorder top-level sections.",
     "Do not recommend a trade merely because a stock ranks highest. Default to 'No high-conviction trade today' unless an absolute setup threshold is cleared.",
     `Use only research.packets for company analysis. Include at most ${compact.opportunityGate.maximumOpportunities} actionable names. A >=3% move without verified news may be Watch only, never Buy/Sell.`,
-    `Research symbols: ${(compact.researchSymbols ?? []).join(", ") || "none"}. These are the only symbols allowed in Today's Verdict, Decision Reasoning, Opportunities, Rejected Candidates, Data and Pipeline Audit, and What Could Change the Call.`,
-    `Context-only symbols: ${(compact.contextOnlySymbols ?? []).join(", ") || "none"}. They may appear only in Market and AI-Cycle Context, and only as sourced factual context. Never assign them Buy, Hold, Watch, Avoid, Sell, Trim, undervalued/overvalued/mispricing, target-price, preferred-entry, or other investment judgments.`,
+    `Research symbols: ${(compact.researchSymbols ?? []).join(", ") || "none"}. Only these may support a Best Opportunity, Avoid thesis, target, mispricing claim, or company verdict.`,
+    `Context-only symbols: ${(compact.contextOnlySymbols ?? []).join(", ") || "none"}. They may appear as sourced facts in market, AI-cycle, sector, and watchlist coverage, but may not receive a thesis or verdict.`,
     "Only a complete research packet whose gateResult is pass may receive Buy now, Buy on weakness, Trim, or Sell. Incomplete or failed packets must remain Watch/No action and be disclosed.",
-    "Buy now, Buy on weakness, and Sell require a verified fresh company event or same-day earnings. Trim requires either that evidence or the supplied extremeTrim flag.",
-    "Show the reasoning chain. For each call explain why it was considered, what the market may be mispricing, evidence for and against, strategic position, today's action, confidence, entry/exit condition, catalyst, risk/reward, and falsifiable invalidation.",
+    "Buy now, Buy on weakness, Sell, and an actual Trim require a verified fresh company event or same-day earnings. An extremeTrim flag without supplied holdings is only a valuation-risk flag: say Review position size, never infer ownership, weight, cost basis, benchmark exposure, gains, or a quantity to sell.",
     "Discovery candidates are not pre-approved investments. Explicitly discuss market cap, dollar liquidity, missing fundamental/valuation data, and source quality before any actionable call.",
+    "For fundamentals.netDebt, the definition is total debt minus cash. A negative value means net cash and must never be described as debt load or balance-sheet weakness.",
     "News metadata is evidence, not automatically causal. Attribute a price move to an event only when relevance is direct; otherwise call the move unverified.",
     "Federal Reserve items are from the official monetary-policy feed. Use them as market-regime inputs only when fresh and material to today's decision.",
     "Reported growth is backward-looking SEC data. Price action cannot establish demand, CapEx, adoption, institutional flows, or fundamental strength.",
     `Label market context as ${compact.session}; do not call regular-trading quotes overnight futures or premarket indications.`,
     `Allowed Today's Actions: ${TODAY_ACTIONS.join(", ")}.`,
-    verbose
-      ? "Verbose mode is an audit trail, not filler: expose research.funnel, analyze every research packet supplied, state incomplete batches and missing or failed inputs, and fully explain why each setup passed or failed. Do not silently omit a candidate or data-source failure."
-      : "Standard mode must remain auditable: explain the funnel and strongest rejected setups without exhaustive low-value tables.",
-    "Depth is preferred over brevity when it adds decision value. Do not add exhaustive sector, dashboard, or full-watchlist tables.",
+    "Separate sourced facts from analysis. Mark every unavailable metric as unavailable; a completed packet is not the same as complete fields.",
+    "Use `+N bps` for yield moves, not ambiguous percentages. Do not call one-day oil/yield moves stagflation without direct supporting evidence.",
     "",
     `**Report Mode:** ${compact.reportMode}`,
     `**Engine Version:** ${compact.engineVersion}`,
     "Repeat those two metadata lines verbatim immediately beneath the report title.",
     "",
-    "# Today's Verdict",
-    "Exactly three bullets labeled **Verdict:**, **Confidence:**, and **Why Today:**.",
+    "# Executive Summary",
+    "Exactly five bullets, in order, labeled **AI Cycle:**, **Key Catalyst:**, **Principal Risk:**, **Best Opportunity:**, and **Avoid:**. If no opportunity clears the gate, Best Opportunity must say none and may name only a researched near-miss.",
     "",
-    "# Decision Reasoning",
-    "Use three labeled paragraphs: **Universe Searched:** with screened, admitted, researched, incomplete, actionable, and rejected funnel counts, **Opportunity Gate:** explaining which signals admitted candidates and the evidence standard, and **Conclusion:** explaining why the strongest setups passed or failed today.",
+    "# Overnight and Market Context",
+    "Use exactly six concise bullets labeled **As Of:**, **Global Markets:**, **Futures:**, **Rates:**, **Dollar:**, and **Oil:**. Preserve each source status and timestamp; explicitly flag stale or unavailable inputs.",
     "",
-    "# Opportunities",
-    verbose
-      ? "If no candidate merits action, do not leave this section empty or use only one sentence. Use four labeled bullets: **Threshold Result:**, **Best Near-Miss:**, **Why It Failed:**, and **Portfolio Action:**."
-      : "If no candidate merits action, state that no actionable opportunity clears the threshold and identify the best near-miss plus its decisive failure.",
-    "Otherwise use `### SYMBOL — Today's Action` and eleven bullets labeled **Why Considered:**, **Mispricing Thesis:**, **Evidence For:**, **Evidence Against:**, **Strategic Position:**, **Today's Action:**, **Confidence:**, **Entry/Exit Condition:**, **Verified Catalyst:**, **Risk/Reward:**, and **Invalidation:** for each name.",
+    "# AI Cycle Dashboard",
+    "Use one Markdown table with columns Segment | Rating | Trend | Evidence | Limitation and exactly these supplied rows: Hyperscaler AI CapEx, GPU Demand, AI Cloud, Enterprise AI, Inference. Do not upgrade Insufficient Data based on price action.",
     "",
-    "# Rejected Candidates",
-    verbose
-      ? "Audit every supplied research packet that is not actionable. Use `### SYMBOL — Rejected/Watch` and fields **Admission Signal:**, **Evidence Supporting:**, **Evidence Missing or Conflicting:**, **Rejection Reason:**, and **Promotion Trigger:**. Mark incomplete research explicitly."
-      : "Discuss up to five of the strongest candidates that failed the action threshold. For each, state the admission signal, missing evidence or conflicting evidence, and what would promote it to an actionable setup. If none exist, say so explicitly.",
+    "# Sector Scorecard",
+    "Use one Markdown table with columns Sector | Fundamentals | Valuation | Momentum | Action | Evidence and exactly these supplied rows: GPU, AI Cloud, GPU Cloud, Networking, Cooling, Power, Cybersecurity, Cloud Software. Do not change deterministic ratings or actions.",
     "",
+    "# Watchlist",
+    "Use one Markdown table with columns Symbol | Price | Daily Change | 52-Week Position | Valuation | Historical Percentile | Catalyst | Risk | Action | Research Status. Include every symbol in watchlist exactly once. Action must be Buy, Hold, Wait, or Avoid. For any symbol with researchStatus=not_researched_today, Action must be Wait and Research Status must say Not researched today. Never turn a deterministic or packet risk flag into a portfolio-specific trade instruction.",
     ...(verbose ? [
-      "# Data and Pipeline Audit",
-      "Begin with **Funnel:** using exactly `screened=N; admitted=N; researched=N; incomplete=N; actionable=N; rejected=N` from research.funnel. Then use four labeled paragraphs: **Available Evidence:**, **Missing Evidence:**, **Source Failures:**, and **Confidence Impact:**. Distinguish a genuine lack of evidence from a source or extraction failure. If no source failed, say so explicitly.",
-      "",
+      "After the Watchlist table add `## Research Audit` with exactly five labeled paragraphs: **Funnel:** using `screened=N; admitted=N; researched=N; incomplete=N; actionable=N; rejected=N`; **Packet Completion:** including `capacity=filled/target` from opportunityGate.researchCapacity and naming any excluded core rows; **Field Completeness:** distinguishing packet completion from populated fields; **Material Missing Fields:** naming material nulls; and **Source Failures:** distinguishing extraction gaps from provider failures.",
     ] : []),
-    "",
-    "# Market and AI-Cycle Context",
-    "Exactly three concise bullets labeled **AI Cycle:**, **Market Regime:**, and **Material News:**. Mention only facts that change conviction today; omit low-value calendar items.",
-    "",
-    "# What Could Change the Call",
-    "Use specific earnings, macro events, price levels, verified news, or data gaps that could change today's calls.",
-    options.retry ? `Repair instruction: the previous response failed for exactly this reason: ${options.validationErrors}. Research symbols are ${(compact.researchSymbols ?? []).join(", ") || "none"}; delete every company-analysis reference to any other ticker. Context-only symbols may remain only as factual statements in Market and AI-Cycle Context. Preserve every ${verbose ? "verbose" : "standard"} section and required label; reduce repetition but retain the complete reasoning chain.` : "",
+    options.retry ? `Repair instruction: the previous response failed for exactly this reason: ${options.validationErrors}. Preserve the exact five top-level sections and required tables. Research symbols are ${(compact.researchSymbols ?? []).join(", ") || "none"}; remove unsupported verdicts for any other ticker.` : "",
     "",
     "Synthesis context JSON (structured research packets plus market context):",
     JSON.stringify(compact),
@@ -2154,7 +2180,7 @@ async function postDiscordReport(url, reportDate, markdown, fingerprint) {
 function discordReportSummary(reportDate, markdown, fingerprint) {
   const title = markdown.split("\n").find((line) => /^#\s+/.test(line))?.replace(/^#\s+/, "")
     || `Growth Tech Morning Brief — ${reportDate}`;
-  const verdict = sectionBody(markdown, "Today's Verdict") || "The complete report is attached.";
+  const verdict = sectionBody(markdown, "Executive Summary") || "The complete report is attached.";
   const summary = `**${title}**\n${verdict}\n\nFull verbose report attached. ID: \`${fingerprint.slice(0, 12)}\``;
   return summary.length <= 1800 ? summary : `${summary.slice(0, 1740).trim()}…\n\nFull verbose report attached. ID: \`${fingerprint.slice(0, 12)}\``;
 }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { compactSnapshotForReport, runScheduledBrief, selectResearchCandidates, sendReportEmail, sendReportWebhook, synthesisContext, validateReportCompleteness, validateResearchConsistency } from "../src/index.js";
+import worker, { compactSnapshotForReport, normalizeResearchPacket, runScheduledBrief, selectResearchCandidates, sendReportEmail, sendReportWebhook, synthesisContext, validateReportCompleteness, validateResearchConsistency } from "../src/index.js";
 
 function r2(initial = {}) {
   const objects = new Map(Object.entries(initial));
@@ -43,85 +43,71 @@ function currentNewYorkDate() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 }
 
-function completeReport(symbols = ["NVDA"], detail = "Balanced action is to monitor positioning and catalyst timing.") {
+function completeReport(symbols = ["NVDA"], detail = "Balanced action is to monitor positioning and catalyst timing.", watchlistAction = "Hold") {
   const symbolText = symbols.join(", ");
+  const covered = new Set(symbols);
+  const sectorRow = (sector, members) => {
+    const hasMember = members.some((symbol) => covered.has(symbol));
+    return `| ${sector} | Unavailable | Unavailable | ${hasMember ? "Positive" : "Unavailable"} | ${hasMember ? "Hold" : "Wait"} | ${hasMember ? "Covered price data only" : "No covered symbols"} |`;
+  };
   return [
     "# Growth Tech Morning Brief",
     "",
-    "# Today's Verdict",
-    "- **Verdict:** No high-conviction trade today.",
-    "- **Confidence:** Medium.",
-    `- **Why Today:** ${detail}`,
+    "**Report Mode:** standard",
+    "**Engine Version:** 0.5.7",
     "",
-    "# Decision Reasoning",
-    "**Universe Searched:** The core watchlist and configured discovery screens were checked with liquidity and relevance filters.",
-    "**Opportunity Gate:** Candidates require a fresh event, earnings, a meaningful dislocation, or an extreme trim setup; ranking alone is insufficient.",
-    "**Conclusion:** The strongest setup lacks enough verified evidence and asymmetric risk/reward to justify action today.",
+    "# Executive Summary",
+    "- **AI Cycle:** Insufficient Data; price action cannot establish the cycle.",
+    `- **Key Catalyst:** ${detail}`,
+    "- **Principal Risk:** Missing forward estimates limit directional confidence.",
+    `- **Best Opportunity:** None clears the action gate; ${symbolText} remains a researched near-miss.`,
+    "- **Avoid:** Avoid treating unverified price movement as a fundamental signal.",
     "",
-    "# Opportunities",
-    "No actionable opportunity clears the threshold.",
+    "# Overnight and Market Context",
+    "- **As Of:** 2026-08-05T13:35:00.000Z; regular trading session.",
+    "- **Global Markets:** Mixed; only supplied point-in-time data are used.",
+    "- **Futures:** Available and current in the supplied snapshot.",
+    "- **Rates:** Available; changes should be expressed in basis points.",
+    "- **Dollar:** Available in the supplied snapshot.",
+    "- **Oil:** Available in the supplied snapshot.",
     "",
-    "# Rejected Candidates",
-    `${symbolText} reached review, but the fixture contains no verified catalyst or evidence of a durable market mispricing. A confirmed event and favorable entry would promote it.`,
+    "# AI Cycle Dashboard",
+    "| Segment | Rating | Trend | Evidence | Limitation |",
+    "|---|---|---|---|---|",
+    "| Hyperscaler AI CapEx | Insufficient Data | Unclear | No direct guidance evidence | Price does not measure CapEx |",
+    "| GPU Demand | Insufficient Data | Unclear | No direct demand evidence | Price does not measure demand |",
+    "| AI Cloud | Insufficient Data | Unclear | No utilization evidence | Coverage unavailable |",
+    "| Enterprise AI | Insufficient Data | Unclear | No adoption evidence | Coverage unavailable |",
+    "| Inference | Insufficient Data | Unclear | No utilization evidence | Coverage unavailable |",
     "",
-    "# Market and AI-Cycle Context",
-    "- **AI Cycle:** Insufficient data; price action cannot establish the cycle.",
-    `- **Market Regime:** ${symbolText} price action is supplied, but no broad regime shift is verified.`,
-    "- **Material News:** No verified fresh event changes conviction in this fixture.",
+    "# Sector Scorecard",
+    "| Sector | Fundamentals | Valuation | Momentum | Action | Evidence |",
+    "|---|---|---|---|---|---|",
+    sectorRow("GPU", ["NVDA", "TSM", "AVGO"]),
+    sectorRow("AI Cloud", ["AMZN", "MSFT", "GOOGL", "ORCL"]),
+    sectorRow("GPU Cloud", ["CRWV"]),
+    sectorRow("Networking", ["ANET", "AVGO"]),
+    sectorRow("Cooling", ["VRT"]),
+    sectorRow("Power", ["CEG"]),
+    sectorRow("Cybersecurity", ["FTNT"]),
+    sectorRow("Cloud Software", ["MSFT", "AMZN", "GOOGL", "META", "ORCL"]),
     "",
-    "# What Could Change the Call",
-    "- A verified company catalyst with a measurable price reaction.",
-    "- A material Fed decision or yield reversal.",
-    "- Better fundamental, valuation, and liquidity evidence could change the conclusion.",
+    "# Watchlist",
+    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Historical Percentile | Catalyst | Risk | Action | Research Status |",
+    "|---|---:|---:|---:|---|---|---|---|---|---|",
+    ...symbols.map((symbol) => `| ${symbol} | $110 | +10% | 50% | Unavailable | Unavailable | No verified catalyst | Evidence gap | ${watchlistAction} | Researched |`),
   ].join("\n");
 }
 
 function verboseNoTradeReport(symbols = ["NVDA"]) {
-  const symbolText = symbols.join(", ");
-  return [
-    "# Growth Tech Morning Brief",
-    "**Report Mode:** verbose",
-    "**Engine Version:** 0.5.7",
+  return completeReport(symbols).replace("**Report Mode:** standard", "**Report Mode:** verbose") + [
     "",
-    "# Today's Verdict",
-    "- **Verdict:** No high-conviction trade today.",
-    "- **Confidence:** High because the screened candidates lack a verified, asymmetric setup.",
-    `- **Why Today:** ${symbolText} reached review, but the evidence does not support an actionable entry or exit.`,
-    "",
-    "# Decision Reasoning",
-    "**Universe Searched:** The core watchlist and broad discovery universe were screened for events, earnings, dislocations, valuation extremes, and liquidity.",
-    `**Opportunity Gate:** ${symbolText} entered through a material price move, then faced catalyst, valuation, evidence-quality, and risk/reward checks.`,
-    "**Conclusion:** The move was not tied to verified new fundamental information, so treating it as mispricing would be speculation rather than an evidence-backed trade.",
-    "",
-    "# Opportunities",
-    "- **Threshold Result:** No actionable opportunity clears the absolute trade threshold.",
-    `- **Best Near-Miss:** ${symbolText} was the strongest near-miss because its move was large enough to require investigation.`,
-    "- **Why It Failed:** No verified catalyst, fresh estimate change, or measurable valuation dislocation established favorable expected value.",
-    "- **Portfolio Action:** Hold existing exposure and wait for verified information or a price level that creates asymmetric risk/reward.",
-    "",
-    "# Rejected Candidates",
-    "### NVDA — Watch",
-    "- **Admission Signal:** The daily move exceeded the dislocation threshold.",
-    "- **Evidence Supporting:** Positive price momentum made the move relevant for same-day review.",
-    "- **Evidence Missing or Conflicting:** No direct company catalyst or demand evidence was verified, and valuation evidence does not establish a bargain.",
-    "- **Rejection Reason:** Momentum alone cannot justify a Buy or Sell action.",
-    "- **Promotion Trigger:** Verified company news plus a favorable entry and explicit invalidation level.",
-    "",
-    "# Data and Pipeline Audit",
+    "## Research Audit",
     `**Funnel:** screened=0; admitted=${symbols.length}; researched=${symbols.length}; incomplete=0; actionable=0; rejected=${symbols.length}`,
-    "**Available Evidence:** Current price, daily change, range position, screened news, and available historical valuation were reviewed.",
-    "**Missing Evidence:** Forward estimates, direct demand indicators, and a verified company catalyst are unavailable.",
-    "**Source Failures:** No source failure is hidden; missing items are absent from configured feeds rather than silently treated as negative evidence.",
-    "**Confidence Impact:** Missing catalyst and forward-estimate data raises confidence in No Trade but lowers confidence in any directional thesis.",
-    "",
-    "# Market and AI-Cycle Context",
-    "- **AI Cycle:** Direct CapEx, backlog, utilization, and estimate-revision evidence remains insufficient.",
-    "- **Market Regime:** Price action is mixed and does not independently create a trade signal.",
-    "- **Material News:** No verified event changes the candidate conclusion.",
-    "",
-    "# What Could Change the Call",
-    "- A verified earnings, guidance, contract, regulatory, or estimate-revision event.",
-    "- A larger price dislocation that creates favorable risk/reward with a defined invalidation level.",
+    `**Packet Completion:** capacity=${symbols.length}/${symbols.length}; every admitted packet completed.`,
+    "**Field Completeness:** Packet completion is separate from populated fields; material nulls remain unavailable.",
+    "**Material Missing Fields:** Forward estimates, direct demand indicators, and verified catalysts are unavailable.",
+    "**Source Failures:** None; missing fields are evidence gaps rather than provider failures.",
   ].join("\n");
 }
 
@@ -152,11 +138,11 @@ test("verbose validation applies section-aware research and context-only ticker 
   };
   const wrongCount = validateReportCompleteness(verboseNoTradeReport().replace("screened=0", "screened=99"), ["NVDA"], compact);
   assert.match(wrongCount.errors.join("; "), /funnel count mismatch for screened/);
-  const foreignTicker = validateReportCompleteness(verboseNoTradeReport().replace("Hold existing exposure", "Hold existing GOOGL exposure"), ["NVDA"], compact);
-  assert.match(foreignTicker.errors.join("; "), /ticker reference outside research universe in Opportunities: GOOGL/);
+  const foreignTicker = validateReportCompleteness(verboseNoTradeReport().replace("NVDA remains a researched near-miss", "GOOGL remains a researched near-miss"), ["NVDA"], compact);
+  assert.match(foreignTicker.errors.join("; "), /ticker reference outside research universe in Executive Summary: GOOGL/);
 
   const factualContext = verboseNoTradeReport().replace(
-    "Price action is mixed and does not independently create a trade signal.",
+    "Mixed; only supplied point-in-time data are used.",
     "GOOGL fell 1% in the supplied market data; this does not independently create a trade signal.",
   );
   assert.deepEqual(validateReportCompleteness(factualContext, ["NVDA"], compact), { ok: true, errors: [] });
@@ -183,6 +169,57 @@ test("auto-watchlist fills unused research capacity without clearing the action 
   assert.equal(selected[0].admissionType, "setup_gate");
   assert.equal(selected.filter((row) => row.admissionType === "auto_watchlist").length, 11);
   assert.ok(selected.slice(1).every((row) => row.setup.eligible === false && row.setup.autoWatchlist === true));
+});
+
+test("snapshot-to-report integration fills all 12 research slots from the full core watchlist", () => {
+  const coreSymbols = ["NVDA", "AMZN", "MSFT", "ANET", "CRWV", "AVGO", "META", "GOOGL", "ORCL", "TSM", "VRT", "CEG", "FTNT"];
+  const watchlist = coreSymbols.map((symbol, index) => ({
+    symbol,
+    name: symbol,
+    price: 100 + index,
+    changePercent: index < 3 ? 4 : 0,
+    yearLow: 80,
+    yearHigh: 120,
+    positionIn52WeekRange: 50,
+    valuation: null,
+    reportedGrowth: null,
+    fundamentals: { cacheStatus: "fresh" },
+    missing: false,
+  }));
+  const discovery = ["FSLY", "VREX", "AIOT", "NABL", "AXTI", "CEVA"].map((symbol, index) => ({
+    symbol,
+    name: symbol,
+    price: 20 + index,
+    changePercent: 5 + index,
+    yearLow: 10,
+    yearHigh: 40,
+    positionIn52WeekRange: 50,
+    marketCap: 1_000_000_000,
+    dollarVolume: 30_000_000,
+    discoveryScore: 5,
+    fundamentalCoverage: { status: "available" },
+    missing: false,
+  }));
+  const compact = compactSnapshotForReport({
+    generatedAt: "2026-08-10T20:00:00.000Z",
+    session: "after_hours",
+    coverage: { requested: 13, succeeded: 13, failed: 0 },
+    watchlist,
+    discovery: { status: "available", scanned: 7148, candidates: discovery },
+    eventLedger: { events: [] },
+  });
+
+  assert.equal(compact.opportunityGate.candidates.length, 12);
+  assert.deepEqual(compact.opportunityGate.researchCapacity, {
+    maximum: 12,
+    eligibleUniverse: 19,
+    target: 12,
+    filled: 12,
+    unfilled: 0,
+    excludedCore: [],
+  });
+  assert.equal(compact.opportunityGate.candidates.filter((row) => row.admissionType === "setup_gate").length, 9);
+  assert.equal(compact.opportunityGate.candidates.filter((row) => row.admissionType === "auto_watchlist").length, 3);
 });
 
 test("synthesis exposes a filtered two-level ticker universe while preserving source ledger input", () => {
@@ -307,7 +344,7 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
       assert.equal(geminiUrl.searchParams.get("key"), "gemini-test-key");
       assert.equal(init.headers["x-goog-api-key"], undefined);
       const body = JSON.parse(init.body);
-      assert.match(body.contents[0].parts[0].text, /decision-focused Growth Tech Morning Brief/);
+      assert.match(body.contents[0].parts[0].text, /institutional sell-side Growth Tech Morning Brief/);
       assert.match(body.contents[0].parts[0].text, /No high-conviction trade today/);
       assert.equal(body.generationConfig.maxOutputTokens, 12000);
       assert.deepEqual(body.generationConfig.thinkingConfig, { thinkingLevel: "low" });
@@ -422,7 +459,7 @@ test("DeepSeek route sets an explicit output budget", async () => {
     assert.equal(body.model, "deepseek-v4-flash");
     assert.deepEqual(body.thinking, { type: "disabled" });
     assert.equal(body.max_tokens, 12000);
-    assert.match(body.messages[0].content, /Today's Verdict/);
+    assert.match(body.messages[0].content, /# Executive Summary/);
     return responseJson({
       choices: [{ finish_reason: "stop", message: { role: "assistant", content: markdown } }],
       usage: { completion_tokens: 1400, total_tokens: 3200 },
@@ -455,8 +492,8 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
     assert.equal(url, "https://api.deepseek.com/chat/completions");
     const requestBody = JSON.parse(init.body);
     assert.equal(requestBody.model, "deepseek-v4-pro");
-    assert.match(requestBody.messages[0].content, /Verbose mode is an audit trail/);
-    assert.match(requestBody.messages[0].content, /Data and Pipeline Audit/);
+    assert.match(requestBody.messages[0].content, /exactly five top-level sections/);
+    assert.match(requestBody.messages[0].content, /Research Audit/);
     return responseJson({ choices: [{ finish_reason: "stop", message: { content: markdown } }] });
   }, () => worker.fetch(new Request("https://example.test/run-report", {
     method: "POST",
@@ -512,11 +549,11 @@ test("openai-compatible route uses only the preconfigured HTTPS base URL", async
   assert.equal(result.report.aiModel, "research-model");
 });
 
-test("strict schema rejects a verdict without required confidence", () => {
-  const markdown = completeReport(["NVDA"]).replace("- **Confidence:** Medium.\n", "");
+test("strict schema rejects an Executive Summary without the required AI Cycle bullet", () => {
+  const markdown = completeReport(["NVDA"]).replace("- **AI Cycle:** Insufficient Data; price action cannot establish the cycle.\n", "");
   const validation = validateReportCompleteness(markdown, ["NVDA"]);
   assert.equal(validation.ok, false);
-  assert.match(validation.errors.join("; "), /missing Today's Verdict field: Confidence/);
+  assert.match(validation.errors.join("; "), /missing Executive Summary field: AI Cycle/);
 });
 
 test("strict schema rejects a recap that only has the four section names", () => {
@@ -528,14 +565,13 @@ test("strict schema rejects a recap that only has the four section names", () =>
   ].join("\n\n");
   const validation = validateReportCompleteness(recap, ["NVDA"]);
   assert.equal(validation.ok, false);
-  assert.ok(validation.errors.includes("missing Today's Verdict field: Verdict"));
-  assert.ok(validation.errors.includes("missing Market Context field: Material News"));
-  assert.ok(validation.errors.includes("Opportunities must state that no setup clears the threshold"));
+  assert.ok(validation.errors.includes("missing section: Executive Summary"));
+  assert.ok(validation.errors.includes("missing section: Watchlist"));
 });
 
 test("semantic validation rejects unsupported demand and CapEx conclusions", () => {
   const markdown = completeReport(["NVDA"])
-    .replace("Insufficient data; price action cannot establish the cycle.", "GPU demand remains robust and the CapEx cycle is intact.");
+    .replace("Insufficient Data; price action cannot establish the cycle.", "GPU demand remains robust and the CapEx cycle is intact.");
   const validation = validateReportCompleteness(markdown, ["NVDA"]);
   assert.equal(validation.ok, false);
   assert.ok(validation.errors.includes("unsupported demand claim"));
@@ -584,7 +620,7 @@ test("candidate research runs in bounded batches, persists packets, and feeds co
   assert.ok(researchPrompts.every((prompt) => /Analyze only these batch symbols:/.test(prompt)));
   assert.deepEqual(researchPrompts.map((prompt) => JSON.parse(prompt.split("\nCandidates:\n").at(-1)).length), [2, 2]);
   assert.match(synthesisPrompt, /"schemaVersion":"candidate-research-v1"/);
-  assert.doesNotMatch(synthesisPrompt, /"sectorScorecard"/);
+  assert.match(synthesisPrompt, /"sectorScorecard"/);
   assert.doesNotMatch(synthesisPrompt, /"history"/);
   assert.deepEqual(result.report.research, { screened: 0, admitted: 4, researched: 4, incomplete: 0, actionable: 0, rejected: 4 });
   const stored = JSON.parse(bucket.objects.get("research/2026-08-05.json"));
@@ -594,7 +630,7 @@ test("candidate research runs in bounded batches, persists packets, and feeds co
 
 test("an exhausted research batch becomes visible incomplete evidence instead of aborting synthesis", async () => {
   const bucket = r2();
-  const report = completeReport(["NVDA"], "The incomplete candidate batch is disclosed and no action is taken.");
+  const report = completeReport(["NVDA"], "The incomplete candidate batch is disclosed and no action is taken.", "Wait");
   let researchCalls = 0;
   let synthesisPrompt = "";
 
@@ -621,43 +657,39 @@ test("an exhausted research batch becomes visible incomplete evidence instead of
   assert.equal(JSON.parse(bucket.objects.get("research/2026-08-05.json")).packets[0].status, "incomplete");
 });
 
-test("actionable calls require the symbol to clear the absolute setup gate", () => {
-  const markdown = completeReport(["NVDA"]).replace(
-    "No actionable opportunity clears the threshold.",
-    [
-      "### NVDA — Buy now",
-      "- **Strategic Position:** Buy.",
-      "- **Today's Action:** Buy now.",
-      "- **Confidence:** High.",
-      "- **Entry/Exit Condition:** Enter at market.",
-      "- **Verified Catalyst:** None.",
-      "- **Downside:** Valuation compression.",
-      "- **Invalidation:** Exit below support.",
-    ].join("\n"),
-  );
-  const validation = validateReportCompleteness(markdown, ["NVDA"], { opportunityGate: { candidates: [] } });
-  assert.equal(validation.ok, false);
-  assert.ok(validation.errors.includes("opportunity did not clear absolute setup gate: NVDA"));
+test("structured research blocks Buy now without a verified catalyst", () => {
+  const normalized = normalizeResearchPacket({
+    symbol: "NVDA", gateResult: "pass", todayAction: "Buy now", gateReason: "price move", strategicPosition: "Buy",
+  }, { symbol: "NVDA", sourceType: "core", setup: { verifiedCatalyst: false, dislocation: true, extremeTrim: false } });
+  assert.equal(normalized.gateResult, "fail");
+  assert.equal(normalized.todayAction, "Watch");
+  assert.match(normalized.gateReason, /lacks deterministic catalyst eligibility/);
 });
 
-test("a large move without verified news can be Watch but not Buy now", () => {
-  const markdown = completeReport(["NVDA"]).replace(
-    "No actionable opportunity clears the threshold.",
-    [
-      "### NVDA — Buy now",
-      "- **Strategic Position:** Hold.",
-      "- **Today's Action:** Buy now.",
-      "- **Confidence:** Low.",
-      "- **Entry/Exit Condition:** Wait for confirmation.",
-      "- **Verified Catalyst:** No verified catalyst.",
-      "- **Downside:** Move may be noise.",
-      "- **Invalidation:** Reversal below prior close.",
-    ].join("\n"),
-  );
-  const compact = { opportunityGate: { candidates: [{ symbol: "NVDA", setup: { eligible: true, verifiedCatalyst: false, dislocation: true, extremeTrim: false } }] } };
-  const validation = validateReportCompleteness(markdown, ["NVDA"], compact);
-  assert.equal(validation.ok, false);
-  assert.ok(validation.errors.includes("actionable call lacks verified catalyst: NVDA"));
+test("extreme valuation without holdings becomes a position-size review, not Trim", () => {
+  const normalized = normalizeResearchPacket({
+    symbol: "ANET", gateResult: "pass", todayAction: "Trim", gateReason: "extreme valuation", strategicPosition: "Hold",
+  }, { symbol: "ANET", sourceType: "core", setup: { verifiedCatalyst: false, dislocation: false, extremeTrim: true } });
+  assert.equal(normalized.gateResult, "fail");
+  assert.equal(normalized.todayAction, "Review position size");
+  assert.match(normalized.gateReason, /no holdings or target allocation were supplied/);
+});
+
+test("final validation rejects negative net debt as debt load and portfolio-specific Trim assumptions", () => {
+  const compact = {
+    researchSymbols: ["ANET"],
+    research: { packets: [{
+      symbol: "ANET",
+      sourceSnapshot: {
+        fundamentals: { netDebt: -500_000_000, netDebtStatus: "net_cash" },
+        setup: { verifiedCatalyst: false, extremeTrim: true },
+      },
+    }] },
+  };
+  const invalid = completeReport(["ANET"], "ANET has a debt load and is likely overweight, so sell a portion.");
+  const errors = validateReportCompleteness(invalid, ["ANET"], compact).errors.join("; ");
+  assert.match(errors, /negative netDebt misclassified instead of net cash: ANET/);
+  assert.match(errors, /portfolio-specific Trim assumption without holdings: ANET/);
 });
 
 test("Gemini 404 diagnostics include status and model without exposing the API key", async () => {
@@ -798,11 +830,11 @@ test("missing required sections are rejected", async () => {
     throw new Error(`Unexpected fetch ${url}`);
   }, () => runScheduledBrief({ WATCHLIST: "NVDA", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")));
 
-  assert.match(result.report.error, /missing section: Today's Verdict/);
+  assert.match(result.report.error, /missing section: Executive Summary/);
   assert.equal(bucket.objects.has("reports/2026-08-05.md"), false);
 });
 
-test("short report may omit covered symbols when none merits a setup", async () => {
+test("Watchlist cannot omit a covered core symbol", async () => {
   const bucket = r2();
   const markdown = completeReport(["NVDA"], "This intentionally omits the second symbol.");
 
@@ -813,8 +845,9 @@ test("short report may omit covered symbols when none merits a setup", async () 
     throw new Error(`Unexpected fetch ${url}`);
   }, () => runScheduledBrief({ WATCHLIST: "NVDA,AMZN", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")));
 
-  assert.equal(result.report.generated, true);
-  assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
+  assert.equal(result.report.generated, false);
+  assert.match(result.report.error, /Watchlist missing core symbol: AMZN/);
+  assert.equal(bucket.objects.has("reports/2026-08-05.md"), false);
 });
 
 test("incomplete Gemini response is never written to R2 or delivered", async () => {
@@ -1184,7 +1217,7 @@ test("Discord errors return useful diagnostics without exposing the webhook URL"
 });
 
 
-test("compact report payload excludes raw history and keeps only gated candidates", () => {
+test("compact report payload excludes raw history while retaining the core watchlist", () => {
   const compact = compactSnapshotForReport({
     generatedAt: "2026-08-05T13:35:00.000Z",
     session: "regular_open_plus_5m",
@@ -1196,7 +1229,8 @@ test("compact report payload excludes raw history and keeps only gated candidate
     }],
   });
 
-  assert.equal("watchlist" in compact, false);
+  assert.equal(compact.watchlist.length, 1);
+  assert.equal("history" in compact.watchlist[0], false);
   assert.equal(compact.opportunityGate.candidates[0].symbol, "NVDA");
   assert.equal(compact.opportunityGate.candidates[0].setup.dislocation, true);
 });

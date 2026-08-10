@@ -136,7 +136,9 @@ test("discovery enrichment calculates SEC growth, valuation, and balance-sheet c
     assert.equal(candidate.reportedGrowth.revenueTtmYoY, 25);
     assert.equal(candidate.valuation.trailingPE, 16);
     assert.equal(candidate.valuation.trailingPS, 10);
-    assert.equal(candidate.fundamentals.cashNetDebt, 300_000_000);
+    assert.equal(candidate.fundamentals.netDebt, -300_000_000);
+    assert.equal(candidate.fundamentals.netDebtStatus, "net_cash");
+    assert.match(candidate.fundamentals.netDebtDefinition, /negative value means net cash/);
     assert.deepEqual(discovery.fundamentalsCoverage, { total: 1, available: 1, unavailable: 0, sourceFailures: 0, mappingMissing: 0, tickerMapCacheStatus: "refreshed" });
   } finally {
     globalThis.fetch = originalFetch;
