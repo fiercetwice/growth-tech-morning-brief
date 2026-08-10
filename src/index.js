@@ -34,6 +34,7 @@ const DEFAULT_SEC_REFRESH_LIMIT = 2;
 const DEFAULT_DISCOVERY_SEC_REFRESH_LIMIT = 6;
 const DEFAULT_CORE_NEWS_LIMIT = 3;
 const DEFAULT_RESEARCH_BATCH_SIZE = 3;
+const MAX_RESEARCH_CANDIDATES = 12;
 const DEFAULT_VERBOSE_MAX_TOKENS = 24_000;
 const DEFAULT_STANDARD_MAX_TOKENS = 12_000;
 const DEFAULT_RESEARCH_MAX_TOKENS = 4_000;
@@ -940,8 +941,7 @@ export function toBrief(snapshot) {
   }
   const valid = [...rows, ...discoveredRows].filter((row) => !row.missing);
   const dataQuality = snapshotDataQuality(snapshot);
-  const candidates = valid.filter((row) => row.setup.eligible)
-    .sort((a, b) => b.setup.score - a.setup.score).slice(0, 15);
+  const candidates = selectResearchCandidates(rows, discoveredRows, snapshot.eventLedger);
   const brief = {
     schemaVersion: 7,
     generatedAt: snapshot.generatedAt,
@@ -970,12 +970,50 @@ export function toBrief(snapshot) {
       maximumOpportunities: 8,
       allowedTodayActions: TODAY_ACTIONS,
       defaultVerdict: "No high-conviction trade today",
-      candidates: candidates.slice(0, 15),
+      candidates,
     },
     watchlist: rows,
   };
   brief.markdown = renderMarkdown(brief);
   return brief;
+}
+
+export function selectResearchCandidates(coreRows, discoveryRows, eventLedger, maximum = MAX_RESEARCH_CANDIDATES) {
+  const valid = [...coreRows, ...discoveryRows].filter((row) => !row.missing);
+  const admitted = valid.filter((row) => row.setup?.eligible)
+    .sort((a, b) => (b.setup?.score ?? 0) - (a.setup?.score ?? 0))
+    .slice(0, maximum)
+    .map((row) => ({ ...row, admissionType: "setup_gate", setup: { ...row.setup, admissionType: "setup_gate" } }));
+  if (admitted.length >= maximum) return admitted;
+
+  const selected = new Set(admitted.map((row) => row.symbol));
+  const newEventSymbols = new Set((eventLedger?.events ?? [])
+    .filter((event) => event.delta === "new" && event.symbol)
+    .map((event) => event.symbol));
+  const fillers = coreRows.filter((row) => !row.missing && !selected.has(row.symbol))
+    .sort((a, b) => autoWatchlistPriority(b, newEventSymbols) - autoWatchlistPriority(a, newEventSymbols))
+    .slice(0, maximum - admitted.length)
+    .map((row) => ({
+      ...row,
+      admissionType: "auto_watchlist",
+      setup: {
+        ...row.setup,
+        admissionType: "auto_watchlist",
+        autoWatchlist: true,
+        reasons: [...(row.setup?.reasons ?? []), "auto-watchlist coverage slot"],
+      },
+    }));
+  return [...admitted, ...fillers];
+}
+
+function autoWatchlistPriority(row, newEventSymbols) {
+  const newEvent = newEventSymbols.has(row.symbol) ? 100 : 0;
+  const move = Math.min(20, Math.abs(row.changePercent ?? 0) * 4);
+  const financialCoverage = row.valuation && row.reportedGrowth ? 6 : row.valuation || row.reportedGrowth ? 3 : 0;
+  const rangeExtreme = Number.isFinite(row.positionIn52WeekRange)
+    ? Math.abs(row.positionIn52WeekRange - 50) / 25
+    : 0;
+  return newEvent + move + financialCoverage + rangeExtreme;
 }
 
 export function compactSnapshotForReport(snapshot) {
@@ -1120,7 +1158,7 @@ export async function generateAiReport(env, snapshot, override = null, options =
 }
 
 async function researchCandidates(env, route, compact) {
-  const candidates = (compact.opportunityGate?.candidates ?? []).slice(0, 12);
+  const candidates = (compact.opportunityGate?.candidates ?? []).slice(0, MAX_RESEARCH_CANDIDATES);
   const batchSize = Math.max(1, Math.min(5, Math.round(nonNegativeNumber(env.RESEARCH_BATCH_SIZE, DEFAULT_RESEARCH_BATCH_SIZE)) || DEFAULT_RESEARCH_BATCH_SIZE));
   const batches = [];
   for (let index = 0; index < candidates.length; index += batchSize) batches.push(candidates.slice(index, index + batchSize));
@@ -1147,7 +1185,7 @@ async function researchCandidates(env, route, compact) {
 
 export function validateResearchConsistency(research, candidates) {
   const errors = [];
-  const expected = candidates.slice(0, 12).map((row) => row.symbol);
+  const expected = candidates.slice(0, MAX_RESEARCH_CANDIDATES).map((row) => row.symbol);
   const actual = research.packets.map((packet) => packet.symbol);
   if (new Set(actual).size !== actual.length) errors.push("duplicate research packet symbol");
   for (const symbol of expected) if (!actual.includes(symbol)) errors.push(`missing research packet: ${symbol}`);
@@ -1201,9 +1239,13 @@ async function researchCandidateBatch(env, route, compact, candidates, batchNumb
 }
 
 function candidateResearchPrompt(compact, candidates, options = {}) {
+  const candidateSymbols = new Set(candidates.map((candidate) => candidate.symbol));
+  const earnings = compact.calendars?.earnings;
+  const companyNews = compact.news?.company;
   return [
     "Research this bounded Growth-Tech candidate batch. Return JSON only, without Markdown fences.",
     "Use only the supplied evidence. Do not infer that a headline caused a move unless the linkage is direct.",
+    `Analyze only these batch symbols: ${[...candidateSymbols].join(", ")}. Do not place any other equity ticker in candidate fields; non-candidate market facts are context only.`,
     "Discovery names cannot pass the action gate when valuation, fundamentals, liquidity context, or a verified fresh company catalyst is missing.",
     "Price movement alone may support Watch, never Buy/Sell. Trim requires a verified catalyst or the supplied extremeTrim flag.",
     "Return {\"candidates\":[...]} with exactly one object per supplied symbol and these fields:",
@@ -1211,7 +1253,25 @@ function candidateResearchPrompt(compact, candidates, options = {}) {
     options.retry ? `Repair the previous failure exactly: ${options.validationErrors}` : "",
     `Batch: ${options.batchNumber}`,
     "Market context:",
-    JSON.stringify({ session: compact.session, marketContext: compact.marketContext, calendars: compact.calendars, materialNews: compact.news }),
+    JSON.stringify({
+      session: compact.session,
+      marketContext: compact.marketContext,
+      calendars: compact.calendars ? {
+        ...compact.calendars,
+        earnings: earnings ? {
+          ...earnings,
+          events: (earnings.events ?? []).filter((event) => candidateSymbols.has(event.symbol)),
+          watchlistMatches: (earnings.watchlistMatches ?? []).filter((symbol) => candidateSymbols.has(symbol)),
+        } : earnings,
+      } : compact.calendars,
+      materialNews: compact.news ? {
+        ...compact.news,
+        company: companyNews ? {
+          ...companyNews,
+          items: (companyNews.items ?? []).filter((item) => (item.symbols ?? []).some((symbol) => candidateSymbols.has(symbol))),
+        } : companyNews,
+      } : compact.news,
+    }),
     "Candidates:",
     JSON.stringify(candidates),
   ].filter(Boolean).join("\n");
@@ -1255,6 +1315,7 @@ function normalizeResearchPacket(packet, candidate) {
     sourceSnapshot: {
       symbol: candidate.symbol,
       sourceType: candidate.sourceType,
+      admissionType: candidate.admissionType ?? candidate.setup?.admissionType ?? "setup_gate",
       price: candidate.price,
       changePercent: candidate.changePercent,
       positionIn52WeekRange: candidate.positionIn52WeekRange,
@@ -1300,7 +1361,18 @@ function incompleteResearchPacket(candidate, failure) {
   };
 }
 
-function synthesisContext(compact, research) {
+export function synthesisContext(compact, research) {
+  const researchSymbols = research.packets.map((packet) => packet.symbol);
+  const researchSet = new Set(researchSymbols);
+  const knownSymbols = new Set(Object.keys(CIKS));
+  const contextOnlySymbols = [...symbolsInValue({
+    calendars: compact.calendars,
+    aiCycle: compact.decisionFramework?.aiCycle,
+    eventLedger: compact.eventLedger,
+  })].filter((symbol) => knownSymbols.has(symbol) && !researchSet.has(symbol));
+  const synthesisSymbols = new Set([...researchSymbols, ...contextOnlySymbols]);
+  const eventLedger = filterEventLedgerForSynthesis(compact.eventLedger, synthesisSymbols);
+  const earnings = compact.calendars?.earnings;
   return {
     schemaVersion: compact.schemaVersion,
     engineVersion: compact.engineVersion,
@@ -1310,7 +1382,14 @@ function synthesisContext(compact, research) {
     coverage: compact.coverage,
     dataQuality: compact.dataQuality,
     marketContext: compact.marketContext,
-    calendars: compact.calendars,
+    calendars: compact.calendars ? {
+      ...compact.calendars,
+      earnings: earnings ? {
+        ...earnings,
+        events: (earnings.events ?? []).filter((event) => synthesisSymbols.has(event.symbol)),
+        watchlistMatches: (earnings.watchlistMatches ?? []).filter((symbol) => synthesisSymbols.has(symbol)),
+      } : earnings,
+    } : compact.calendars,
     news: {
       monetaryPolicy: compact.news?.monetaryPolicy,
       company: compact.news?.company ? { ...compact.news.company, items: undefined } : undefined,
@@ -1335,9 +1414,13 @@ function synthesisContext(compact, research) {
       eligibleAfterLiquidityAndRelevance: compact.discovery.eligibleAfterLiquidityAndRelevance,
       filters: compact.discovery.filters,
       fundamentalsCoverage: compact.discovery.fundamentalsCoverage,
-      admittedSymbols: (compact.discovery.candidates ?? []).map((row) => row.symbol),
+      admittedSymbols: research.packets
+        .filter((packet) => packet.sourceSnapshot?.sourceType === "discovery")
+        .map((packet) => packet.symbol),
     } : null,
-    eventLedger: compact.eventLedger,
+    eventLedger,
+    researchSymbols,
+    contextOnlySymbols,
     research: {
       schemaVersion: research.schemaVersion,
       funnel: research.funnel,
@@ -1345,6 +1428,22 @@ function synthesisContext(compact, research) {
       packets: research.packets,
       storage: research.storage,
     },
+  };
+}
+
+function symbolsInValue(value) {
+  return new Set(JSON.stringify(value ?? {}).match(/\b[A-Z.]{2,8}\b/g) ?? []);
+}
+
+function filterEventLedgerForSynthesis(eventLedger, allowedSymbols) {
+  if (!eventLedger) return eventLedger;
+  const events = (eventLedger.events ?? []).filter((event) => !event.symbol || allowedSymbols.has(event.symbol));
+  const retainedIds = new Set(events.map((event) => event.id));
+  return {
+    ...eventLedger,
+    events,
+    delta: Object.fromEntries(Object.entries(eventLedger.delta ?? {})
+      .map(([key, ids]) => [key, (ids ?? []).filter((id) => retainedIds.has(id))])),
   };
 }
 
@@ -1523,6 +1622,7 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
   const rejected = sectionBody(markdown, "Rejected Candidates");
   if (!rejected) errors.push("Rejected Candidates must explain the strongest failed setups");
   validateDecisionAudit(markdown, compact, errors);
+  validateTickerScope(markdown, compact, errors, symbols);
   validateOpportunities(markdown, symbols, compact, errors);
   validateUnsupportedClaims(markdown, compact, errors);
   if (markdown.length < 700) errors.push("report is shorter than the minimum insight length");
@@ -1566,7 +1666,6 @@ function validateDecisionAudit(markdown, compact, errors) {
     }
   }
   validateFunnelAudit(audit, compact, errors);
-  validateTickerScope(markdown, compact, errors);
 }
 
 function validateFunnelAudit(audit, compact, errors) {
@@ -1580,11 +1679,31 @@ function validateFunnelAudit(audit, compact, errors) {
   }
 }
 
-function validateTickerScope(markdown, compact, errors) {
-  const allowed = new Set([...(compact?.research?.packets ?? []).map((packet) => packet.symbol), "SPY"]);
-  const knownEquities = new Set([...Object.keys(CIKS), ...(compact?.discovery?.admittedSymbols ?? [])]);
-  const found = new Set(markdown.match(/\b[A-Z.]{2,8}\b/g) ?? []);
-  for (const token of found) if (knownEquities.has(token) && !allowed.has(token)) errors.push(`ticker reference outside research universe: ${token}`);
+function validateTickerScope(markdown, compact, errors, fallbackSymbols = []) {
+  const packetSymbols = (compact?.research?.packets ?? []).map((packet) => packet.symbol);
+  const researchSymbols = new Set(compact?.researchSymbols ?? (packetSymbols.length ? packetSymbols : fallbackSymbols ?? []));
+  const contextOnlySymbols = new Set(compact?.contextOnlySymbols ?? []);
+  const knownEquities = new Set([...Object.keys(CIKS), ...(compact?.discovery?.admittedSymbols ?? []), ...contextOnlySymbols]);
+  const sections = [...REQUIRED_REPORT_SECTIONS, "Data and Pipeline Audit"];
+  for (const section of sections) {
+    const body = sectionBody(markdown, section);
+    const found = new Set(body.match(/\b[A-Z.]{2,8}\b/g) ?? []);
+    const marketContext = section === "Market and AI-Cycle Context";
+    for (const token of found) {
+      if (!knownEquities.has(token) || token === "SPY" || researchSymbols.has(token)) continue;
+      if (!marketContext || !contextOnlySymbols.has(token)) {
+        errors.push(`ticker reference outside research universe in ${section}: ${token}`);
+      }
+    }
+  }
+
+  const marketContext = sectionBody(markdown, "Market and AI-Cycle Context");
+  for (const line of marketContext.split("\n")) {
+    const symbols = [...contextOnlySymbols].filter((symbol) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(line));
+    if (symbols.length && /\b(?:buy(?: now| on weakness)?|sell|trim|hold|avoid|under(?:valued|rated)|overvalued|mispriced|target price|preferred entry|rating)\b/i.test(line)) {
+      for (const symbol of symbols) errors.push(`context-only ticker received investment judgment: ${symbol}`);
+    }
+  }
 }
 
 function validateOpportunities(markdown, symbols, compact, errors) {
@@ -1701,7 +1820,9 @@ function reportPrompt(compact, options = {}) {
     `Produce an evidence-rich, decision-focused Growth Tech Morning Brief in Markdown in ${compact.reportMode} mode.`,
     "Answer one question: after screening both the core watchlist and a broader movers universe, is there a sufficiently strong, time-sensitive reason to buy, sell, trim, or investigate a stock today?",
     "Do not recommend a trade merely because a stock ranks highest. Default to 'No high-conviction trade today' unless an absolute setup threshold is cleared.",
-    `Use only research.packets. Include at most ${compact.opportunityGate.maximumOpportunities} actionable names. A >=3% move without verified news may be Watch only, never Buy/Sell.`,
+    `Use only research.packets for company analysis. Include at most ${compact.opportunityGate.maximumOpportunities} actionable names. A >=3% move without verified news may be Watch only, never Buy/Sell.`,
+    `Research symbols: ${(compact.researchSymbols ?? []).join(", ") || "none"}. These are the only symbols allowed in Today's Verdict, Decision Reasoning, Opportunities, Rejected Candidates, Data and Pipeline Audit, and What Could Change the Call.`,
+    `Context-only symbols: ${(compact.contextOnlySymbols ?? []).join(", ") || "none"}. They may appear only in Market and AI-Cycle Context, and only as sourced factual context. Never assign them Buy, Hold, Watch, Avoid, Sell, Trim, undervalued/overvalued/mispricing, target-price, preferred-entry, or other investment judgments.`,
     "Only a complete research packet whose gateResult is pass may receive Buy now, Buy on weakness, Trim, or Sell. Incomplete or failed packets must remain Watch/No action and be disclosed.",
     "Buy now, Buy on weakness, and Sell require a verified fresh company event or same-day earnings. Trim requires either that evidence or the supplied extremeTrim flag.",
     "Show the reasoning chain. For each call explain why it was considered, what the market may be mispricing, evidence for and against, strategic position, today's action, confidence, entry/exit condition, catalyst, risk/reward, and falsifiable invalidation.",
@@ -1748,7 +1869,7 @@ function reportPrompt(compact, options = {}) {
     "",
     "# What Could Change the Call",
     "Use specific earnings, macro events, price levels, verified news, or data gaps that could change today's calls.",
-    options.retry ? `Repair instruction: the previous response failed for exactly this reason: ${options.validationErrors}. Preserve every ${verbose ? "verbose" : "standard"} section and required label; reduce repetition but retain the complete reasoning chain.` : "",
+    options.retry ? `Repair instruction: the previous response failed for exactly this reason: ${options.validationErrors}. Research symbols are ${(compact.researchSymbols ?? []).join(", ") || "none"}; delete every company-analysis reference to any other ticker. Context-only symbols may remain only as factual statements in Market and AI-Cycle Context. Preserve every ${verbose ? "verbose" : "standard"} section and required label; reduce repetition but retain the complete reasoning chain.` : "",
     "",
     "Synthesis context JSON (structured research packets plus market context):",
     JSON.stringify(compact),

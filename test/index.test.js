@@ -308,8 +308,9 @@ test("brief excludes raw history and selects P/S for negative earners", () => {
   assert.equal(brief.watchlist[0].valuation.selectedMetric, "trailingPS");
   assert.equal(brief.watchlist[0].valuation.selectedPercentile, 80);
   assert.equal("history" in brief.watchlist[0], false);
-  assert.equal(brief.opportunityGate.candidates.length, 0);
-  assert.match(brief.markdown, /No stock cleared the absolute setup gate/);
+  assert.equal(brief.opportunityGate.candidates.length, 1);
+  assert.equal(brief.opportunityGate.candidates[0].admissionType, "auto_watchlist");
+  assert.match(brief.markdown, /auto-watchlist coverage slot/);
 });
 
 test("brief renders missing valuation percentile as n/a", () => {
@@ -337,7 +338,8 @@ test("brief computes deterministic stock and sector actions from supplied metric
   assert.equal(brief.watchlist[0].action, "Buy");
   assert.equal(brief.decisionFramework.sectorScorecard.GPU.action, "Buy");
   assert.equal(brief.decisionFramework.aiCycle["GPU Demand"].rating, "Insufficient Data");
-  assert.equal(brief.opportunityGate.candidates.length, 0);
+  assert.equal(brief.opportunityGate.candidates.length, 1);
+  assert.equal(brief.opportunityGate.candidates[0].admissionType, "auto_watchlist");
 });
 
 test("brief admits a liquid discovery name with a material event outside the core watchlist", () => {

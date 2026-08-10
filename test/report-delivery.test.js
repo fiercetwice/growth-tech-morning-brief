@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { compactSnapshotForReport, runScheduledBrief, sendReportEmail, sendReportWebhook, validateReportCompleteness, validateResearchConsistency } from "../src/index.js";
+import worker, { compactSnapshotForReport, runScheduledBrief, selectResearchCandidates, sendReportEmail, sendReportWebhook, synthesisContext, validateReportCompleteness, validateResearchConsistency } from "../src/index.js";
 
 function r2(initial = {}) {
   const objects = new Map(Object.entries(initial));
@@ -140,18 +140,78 @@ test("verbose validation requires an auditable no-trade explanation", () => {
   assert.match(silent.errors.join("; "), /silently omitted gated candidate: NVDA/);
 });
 
-test("verbose validation rejects funnel count drift and out-of-scope equities", () => {
+test("verbose validation applies section-aware research and context-only ticker scopes", () => {
   const compact = {
     reportMode: "verbose",
     engineVersion: "0.5.7",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
-    research: { funnel: { screened: 100, admitted: 1, researched: 1, incomplete: 0, actionable: 0, rejected: 1 }, packets: [{ symbol: "NVDA" }] },
+    research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, actionable: 0, rejected: 1 }, packets: [{ symbol: "NVDA" }] },
+    researchSymbols: ["NVDA"],
+    contextOnlySymbols: ["GOOGL"],
   };
   const wrongCount = validateReportCompleteness(verboseNoTradeReport().replace("screened=0", "screened=99"), ["NVDA"], compact);
   assert.match(wrongCount.errors.join("; "), /funnel count mismatch for screened/);
   const foreignTicker = validateReportCompleteness(verboseNoTradeReport().replace("Hold existing exposure", "Hold existing GOOGL exposure"), ["NVDA"], compact);
-  assert.match(foreignTicker.errors.join("; "), /ticker reference outside research universe: GOOGL/);
+  assert.match(foreignTicker.errors.join("; "), /ticker reference outside research universe in Opportunities: GOOGL/);
+
+  const factualContext = verboseNoTradeReport().replace(
+    "Price action is mixed and does not independently create a trade signal.",
+    "GOOGL fell 1% in the supplied market data; this does not independently create a trade signal.",
+  );
+  assert.deepEqual(validateReportCompleteness(factualContext, ["NVDA"], compact), { ok: true, errors: [] });
+
+  const judgedContext = factualContext.replace("GOOGL fell 1%", "GOOGL is undervalued after falling 1%");
+  assert.match(validateReportCompleteness(judgedContext, ["NVDA"], compact).errors.join("; "), /context-only ticker received investment judgment: GOOGL/);
+});
+
+test("auto-watchlist fills unused research capacity without clearing the action gate", () => {
+  const symbols = ["NVDA", "AMZN", "MSFT", "ANET", "CRWV", "AVGO", "META", "GOOGL", "ORCL", "TSM", "VRT", "CEG", "FTNT"];
+  const rows = symbols.map((symbol, index) => ({
+    symbol,
+    price: 100 + index,
+    changePercent: index === 0 ? 4 : 0,
+    positionIn52WeekRange: 50,
+    valuation: { trailingPE: 20 },
+    reportedGrowth: { revenueTtmYoY: 10 },
+    setup: { eligible: index === 0, score: index === 0 ? 2 : 0, reasons: index === 0 ? ["+4% price dislocation"] : [], verifiedCatalyst: false, dislocation: index === 0, extremeTrim: false },
+    missing: false,
+  }));
+  const selected = selectResearchCandidates(rows, [], { events: [] });
+  assert.equal(selected.length, 12);
+  assert.equal(selected[0].symbol, "NVDA");
+  assert.equal(selected[0].admissionType, "setup_gate");
+  assert.equal(selected.filter((row) => row.admissionType === "auto_watchlist").length, 11);
+  assert.ok(selected.slice(1).every((row) => row.setup.eligible === false && row.setup.autoWatchlist === true));
+});
+
+test("synthesis exposes a filtered two-level ticker universe while preserving source ledger input", () => {
+  const fullLedger = {
+    schemaVersion: "event-ledger-v1",
+    events: [
+      { id: "nvda", symbol: "NVDA", delta: "new", title: "NVDA event" },
+      { id: "msft", symbol: "MSFT", delta: "new", title: "MSFT event" },
+      { id: "lite", symbol: "LITE", delta: "new", title: "LITE event" },
+    ],
+    delta: { new: ["nvda", "msft", "lite"], unchanged: [], resolved: [] },
+  };
+  const compact = {
+    schemaVersion: 7,
+    engineVersion: "0.5.7",
+    reportMode: "verbose",
+    calendars: { earnings: { events: [{ symbol: "NVDA" }, { symbol: "MSFT" }, { symbol: "LITE" }], watchlistMatches: ["NVDA", "MSFT"] } },
+    decisionFramework: { aiCycle: { GPU: { evidence: "NVDA +1%, MSFT -1%" } } },
+    opportunityGate: { candidates: [] },
+    discovery: { candidates: [{ symbol: "LITE" }] },
+    eventLedger: fullLedger,
+  };
+  const research = { packets: [{ symbol: "NVDA", sourceSnapshot: { sourceType: "core", setup: {} } }], funnel: {}, batches: [] };
+  const synthesis = synthesisContext(compact, research);
+  assert.deepEqual(synthesis.researchSymbols, ["NVDA"]);
+  assert.deepEqual(synthesis.contextOnlySymbols, ["MSFT"]);
+  assert.deepEqual(synthesis.eventLedger.events.map((event) => event.symbol), ["NVDA", "MSFT"]);
+  assert.deepEqual(synthesis.calendars.earnings.events.map((event) => event.symbol), ["NVDA", "MSFT"]);
+  assert.deepEqual(fullLedger.events.map((event) => event.symbol), ["NVDA", "MSFT", "LITE"]);
 });
 
 test("research consistency rejects duplicate, missing, and inconsistent packets", () => {
@@ -521,6 +581,7 @@ test("candidate research runs in bounded batches, persists packets, and feeds co
   }, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
 
   assert.equal(researchPrompts.length, 2);
+  assert.ok(researchPrompts.every((prompt) => /Analyze only these batch symbols:/.test(prompt)));
   assert.deepEqual(researchPrompts.map((prompt) => JSON.parse(prompt.split("\nCandidates:\n").at(-1)).length), [2, 2]);
   assert.match(synthesisPrompt, /"schemaVersion":"candidate-research-v1"/);
   assert.doesNotMatch(synthesisPrompt, /"sectorScorecard"/);
