@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.5.6 — staged candidate research
+# Growth Tech Morning Brief v0.5.7 — discovery fundamentals and event memory
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -10,7 +10,7 @@ Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/N
 - Federal Reserve official monetary-policy RSS: fresh rate decisions, FOMC statements, projections, and Chair commentary published during the prior seven days.
 - Yahoo Finance's unofficial search-news endpoint: fresh company headlines for covered symbols, including publisher, URL, publication time, and symbol association.
 - Nasdaq's unofficial public full-market stock screener: roughly 7,000 listed companies, including sector, industry, market capitalization, price move, and volume. Growth-Tech equities outside the core watchlist are filtered by market capitalization, dollar liquidity, theme relevance, and abnormal move before Yahoo news enrichment and AI review.
-- SEC EDGAR CompanyFacts: reported revenue, diluted EPS and diluted shares.
+- SEC EDGAR CompanyFacts: reported revenue, diluted EPS, diluted shares, cash and debt. Discovery names use the SEC ticker map plus Nasdaq's screened current price/market cap to calculate current trailing P/E or P/S without extra history requests.
 - Local calculation: reported TTM and latest-quarter revenue/EPS growth, point-in-time trailing P/E and P/S history, and five-year valuation percentiles. A historical date uses only SEC filings published by that date, avoiding look-ahead bias.
 - Absolute opportunity gate: only material fresh events, same-day earnings, moves of at least 3%, or extreme valuation/range trim setups reach AI review. The model may return up to eight genuinely actionable names and defaults to no trade; discovery candidates receive explicit liquidity and missing-data warnings.
 - R2 caches SEC responses for seven days, keeps full dated calculation snapshots, stores compact dated briefs, and saves Gemini-generated Markdown reports.
@@ -109,7 +109,9 @@ Every provider must return a normally completed response. The Worker validates a
 
 `REPORT_MODE` selects `standard` or `verbose` generation and defaults to `verbose` in the deployed configuration. Verbose reports must audit every staged research packet supplied to synthesis (up to 12), expand a No-Trade Opportunities section into threshold/near-miss/failure/portfolio reasoning, and include a Data and Pipeline Audit. Every generated report and R2 metadata record identify the report mode and engine version. Authenticated forced runs may override the mode with `{"forceRegenerate":true,"reportMode":"standard"}` or `{"forceRegenerate":true,"verbose":true}`.
 
-v0.5.6 uses staged generation. Deterministic code screens the full market, then the Worker researches up to 12 admitted candidates in bounded batches (three by default). Each batch returns validated structured JSON covering catalysts, supporting and conflicting evidence, mispricing, risk/reward, missing evidence, invalidation, and the action-gate result. The packets are stored under `research/` in R2. Final synthesis receives those compact packets and the market regime instead of the duplicate raw candidate payload. A failed batch is retried once with its exact validation errors; if it still fails, every affected symbol remains visible as `research incomplete` and cannot receive an actionable call.
+The staged generation introduced in v0.5.6 remains intact. Deterministic code screens the full market, then the Worker researches up to 12 admitted candidates in bounded batches (three by default). Each batch returns validated structured JSON covering catalysts, supporting and conflicting evidence, mispricing, risk/reward, missing evidence, invalidation, and the action-gate result. The packets are stored under `research/` in R2. Final synthesis receives those compact packets and the market regime instead of the duplicate raw candidate payload. A failed batch is retried once with its exact validation errors; if it still fails, every affected symbol remains visible as `research incomplete` and cannot receive an actionable call.
+
+v0.5.7 enriches every admitted discovery candidate with available SEC fundamentals and explicitly separates a genuine extraction/coverage gap from an upstream source failure. It also persists a stable event ledger with `new`, `unchanged`, and `resolved` deltas. Before synthesis and storage, exact funnel invariants are enforced; verbose reports must repeat the supplied funnel counts and cannot introduce an equity outside the researched universe.
 
 Final synthesis uses explicit output budgets: 24,000 tokens in verbose mode and 12,000 in standard mode by default. A failed synthesis is repaired once using the exact provider or schema failure. The previous stored report remains untouched if both attempts fail, and the response identifies report storage, email, and Discord delivery as not attempted.
 
@@ -155,6 +157,7 @@ R2 object layout:
 - `reports/YYYY-MM-DD.md`: AI-generated Markdown report.
 - `reports/latest.md`: latest AI-generated Markdown report. R2 custom metadata includes report date, provider, model, finish reason, output/thinking/total token counts when returned, generation attempt count, generated timestamp, and validation status.
 - `research/YYYY-MM-DD.json` and `research/latest.json`: validated candidate packets, batch attempts, failures, and funnel counts.
+- `events/YYYY-MM-DD.json` and `events/latest.json`: persistent company, earnings, and monetary-policy event IDs with new/unchanged/resolved deltas.
 - `deliveries/YYYY-MM-DD.json`: Discord delivery receipt with success, failure, timestamp, report fingerprint, and attachment diagnostics.
 
 ## Configuration
@@ -165,6 +168,8 @@ R2 object layout:
 - `DISCOVERY_MIN_MARKET_CAP`: minimum market capitalization for discovery; defaults to $250 million.
 - `DISCOVERY_MIN_DOLLAR_VOLUME`: minimum current-session price × volume; defaults to $5 million.
 - `SEC_REFRESH_LIMIT`: maximum uncached or expired SEC network refreshes per invocation; deployed default 2. Fresh cache entries are reused, and an expired entry remains available as stale data when the refresh budget is exhausted. Together with the bounded research pipeline and focused market series, this keeps the full report pipeline within the Workers Free 50-external-subrequest ceiling.
+- `DISCOVERY_SEC_REFRESH_LIMIT`: maximum uncached discovery-company SEC refreshes per invocation; deployed default 6.
+- `CORE_NEWS_LIMIT`: core watchlist names receiving company-news lookups; deployed default 3, prioritized by same-day earnings and then absolute price move. Every core name remains price-screened. On a cold SEC ticker-map refresh with email delivery enabled, one lookup is reserved so the worst-case path remains within the Worker subrequest ceiling.
 - `REPORT_MODE`: `standard` or `verbose`; the deployed default is `verbose`. A request-level override requires `forceRegenerate: true`.
 - `RESEARCH_BATCH_SIZE`: candidate count per independent AI research call; defaults to 3 and is capped at 5.
 - `RESEARCH_MAX_TOKENS`: output budget for each structured research batch; defaults to 4,000.
@@ -187,6 +192,8 @@ R2 object layout:
 - `WEBHOOK_URL`: optional generic endpoint that receives the generated Markdown report. Discord webhook URLs are supported directly for backward compatibility.
 
 Two UTC cron expressions cover daylight-saving time. The Worker checks New York local time, so only the 09:35 ET trigger runs.
+
+See [ROADMAP.md](ROADMAP.md) for the v0.5.8 Target & Mispricing Engine and subsequent calibration, supply-chain, thesis-memory, and portfolio-aware work.
 
 ## Security and data use
 

@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildCalendarContext, buildDiscoveryContext, buildMarketContext, buildSnapshot, buildValuationHistory, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
-  normalizeNasdaqMacroCalendar, normalizeNasdaqStockUniverse, normalizeYahooNews, marketSession, normalizeYahooChart, percentile, quarterlyFacts,
+  buildCalendarContext, buildDiscoveryContext, buildEventLedger, buildMarketContext, buildSnapshot, buildValuationHistory, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
+  normalizeNasdaqMacroCalendar, normalizeNasdaqStockUniverse, normalizeSecTickerMap, normalizeYahooNews, marketSession, normalizeYahooChart, percentile, quarterlyFacts,
   reportedGrowth, toBrief, zonedParts,
 } from "../src/index.js";
 
@@ -102,6 +102,63 @@ test("discovery excludes the core watchlist and enforces liquidity", async () =>
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("discovery enrichment calculates SEC growth, valuation, and balance-sheet context", async () => {
+  const originalFetch = globalThis.fetch;
+  const periods = Array.from({ length: 8 }, (_, index) => ({
+    form: "10-Q", fy: index < 4 ? 2024 : 2025, fp: `Q${(index % 4) + 1}`,
+    start: `${index < 4 ? 2024 : 2025}-${String((index % 4) * 3 + 1).padStart(2, "0")}-01`, end: `${index < 4 ? 2024 : 2025}-${String((index % 4 + 1) * 3).padStart(2, "0")}-28`,
+    filed: `${index < 4 ? 2024 : 2025}-${String(Math.min(12, (index % 4 + 1) * 3 + 1)).padStart(2, "0")}-15`,
+  }));
+  const companyFacts = { entityName: "Lumentum", facts: { "us-gaap": {
+    RevenueFromContractWithCustomerExcludingAssessedTax: { units: { USD: periods.map((row, index) => ({ ...row, val: index < 4 ? 100_000_000 : 125_000_000 })) } },
+    EarningsPerShareDiluted: { units: { "USD/shares": periods.map((row, index) => ({ ...row, val: index < 4 ? 1 : 1.25 })) } },
+    WeightedAverageNumberOfDilutedSharesOutstanding: { units: { shares: periods.map((row) => ({ ...row, val: 10_000_000 })) } },
+    CashAndCashEquivalentsAtCarryingValue: { units: { USD: [{ form: "10-Q", end: "2025-12-31", filed: "2026-02-01", val: 600_000_000 }] } },
+    LongTermDebtNoncurrent: { units: { USD: [{ form: "10-Q", end: "2025-12-31", filed: "2026-02-01", val: 300_000_000 }] } },
+  } } };
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/screener/stocks")) return new Response(JSON.stringify({ data: { rows: [{
+      symbol: "LITE", name: "Lumentum", sector: "Technology", industry: "Communication Equipment",
+      lastsale: "$80", pctchange: "8%", volume: "2000000", marketCap: "5000000000",
+    }] } }), { headers: { "content-type": "application/json" } });
+    if (url.includes("/finance/search")) return new Response(JSON.stringify({ news: [] }), { headers: { "content-type": "application/json" } });
+    if (url === "https://www.sec.gov/files/company_tickers.json") return new Response(JSON.stringify({ 0: { ticker: "LITE", cik_str: 1633978 } }), { headers: { "content-type": "application/json" } });
+    if (url.includes("/CIK0001633978.json")) return new Response(JSON.stringify(companyFacts), { headers: { "content-type": "application/json" } });
+    throw new Error(`Unexpected fetch ${url}`);
+  };
+  try {
+    const discovery = await buildDiscoveryContext({}, new Date("2026-08-05T13:35:00Z"), []);
+    const candidate = discovery.candidates[0];
+    assert.equal(candidate.fundamentalCoverage.status, "available");
+    assert.equal(candidate.reportedGrowth.revenueTtmYoY, 25);
+    assert.equal(candidate.valuation.trailingPE, 16);
+    assert.equal(candidate.valuation.trailingPS, 10);
+    assert.equal(candidate.fundamentals.cashNetDebt, 300_000_000);
+    assert.deepEqual(discovery.fundamentalsCoverage, { total: 1, available: 1, unavailable: 0, sourceFailures: 0, mappingMissing: 0, tickerMapCacheStatus: "refreshed" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("SEC ticker normalization pads CIK values", () => {
+  assert.equal(normalizeSecTickerMap({ 0: { ticker: "lite", cik_str: 1633978 } }).get("LITE"), "0001633978");
+});
+
+test("event ledger keeps stable IDs and classifies snapshot deltas", async () => {
+  const snapshot = {
+    generatedAt: "2026-08-05T13:35:00.000Z",
+    news: { company: { items: [{ title: "LITE wins contract", publishedAt: "2026-08-05T12:00:00.000Z", url: "https://example.test/lite", source: "Reuters", symbols: ["LITE"] }] }, monetaryPolicy: { items: [] } },
+    calendars: { earnings: { events: [], source: "Nasdaq" } },
+  };
+  const first = await buildEventLedger(snapshot, {}, "2026-08-05");
+  const second = await buildEventLedger(snapshot, { BRIEF_BUCKET: { get: async () => ({ json: async () => first }) } }, "2026-08-05");
+  assert.equal(first.events[0].delta, "new");
+  assert.equal(second.events[0].id, first.events[0].id);
+  assert.equal(second.events[0].delta, "unchanged");
+  assert.deepEqual(second.delta.new, []);
 });
 
 test("cold SEC cache obeys the per-invocation external refresh budget", async () => {
@@ -303,5 +360,5 @@ test("brief admits a liquid discovery name with a material event outside the cor
   assert.equal(brief.discovery.candidates[0].symbol, "LITE");
   assert.equal(brief.opportunityGate.candidates[0].symbol, "LITE");
   assert.equal(brief.opportunityGate.candidates[0].setup.verifiedCatalyst, true);
-  assert.match(brief.opportunityGate.candidates[0].risk, /fundamentals and valuation not yet verified/);
+  assert.match(brief.opportunityGate.candidates[0].risk, /fundamental coverage unavailable; valuation unavailable/);
 });

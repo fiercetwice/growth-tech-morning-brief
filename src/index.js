@@ -4,12 +4,13 @@ const FED_MONETARY_RSS = "https://www.federalreserve.gov/feeds/press_monetary.xm
 const YAHOO_SEARCH = "https://query2.finance.yahoo.com/v1/finance/search";
 const NASDAQ_STOCK_SCREENER = "https://api.nasdaq.com/api/screener/stocks";
 const SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts";
+const SEC_COMPANY_TICKERS = "https://www.sec.gov/files/company_tickers.json";
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.6";
+const SERVICE_VERSION = "0.5.7";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -23,13 +24,15 @@ const REQUIRED_REPORT_SECTIONS = [
 const REQUIRED_VERDICT_LABELS = ["Verdict", "Confidence", "Why Today"];
 const REQUIRED_CONTEXT_LABELS = ["AI Cycle", "Market Regime", "Material News"];
 const REQUIRED_REASONING_LABELS = ["Universe Searched", "Opportunity Gate", "Conclusion"];
-const REQUIRED_AUDIT_LABELS = ["Available Evidence", "Missing Evidence", "Source Failures", "Confidence Impact"];
+const REQUIRED_AUDIT_LABELS = ["Funnel", "Available Evidence", "Missing Evidence", "Source Failures", "Confidence Impact"];
 const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Trim", "Sell", "Watch", "No action"];
 const REPORT_MODES = new Set(["standard", "verbose"]);
 const DEFAULT_DISCOVERY_LIMIT = 6;
 const DEFAULT_MIN_MARKET_CAP = 250_000_000;
 const DEFAULT_MIN_DOLLAR_VOLUME = 5_000_000;
 const DEFAULT_SEC_REFRESH_LIMIT = 2;
+const DEFAULT_DISCOVERY_SEC_REFRESH_LIMIT = 6;
+const DEFAULT_CORE_NEWS_LIMIT = 3;
 const DEFAULT_RESEARCH_BATCH_SIZE = 3;
 const DEFAULT_VERBOSE_MAX_TOKENS = 24_000;
 const DEFAULT_STANDARD_MAX_TOKENS = 12_000;
@@ -225,7 +228,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
 
   const symbols = parseSymbols(env.WATCHLIST);
   const secNetworkBudget = { remaining: Math.min(10, Math.round(nonNegativeNumber(env.SEC_REFRESH_LIMIT, DEFAULT_SEC_REFRESH_LIMIT))) };
-  const [results, marketContext, calendars, coreNews, discovery] = await Promise.all([
+  const [results, marketContext, calendars, discovery] = await Promise.all([
     Promise.allSettled(symbols.map(async (symbol) => {
     const chart = await fetchYahooChart(symbol, now, env);
     const fundamentals = await fetchSecFundamentals(symbol, env, now, { networkBudget: secNetworkBudget }).catch((error) => ({
@@ -235,7 +238,6 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
     })),
     buildMarketContext(env, now),
     buildCalendarContext(env, now, symbols),
-    buildNewsContext(env, now, symbols),
     buildDiscoveryContext(env, now, symbols),
   ]);
 
@@ -244,6 +246,14 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
     : { symbol: symbols[index], missing: true, error: result.reason?.message ?? String(result.reason) });
   const succeeded = watchlist.filter((row) => !row.missing).length;
   if (!succeeded) throw new Error("All Yahoo chart requests failed");
+
+  const emailConfigured = Boolean(env.RESEND_API_KEY && env.REPORT_TO_EMAIL && env.REPORT_FROM_EMAIL);
+  const coldTickerMapReserve = emailConfigured && ["refreshed", "failed"].includes(discovery.fundamentalsCoverage?.tickerMapCacheStatus) ? 1 : 0;
+  const coreNewsSymbols = selectCoreNewsSymbols(watchlist, calendars, Math.min(
+    symbols.length,
+    Math.max(0, Math.round(nonNegativeNumber(env.CORE_NEWS_LIMIT, DEFAULT_CORE_NEWS_LIMIT)) - coldTickerMapReserve),
+  ));
+  const coreNews = await buildNewsContext(env, now, coreNewsSymbols);
 
   const discoverySymbols = (discovery.candidates ?? []).map((row) => row.symbol);
   const discoveryNews = discovery.news?.items ?? [];
@@ -258,7 +268,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
   };
 
   const snapshot = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     generatedAt: now.toISOString(),
     session: marketSession(now),
     sources: {
@@ -279,6 +289,8 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
     watchlist,
   };
 
+  snapshot.eventLedger = await buildEventLedger(snapshot, env, ny.date);
+
   if (env.BRIEF_BUCKET?.put) {
     const body = JSON.stringify(snapshot, null, 2);
     const briefBody = JSON.stringify(toBrief(snapshot), null, 2);
@@ -287,6 +299,8 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
       env.BRIEF_BUCKET.put("snapshots/latest.json", body, { httpMetadata: { contentType: "application/json" } }),
       env.BRIEF_BUCKET.put(`briefs/${ny.date}.json`, briefBody, { httpMetadata: { contentType: "application/json" } }),
       env.BRIEF_BUCKET.put("briefs/latest.json", briefBody, { httpMetadata: { contentType: "application/json" } }),
+      env.BRIEF_BUCKET.put(`events/${ny.date}.json`, JSON.stringify(snapshot.eventLedger, null, 2), { httpMetadata: { contentType: "application/json" } }),
+      env.BRIEF_BUCKET.put("events/latest.json", JSON.stringify(snapshot.eventLedger, null, 2), { httpMetadata: { contentType: "application/json" } }),
     ]);
   }
   return snapshot;
@@ -348,6 +362,64 @@ export async function buildNewsContext(env, now = new Date(), symbols = []) {
   };
 }
 
+function selectCoreNewsSymbols(watchlist, calendars, limit) {
+  if (!limit) return [];
+  const earnings = new Set(calendars?.earnings?.watchlistMatches ?? []);
+  return [...watchlist].filter((row) => !row.missing).sort((a, b) => {
+    const earningsDelta = Number(earnings.has(b.symbol)) - Number(earnings.has(a.symbol));
+    return earningsDelta || Math.abs(b.changePercent ?? 0) - Math.abs(a.changePercent ?? 0);
+  }).slice(0, limit).map((row) => row.symbol);
+}
+
+export async function buildEventLedger(snapshot, env, date = snapshot.generatedAt?.slice(0, 10)) {
+  const events = [];
+  for (const item of snapshot.news?.company?.items ?? []) {
+    for (const symbol of item.symbols ?? [null]) events.push(eventRecord("company_news", symbol, item.title, item.publishedAt, item.url, item.source));
+  }
+  for (const item of snapshot.calendars?.earnings?.events ?? []) {
+    events.push(eventRecord("earnings", item.symbol, `${item.symbol} earnings${item.time ? ` ${item.time}` : ""}`, date, null, snapshot.calendars.earnings.source));
+  }
+  for (const item of snapshot.news?.monetaryPolicy?.items ?? []) {
+    events.push(eventRecord(item.kind ?? "monetary_policy", null, item.title, item.publishedAt, item.url, item.source));
+  }
+  const deduped = events.filter((item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index);
+  let previous = null;
+  if (env.BRIEF_BUCKET?.get) {
+    try {
+      const object = await env.BRIEF_BUCKET.get("events/latest.json");
+      if (object) previous = await object.json();
+    } catch (error) {
+      console.warn(`Event ledger history unavailable: ${errorMessage(error)}`);
+    }
+  }
+  const previousIds = new Set((previous?.events ?? []).map((item) => item.id));
+  const currentIds = new Set(deduped.map((item) => item.id));
+  return {
+    schemaVersion: "event-ledger-v1",
+    asOf: snapshot.generatedAt,
+    events: deduped.map((item) => ({ ...item, delta: previousIds.has(item.id) ? "unchanged" : "new" })),
+    delta: {
+      new: deduped.filter((item) => !previousIds.has(item.id)).map((item) => item.id),
+      unchanged: deduped.filter((item) => previousIds.has(item.id)).map((item) => item.id),
+      resolved: (previous?.events ?? []).filter((item) => !currentIds.has(item.id)).map((item) => item.id),
+    },
+  };
+}
+
+function eventRecord(type, symbol, title, occurredAt, url, source) {
+  const identity = [type, symbol ?? "market", url ?? title ?? "untitled", occurredAt ?? "undated"].join("|");
+  return { id: `evt_${stableHash(identity)}`, type, symbol, title, occurredAt, url, source };
+}
+
+function stableHash(value) {
+  let hash = 2166136261;
+  for (const character of String(value)) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 export async function buildDiscoveryContext(env, now = new Date(), coreSymbols = []) {
   if (String(env.DISCOVERY_ENABLED ?? "true").toLowerCase() === "false") {
     return { status: "disabled", source: "Nasdaq full-market stock screener (unofficial public endpoint)", asOf: null, scanned: 0, candidates: [], news: { items: [] } };
@@ -368,6 +440,7 @@ export async function buildDiscoveryContext(env, now = new Date(), coreSymbols =
     const newsSettled = await Promise.allSettled(candidates.map(async (row) => normalizeYahooNews(await fetchYahooNews(row.symbol, env), row.symbol, now).slice(0, 3)));
     const newsItems = newsSettled.flatMap((result) => result.status === "fulfilled" ? result.value : []);
     for (const row of candidates) row.news = newsItems.filter((item) => item.symbols?.includes(row.symbol)).slice(0, 3);
+    const fundamentalsCoverage = await enrichDiscoveryCandidates(candidates, env, now);
     return {
       status: "available",
       source: "Nasdaq full-market stock screener (unofficial public endpoint)",
@@ -376,11 +449,100 @@ export async function buildDiscoveryContext(env, now = new Date(), coreSymbols =
       eligibleAfterLiquidityAndRelevance: candidates.length,
       filters: { minMarketCap, minDollarVolume, maximumCandidates: limit },
       candidates,
+      fundamentalsCoverage,
       news: { items: newsItems },
     };
   } catch (error) {
     return { status: "unavailable", source: "Nasdaq full-market stock screener (unofficial public endpoint)", asOf: null, scanned: 0, candidates: [], news: { items: [] }, reason: errorMessage(error) };
   }
+}
+
+async function enrichDiscoveryCandidates(candidates, env, now) {
+  const coverage = { total: candidates.length, available: 0, unavailable: 0, sourceFailures: 0, mappingMissing: 0, tickerMapCacheStatus: "not_required" };
+  if (!candidates.length) return coverage;
+  let cikByTicker;
+  try {
+    const tickerMap = await fetchSecTickerMap(env, now);
+    cikByTicker = tickerMap.values;
+    coverage.tickerMapCacheStatus = tickerMap.cacheStatus;
+  } catch (error) {
+    for (const row of candidates) row.fundamentalCoverage = { status: "source_failure", reason: errorMessage(error) };
+    coverage.sourceFailures = candidates.length;
+    coverage.tickerMapCacheStatus = "failed";
+    return coverage;
+  }
+  const networkBudget = { remaining: Math.min(25, Math.round(nonNegativeNumber(env.DISCOVERY_SEC_REFRESH_LIMIT, DEFAULT_DISCOVERY_SEC_REFRESH_LIMIT))) };
+  const results = await Promise.allSettled(candidates.map(async (row) => {
+    const cik = cikByTicker.get(row.symbol);
+    if (!cik) return { row, status: "mapping_missing", reason: "SEC ticker-to-CIK mapping unavailable" };
+    try {
+      const facts = await fetchSecFundamentals(row.symbol, env, now, { cik, networkBudget });
+      if (!facts.available) {
+        const status = /budget exhausted/i.test(facts.reason ?? "") ? "source_failure" : "extraction_gap";
+        return { row, status, reason: facts.reason ?? "SEC filing lacks usable revenue/EPS facts", facts };
+      }
+      return { row, status: "available", facts };
+    } catch (error) {
+      return { row, status: "source_failure", reason: errorMessage(error) };
+    }
+  }));
+  for (const settled of results) {
+    const result = settled.status === "fulfilled" ? settled.value : null;
+    if (!result) continue;
+    const { row, facts, status, reason } = result;
+    const growth = facts?.available ? reportedGrowth(facts) : null;
+    row.fundamentalCoverage = { status, source: "SEC EDGAR CompanyFacts", reason: reason ?? null, asOf: latestTimestamp([facts?.balanceSheet?.asOf, growth?.asOf]) };
+    if (status === "available") {
+      const ttmRevenue = sumLastFour(facts.quarterlyRevenue);
+      const ttmEps = sumLastFour(facts.quarterlyEps);
+      row.valuation = {
+        trailingPE: ttmEps > 0 ? round(row.price / ttmEps) : null,
+        trailingPS: ttmRevenue > 0 && row.marketCap > 0 ? round(row.marketCap / ttmRevenue) : null,
+        selectedMetric: ttmEps > 0 ? "trailingPE" : "trailingPS",
+        selectedPercentile: null,
+        fundamentalAsOf: row.fundamentalCoverage.asOf,
+        basis: "current Nasdaq screened price/market cap with trailing SEC filings; no historical percentile",
+      };
+      row.reportedGrowth = growth;
+      row.fundamentals = {
+        ttmRevenue: round(ttmRevenue),
+        ttmEps: round(ttmEps),
+        cash: facts.balanceSheet?.cash ?? null,
+        debt: facts.balanceSheet?.debt ?? null,
+        cashNetDebt: finitePair(facts.balanceSheet?.cash, facts.balanceSheet?.debt) ? round(facts.balanceSheet.cash - facts.balanceSheet.debt) : null,
+        asOf: row.fundamentalCoverage.asOf,
+        cacheStatus: facts.cacheStatus ?? null,
+      };
+      coverage.available += 1;
+    } else if (status === "source_failure") coverage.sourceFailures += 1;
+    else if (status === "mapping_missing") coverage.mappingMissing += 1;
+    else coverage.unavailable += 1;
+  }
+  return coverage;
+}
+
+async function fetchSecTickerMap(env, now) {
+  const cacheKey = "sec/company_tickers.json";
+  if (env.BRIEF_BUCKET?.get) {
+    const cached = await env.BRIEF_BUCKET.get(cacheKey);
+    if (cached && (!cached.uploaded || now.getTime() - new Date(cached.uploaded).getTime() < 30 * 86400_000)) {
+      return { values: normalizeSecTickerMap(await cached.json()), cacheStatus: "fresh" };
+    }
+  }
+  const response = await fetch(SEC_COMPANY_TICKERS, { headers: { accept: "application/json", "user-agent": env.SEC_USER_AGENT || "growth-tech-morning-brief research@example.com" } });
+  if (!response.ok) throw new Error(`SEC ticker map failed (${response.status})`);
+  const body = await response.json();
+  if (env.BRIEF_BUCKET?.put) await env.BRIEF_BUCKET.put(cacheKey, JSON.stringify(body), { httpMetadata: { contentType: "application/json" } });
+  return { values: normalizeSecTickerMap(body), cacheStatus: "refreshed" };
+}
+
+export function normalizeSecTickerMap(body) {
+  return new Map(Object.values(body ?? {}).filter((row) => row?.ticker && Number.isFinite(Number(row?.cik_str)))
+    .map((row) => [String(row.ticker).toUpperCase(), String(row.cik_str).padStart(10, "0")]));
+}
+
+function sumLastFour(rows = []) {
+  return rows.length >= 4 ? rows.slice(-4).reduce((sum, row) => sum + row.value, 0) : null;
 }
 
 async function fetchNasdaqStockUniverse(env) {
@@ -633,7 +795,12 @@ function snapshotDataQuality(snapshot) {
     if (status && status in fundamentalCache) fundamentalCache[status] += 1;
     else fundamentalCache.missing += 1;
   }
-  return { categories, available, total: Object.keys(categories).length, complete: available === Object.keys(categories).length, fundamentalCache };
+  const discoveryFundamentals = snapshot.discovery?.fundamentalsCoverage ?? { total: 0, available: 0, unavailable: 0, sourceFailures: 0, mappingMissing: 0 };
+  const discoveryCoverageStatus = discoveryFundamentals.total === 0 ? "not_applicable"
+    : discoveryFundamentals.available === discoveryFundamentals.total ? "complete"
+      : discoveryFundamentals.sourceFailures > 0 ? "source_failure"
+        : "coverage_gap";
+  return { categories, available, total: Object.keys(categories).length, complete: available === Object.keys(categories).length, fundamentalCache, discoveryFundamentals: { ...discoveryFundamentals, status: discoveryCoverageStatus } };
 }
 
 function latestTimestamp(values) {
@@ -776,7 +943,7 @@ export function toBrief(snapshot) {
   const candidates = valid.filter((row) => row.setup.eligible)
     .sort((a, b) => b.setup.score - a.setup.score).slice(0, 15);
   const brief = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     generatedAt: snapshot.generatedAt,
     session: snapshot.session,
     coverage: snapshot.coverage,
@@ -794,8 +961,10 @@ export function toBrief(snapshot) {
       scanned: snapshot.discovery?.scanned ?? 0,
       eligibleAfterLiquidityAndRelevance: snapshot.discovery?.eligibleAfterLiquidityAndRelevance ?? 0,
       filters: snapshot.discovery?.filters ?? null,
+      fundamentalsCoverage: snapshot.discovery?.fundamentalsCoverage ?? null,
       candidates: discoveredRows,
     },
+    eventLedger: snapshot.eventLedger ?? null,
     opportunityGate: {
       rule: "No actionable trade merely because it ranks highest. Action requires a verified fresh event, same-day earnings, a >=3% dislocation, or an extreme valuation/range trim setup. Discovery names require explicit liquidity and data-quality review.",
       maximumOpportunities: 8,
@@ -823,6 +992,7 @@ export function compactSnapshotForReport(snapshot) {
     decisionFramework: brief.decisionFramework,
     opportunityGate: brief.opportunityGate,
     discovery: brief.discovery,
+    eventLedger: brief.eventLedger,
   };
 }
 
@@ -843,15 +1013,19 @@ function compactDiscoveryRow(row) {
     screen: row.screen,
     discoveryScore: row.discoveryScore,
     sourceType: "discovery",
-    valuation: null,
-    reportedGrowth: null,
+    valuation: row.valuation ?? null,
+    reportedGrowth: row.reportedGrowth ?? null,
+    fundamentals: row.fundamentals ?? null,
+    fundamentalCoverage: row.fundamentalCoverage ?? { status: "unavailable", reason: "discovery enrichment not run" },
     news: row.news ?? [],
     missing: false,
   };
 }
 
 function discoveryRiskFor(row) {
-  const risks = ["discovery candidate; fundamentals and valuation not yet verified"];
+  const risks = ["discovery candidate; independent action-gate review required"];
+  if (row.fundamentalCoverage?.status !== "available") risks.push(`fundamental coverage ${row.fundamentalCoverage?.status ?? "unavailable"}`);
+  if (!row.valuation) risks.push("valuation unavailable");
   if ((row.marketCap ?? Infinity) < 1_000_000_000) risks.push("sub-$1B market capitalization");
   if ((row.dollarVolume ?? Infinity) < 20_000_000) risks.push("limited daily dollar liquidity");
   if (!row.news?.length) risks.push("no fresh verified headline");
@@ -885,6 +1059,8 @@ export async function generateAiReport(env, snapshot, override = null, options =
   compact.reportMode = selectedReportMode(env, options.reportMode);
   compact.engineVersion = SERVICE_VERSION;
   const research = await researchCandidates(env, route, compact);
+  const researchConsistency = validateResearchConsistency(research, compact.opportunityGate?.candidates ?? []);
+  if (!researchConsistency.ok) throw new Error(`Research funnel consistency failed: ${researchConsistency.errors.join("; ")}`);
   research.storage = await storeResearchPackets(env, compact, research);
   const synthesis = synthesisContext(compact, research);
   const requiredSymbols = research.packets.map((packet) => packet.symbol);
@@ -969,6 +1145,19 @@ async function researchCandidates(env, route, compact) {
   };
 }
 
+export function validateResearchConsistency(research, candidates) {
+  const errors = [];
+  const expected = candidates.slice(0, 12).map((row) => row.symbol);
+  const actual = research.packets.map((packet) => packet.symbol);
+  if (new Set(actual).size !== actual.length) errors.push("duplicate research packet symbol");
+  for (const symbol of expected) if (!actual.includes(symbol)) errors.push(`missing research packet: ${symbol}`);
+  for (const symbol of actual) if (!expected.includes(symbol)) errors.push(`research packet outside admitted universe: ${symbol}`);
+  if (research.funnel.admitted !== actual.length) errors.push(`admitted ${research.funnel.admitted} != packets ${actual.length}`);
+  if (research.funnel.researched + research.funnel.incomplete !== research.funnel.admitted) errors.push("researched + incomplete != admitted");
+  if (research.funnel.actionable + research.funnel.rejected !== research.funnel.admitted) errors.push("actionable + rejected != admitted");
+  return { ok: errors.length === 0, errors };
+}
+
 async function researchCandidateBatch(env, route, compact, candidates, batchNumber) {
   const failures = [];
   for (let attempt = 1; attempt <= MAX_AI_ATTEMPTS; attempt += 1) {
@@ -1050,7 +1239,7 @@ function validateResearchBatch(parsed, candidates) {
 
 function normalizeResearchPacket(packet, candidate) {
   const discoveryBlocked = candidate?.sourceType === "discovery"
-    && (!candidate?.valuation || !candidate?.reportedGrowth || !candidate?.setup?.verifiedCatalyst);
+    && (!discoveryFinancialsComplete(candidate) || !candidate?.setup?.verifiedCatalyst);
   const actionable = ["Buy now", "Buy on weakness", "Sell"].includes(packet.todayAction)
     ? candidate?.setup?.verifiedCatalyst
     : packet.todayAction === "Trim"
@@ -1074,10 +1263,19 @@ function normalizeResearchPacket(packet, candidate) {
       relativeVolume: candidate.relativeVolume,
       valuation: candidate.valuation,
       reportedGrowth: candidate.reportedGrowth,
+      fundamentals: candidate.fundamentals,
+      fundamentalCoverage: candidate.fundamentalCoverage,
       setup: candidate.setup,
       news: candidate.news,
     },
   };
+}
+
+function discoveryFinancialsComplete(candidate) {
+  const valuationAvailable = Number.isFinite(candidate?.valuation?.trailingPE) || Number.isFinite(candidate?.valuation?.trailingPS);
+  const growthAvailable = ["revenueTtmYoY", "revenueLatestQuarterYoY", "epsTtmYoY", "epsLatestQuarterYoY"]
+    .some((field) => Number.isFinite(candidate?.reportedGrowth?.[field]));
+  return candidate?.fundamentalCoverage?.status === "available" && valuationAvailable && growthAvailable;
 }
 
 function incompleteResearchPacket(candidate, failure) {
@@ -1136,8 +1334,10 @@ function synthesisContext(compact, research) {
       scanned: compact.discovery.scanned,
       eligibleAfterLiquidityAndRelevance: compact.discovery.eligibleAfterLiquidityAndRelevance,
       filters: compact.discovery.filters,
+      fundamentalsCoverage: compact.discovery.fundamentalsCoverage,
       admittedSymbols: (compact.discovery.candidates ?? []).map((row) => row.symbol),
     } : null,
+    eventLedger: compact.eventLedger,
     research: {
       schemaVersion: research.schemaVersion,
       funnel: research.funnel,
@@ -1365,6 +1565,26 @@ function validateDecisionAudit(markdown, compact, errors) {
       }
     }
   }
+  validateFunnelAudit(audit, compact, errors);
+  validateTickerScope(markdown, compact, errors);
+}
+
+function validateFunnelAudit(audit, compact, errors) {
+  const expected = compact?.research?.funnel;
+  if (!expected) return;
+  const funnelLine = audit.split("\n").find((line) => /\*{0,2}Funnel\*{0,2}\s*:/i.test(line)) ?? "";
+  for (const field of ["screened", "admitted", "researched", "incomplete", "actionable", "rejected"]) {
+    const match = new RegExp(`${field}\\s*[=:]\\s*(\\d+)`, "i").exec(funnelLine);
+    if (!match) errors.push(`Data and Pipeline Audit Funnel missing count: ${field}`);
+    else if (expected[field] !== null && Number(match[1]) !== Number(expected[field])) errors.push(`funnel count mismatch for ${field}: expected ${expected[field]}, received ${match[1]}`);
+  }
+}
+
+function validateTickerScope(markdown, compact, errors) {
+  const allowed = new Set([...(compact?.research?.packets ?? []).map((packet) => packet.symbol), "SPY"]);
+  const knownEquities = new Set([...Object.keys(CIKS), ...(compact?.discovery?.admittedSymbols ?? [])]);
+  const found = new Set(markdown.match(/\b[A-Z.]{2,8}\b/g) ?? []);
+  for (const token of found) if (knownEquities.has(token) && !allowed.has(token)) errors.push(`ticker reference outside research universe: ${token}`);
 }
 
 function validateOpportunities(markdown, symbols, compact, errors) {
@@ -1519,7 +1739,7 @@ function reportPrompt(compact, options = {}) {
     "",
     ...(verbose ? [
       "# Data and Pipeline Audit",
-      "Use four labeled paragraphs: **Available Evidence:**, **Missing Evidence:**, **Source Failures:**, and **Confidence Impact:**. Distinguish a genuine lack of evidence from a source or extraction failure. If no source failed, say so explicitly.",
+      "Begin with **Funnel:** using exactly `screened=N; admitted=N; researched=N; incomplete=N; actionable=N; rejected=N` from research.funnel. Then use four labeled paragraphs: **Available Evidence:**, **Missing Evidence:**, **Source Failures:**, and **Confidence Impact:**. Distinguish a genuine lack of evidence from a source or extraction failure. If no source failed, say so explicitly.",
       "",
     ] : []),
     "",
@@ -1991,7 +2211,7 @@ export function normalizeYahooChart(result) {
 }
 
 async function fetchSecFundamentals(symbol, env, now, options = {}) {
-  const cik = CIKS[symbol];
+  const cik = options.cik ?? CIKS[symbol];
   if (!cik) return { available: false, reason: "CIK not configured" };
   const cacheKey = `sec/companyfacts/${cik}.json`;
   let body = null;
@@ -2044,13 +2264,30 @@ export function extractSecFundamentals(body) {
   const quarterlyRevenue = quarterlyFacts(revenue, { deriveFourthQuarter: true });
   const quarterlyEps = quarterlyFacts(eps, { deriveFourthQuarter: true });
   const quarterlyShares = quarterlyFacts(shares);
+  const cash = latestInstantFact(factUnits(gaap, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"], "USD"));
+  const debtCurrent = latestInstantFact(factUnits(gaap, ["ShortTermBorrowings", "LongTermDebtCurrent"], "USD"));
+  const debtLongTerm = latestInstantFact(factUnits(gaap, ["LongTermDebtNoncurrent", "LongTermDebt"], "USD"));
+  const debt = [debtCurrent?.value, debtLongTerm?.value].filter(Number.isFinite).reduce((sum, value) => sum + value, 0);
   return {
     available: Boolean(quarterlyRevenue.length || quarterlyEps.length),
     entityName: body?.entityName ?? null,
     quarterlyRevenue,
     quarterlyEps,
     quarterlyShares,
+    balanceSheet: {
+      cash: cash?.value ?? null,
+      debt: debtCurrent || debtLongTerm ? debt : null,
+      asOf: [cash?.filed, debtCurrent?.filed, debtLongTerm?.filed].filter(Boolean).sort().at(-1) ?? null,
+      basis: "latest reported SEC balance-sheet facts",
+    },
   };
+}
+
+function latestInstantFact(rows) {
+  return rows.filter((row) => row.end && row.filed && Number.isFinite(Number(row.val)))
+    .sort((a, b) => a.filed.localeCompare(b.filed) || a.end.localeCompare(b.end))
+    .map((row) => ({ end: row.end, filed: row.filed, value: Number(row.val), form: row.form }))
+    .at(-1) ?? null;
 }
 
 function factUnits(gaap, tags, unit) {

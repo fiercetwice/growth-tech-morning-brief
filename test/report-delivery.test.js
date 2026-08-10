@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { compactSnapshotForReport, runScheduledBrief, sendReportEmail, sendReportWebhook, validateReportCompleteness } from "../src/index.js";
+import worker, { compactSnapshotForReport, runScheduledBrief, sendReportEmail, sendReportWebhook, validateReportCompleteness, validateResearchConsistency } from "../src/index.js";
 
 function r2(initial = {}) {
   const objects = new Map(Object.entries(initial));
@@ -37,6 +37,10 @@ function yahooChart(symbol = "NVDA") {
 
 function responseJson(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+function currentNewYorkDate() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 }
 
 function completeReport(symbols = ["NVDA"], detail = "Balanced action is to monitor positioning and catalyst timing.") {
@@ -77,7 +81,7 @@ function verboseNoTradeReport(symbols = ["NVDA"]) {
   return [
     "# Growth Tech Morning Brief",
     "**Report Mode:** verbose",
-    "**Engine Version:** 0.5.6",
+    "**Engine Version:** 0.5.7",
     "",
     "# Today's Verdict",
     "- **Verdict:** No high-conviction trade today.",
@@ -104,6 +108,7 @@ function verboseNoTradeReport(symbols = ["NVDA"]) {
     "- **Promotion Trigger:** Verified company news plus a favorable entry and explicit invalidation level.",
     "",
     "# Data and Pipeline Audit",
+    `**Funnel:** screened=0; admitted=${symbols.length}; researched=${symbols.length}; incomplete=0; actionable=0; rejected=${symbols.length}`,
     "**Available Evidence:** Current price, daily change, range position, screened news, and available historical valuation were reviewed.",
     "**Missing Evidence:** Forward estimates, direct demand indicators, and a verified company catalyst are unavailable.",
     "**Source Failures:** No source failure is hidden; missing items are absent from configured feeds rather than silently treated as negative evidence.",
@@ -123,8 +128,9 @@ function verboseNoTradeReport(symbols = ["NVDA"]) {
 test("verbose validation requires an auditable no-trade explanation", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.6",
+    engineVersion: "0.5.7",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
+    research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, actionable: 0, rejected: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
   assert.deepEqual(valid, { ok: true, errors: [] });
@@ -132,6 +138,32 @@ test("verbose validation requires an auditable no-trade explanation", () => {
   const silent = validateReportCompleteness(verboseNoTradeReport().replace(/NVDA/g, "the candidate"), ["NVDA"], compact);
   assert.equal(silent.ok, false);
   assert.match(silent.errors.join("; "), /silently omitted gated candidate: NVDA/);
+});
+
+test("verbose validation rejects funnel count drift and out-of-scope equities", () => {
+  const compact = {
+    reportMode: "verbose",
+    engineVersion: "0.5.7",
+    opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
+    discovery: { admittedSymbols: [] },
+    research: { funnel: { screened: 100, admitted: 1, researched: 1, incomplete: 0, actionable: 0, rejected: 1 }, packets: [{ symbol: "NVDA" }] },
+  };
+  const wrongCount = validateReportCompleteness(verboseNoTradeReport().replace("screened=0", "screened=99"), ["NVDA"], compact);
+  assert.match(wrongCount.errors.join("; "), /funnel count mismatch for screened/);
+  const foreignTicker = validateReportCompleteness(verboseNoTradeReport().replace("Hold existing exposure", "Hold existing GOOGL exposure"), ["NVDA"], compact);
+  assert.match(foreignTicker.errors.join("; "), /ticker reference outside research universe: GOOGL/);
+});
+
+test("research consistency rejects duplicate, missing, and inconsistent packets", () => {
+  const candidates = [{ symbol: "NVDA" }, { symbol: "ANET" }];
+  const result = validateResearchConsistency({
+    packets: [{ symbol: "NVDA" }, { symbol: "NVDA" }],
+    funnel: { admitted: 3, researched: 2, incomplete: 0, actionable: 0, rejected: 2 },
+  }, candidates);
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join("; "), /duplicate research packet symbol/);
+  assert.match(result.errors.join("; "), /missing research packet: ANET/);
+  assert.match(result.errors.join("; "), /admitted 3 != packets 2/);
 });
 
 function geminiReport(text, finishReason = "STOP", usageMetadata = {}, parts = null) {
@@ -377,9 +409,9 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiProvider, "deepseek");
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
-  assert.equal(body.report.reportEngineVersion, "0.5.6");
+  assert.equal(body.report.reportEngineVersion, "0.5.7");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.6");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.7");
   assert.equal(bucket.objects.get("reports/latest.md"), markdown);
 });
 
@@ -589,7 +621,7 @@ test("Gemini 404 diagnostics include status and model without exposing the API k
   assert.equal(result.report.aiProvider, "gemini");
   assert.equal(result.report.aiModel, "gemini-3.5-flash");
   assert.equal(result.report.reportMode, "standard");
-  assert.equal(result.report.reportEngineVersion, "0.5.6");
+  assert.equal(result.report.reportEngineVersion, "0.5.7");
   assert.equal(result.report.generation.validation, "failed");
   assert.deepEqual(result.report.storage, { skipped: true, reason: "generation_failed" });
   assert.deepEqual(result.report.webhook, { skipped: true, reason: "generation_failed" });
@@ -744,7 +776,8 @@ test("incomplete Gemini response is never written to R2 or delivered", async () 
 });
 
 test("forceRegenerate replaces an existing incomplete report after validation succeeds", async () => {
-  const bucket = r2({ "reports/2026-08-05.md": "old incomplete", "reports/latest.md": "old incomplete" });
+  const reportDate = currentNewYorkDate();
+  const bucket = r2({ [`reports/${reportDate}.md`]: "old incomplete", "reports/latest.md": "old incomplete" });
   const markdown = completeReport(["NVDA"], "Regeneration produces a complete replacement.");
   const env = {
     RUN_TOKEN_REQUIRED: "true",
@@ -774,9 +807,9 @@ test("forceRegenerate replaces an existing incomplete report after validation su
   assert.match(discordFiles.join("\n"), /Regeneration produces/);
   const body = await response.json();
   assert.equal(body.report.replaced, true);
-  assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
+  assert.equal(bucket.objects.get(`reports/${reportDate}.md`), markdown);
   assert.equal(bucket.objects.get("reports/latest.md"), markdown);
-  assert.equal(JSON.parse(bucket.objects.get("deliveries/2026-08-05.json")).discord.sent, true);
+  assert.equal(JSON.parse(bucket.objects.get(`deliveries/${reportDate}.json`)).discord.sent, true);
 });
 
 test("failed forced regeneration preserves the previous stored report", async () => {
@@ -819,7 +852,7 @@ test("existing dated report prevents duplicate report generation but still evalu
 
   assert.deepEqual(result.report, {
     date: "2026-08-05",
-    engineVersion: "0.5.6",
+    engineVersion: "0.5.7",
     generated: false,
     stored: true,
     email: null,
@@ -1031,7 +1064,8 @@ test("existing successful receipt prevents duplicate scheduled Discord delivery"
 });
 
 test("run-report forceDelivery retries delivery without another Gemini API call", async () => {
-  const bucket = r2({ "reports/2026-08-05.md": "stored report" });
+  const reportDate = currentNewYorkDate();
+  const bucket = r2({ [`reports/${reportDate}.md`]: "stored report" });
   const env = {
     RUN_TOKEN_REQUIRED: "true",
     RUN_TOKEN: "secret",
@@ -1062,7 +1096,7 @@ test("run-report forceDelivery retries delivery without another Gemini API call"
   assert.equal(body.report.webhook.sent, true);
   assert.equal(body.report.webhook.messages, 1);
   assert.deepEqual(body.report.webhook.chunks, { expected: 1, delivered: 1, failed: 0 });
-  assert.equal(bucket.objects.get("reports/2026-08-05.md"), "stored report");
+  assert.equal(bucket.objects.get(`reports/${reportDate}.md`), "stored report");
 });
 
 test("Discord errors return useful diagnostics without exposing the webhook URL", async () => {
