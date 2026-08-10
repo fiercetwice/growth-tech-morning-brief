@@ -108,7 +108,7 @@ export default {
         return json({ error: "delivery_failed", message: errorMessage(error) }, 502);
       }
     }
-    if (path === "/run-report" && request.method === "POST") {
+    if ((path === "/run-report" || path === `/run-report/v${SERVICE_VERSION}`) && request.method === "POST") {
       if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
       try {
         const options = await request.json().catch(() => ({}));

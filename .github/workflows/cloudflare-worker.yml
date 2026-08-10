@@ -85,25 +85,39 @@ jobs:
 
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          if ! http_status="$(curl --fail-with-body --silent --show-error \
-            --output "$response_file" \
-            --write-out '%{http_code}' \
-            --connect-timeout 15 \
-            --max-time 300 \
-            --request POST \
-            --url "$WORKER_URL/run-report" \
-            --header "Authorization: Bearer $RUN_TOKEN" \
-            --header "Content-Type: application/json" \
-            --data '{
-              "forceRegenerate": true,
-              "forceDelivery": true,
-              "provider": "deepseek",
-              "model": "deepseek-v4-flash",
-              "reportMode": "verbose"
-            }')"; then
-            echo "::error::The /run-report request failed (HTTP ${http_status:-unknown})."
+          report_url="$WORKER_URL/run-report/v$expected_version"
+          http_status=""
+          for attempt in $(seq 1 24); do
+            if ! http_status="$(curl --silent --show-error \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              --connect-timeout 15 \
+              --max-time 300 \
+              --request POST \
+              --url "$report_url" \
+              --header "Authorization: Bearer $RUN_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data '{
+                "forceRegenerate": true,
+                "forceDelivery": true,
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "reportMode": "verbose"
+              }')"; then
+              echo "::error::The versioned /run-report request failed before receiving an HTTP response."
+              exit 1
+            fi
+            if [ "$http_status" = "404" ] && [ "$attempt" != "24" ]; then
+              sleep 5
+              continue
+            fi
+            break
+          done
+
+          if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+            echo "::error::The versioned /run-report request failed (HTTP ${http_status:-unknown})."
             if jq -e . "$response_file" > /dev/null 2>&1; then
-              jq '{ error, reportError: .report.error, webhook: .report.webhook }' "$response_file"
+              jq '{ error, message, reportError: .report.error, webhook: .report.webhook }' "$response_file"
             else
               echo "The Worker returned a non-JSON response ($(wc -c < "$response_file") bytes)."
             fi
@@ -111,7 +125,7 @@ jobs:
           fi
 
           if ! jq -e . "$response_file" > /dev/null 2>&1; then
-            echo "::error::The /run-report request returned invalid JSON (HTTP $http_status, $(wc -c < "$response_file") bytes)."
+            echo "::error::The versioned /run-report request returned invalid JSON (HTTP $http_status, $(wc -c < "$response_file") bytes)."
             exit 1
           fi
           response="$(< "$response_file")"
