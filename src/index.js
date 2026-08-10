@@ -11,6 +11,7 @@ const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
 const SERVICE_VERSION = "0.5.7";
+const BUILD_REVISION = "0.5.7-hf3";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -22,8 +23,7 @@ const REQUIRED_REPORT_SECTIONS = [
 ];
 const REQUIRED_EXECUTIVE_LABELS = ["AI Cycle", "Key Catalyst", "Principal Risk", "Best Opportunity", "Avoid"];
 const REQUIRED_CONTEXT_LABELS = ["As Of", "Global Markets", "Futures", "Rates", "Dollar", "Oil"];
-const REQUIRED_AUDIT_LABELS = ["Funnel", "Packet Completion", "Field Completeness", "Material Missing Fields", "Source Failures"];
-const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Trim", "Sell", "Review position size", "Watch", "No action"];
+const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Sell", "Review position size", "Watch", "No action"];
 const REPORT_MODES = new Set(["standard", "verbose"]);
 const DEFAULT_DISCOVERY_LIMIT = 6;
 const DEFAULT_MIN_MARKET_CAP = 250_000_000;
@@ -33,8 +33,6 @@ const DEFAULT_DISCOVERY_SEC_REFRESH_LIMIT = 6;
 const DEFAULT_CORE_NEWS_LIMIT = 3;
 const DEFAULT_RESEARCH_BATCH_SIZE = 3;
 const MAX_RESEARCH_CANDIDATES = 12;
-const DEFAULT_VERBOSE_MAX_TOKENS = 24_000;
-const DEFAULT_STANDARD_MAX_TOKENS = 12_000;
 const DEFAULT_RESEARCH_MAX_TOKENS = 4_000;
 const MAX_AI_ATTEMPTS = 2;
 const MAX_DISCORD_ATTEMPTS = 4;
@@ -78,7 +76,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
-    if (path === "/health") return json({ ok: true, service: "growth-tech-morning-brief", version: SERVICE_VERSION });
+    if (path === "/health") return json({ ok: true, service: "growth-tech-morning-brief", version: SERVICE_VERSION, buildRevision: BUILD_REVISION });
     if (path === "/latest" && request.method === "GET") {
       if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
       if (!env.BRIEF_BUCKET?.get) return json({ error: "r2_not_configured" }, 503);
@@ -158,7 +156,7 @@ async function generateOrDeliverReport(env, now, options = {}) {
 
   const reportDate = zonedParts(now, "America/New_York").date;
   const reportObject = await env.BRIEF_BUCKET.get(`reports/${reportDate}.md`);
-  const reportResults = { date: reportDate, engineVersion: SERVICE_VERSION, generated: false, stored: false, email: null, webhook: null };
+  const reportResults = { date: reportDate, engineVersion: SERVICE_VERSION, buildRevision: BUILD_REVISION, generated: false, stored: false, storage: null, email: null, webhook: null };
   try {
     let reportMarkdown;
     if (reportObject && !options.forceRegenerate) {
@@ -166,6 +164,9 @@ async function generateOrDeliverReport(env, now, options = {}) {
       reportResults.reused = true;
       reportResults.reportMode = reportObject.customMetadata?.reportMode ?? "unknown";
       reportResults.reportEngineVersion = reportObject.customMetadata?.engineVersion ?? "unknown";
+      reportResults.reportBuildRevision = reportObject.customMetadata?.buildRevision ?? "unknown";
+      reportResults.reportId = reportObject.customMetadata?.reportId ?? "unknown";
+      reportResults.contentHash = reportObject.customMetadata?.contentHash ?? "unknown";
       reportResults.stored = true;
     } else {
       const latestObject = await env.BRIEF_BUCKET.get("snapshots/latest.json");
@@ -177,12 +178,15 @@ async function generateOrDeliverReport(env, now, options = {}) {
       reportResults.aiModel = generatedReport.model;
       reportResults.reportMode = generatedReport.reportMode;
       reportResults.reportEngineVersion = SERVICE_VERSION;
+      reportResults.reportBuildRevision = BUILD_REVISION;
+      reportResults.reportId = generatedReport.metadata.reportId;
+      reportResults.contentHash = generatedReport.metadata.contentHash;
       reportResults.research = generatedReport.research?.funnel ?? null;
       if (generatedReport.provider === "gemini") reportResults.geminiModel = generatedReport.model;
       reportResults.generation = generatedReport.metadata;
       reportResults.generated = true;
-      await storeReport(env, reportDate, reportMarkdown, generatedReport.metadata);
-      reportResults.stored = true;
+      reportResults.storage = await storeReport(env, reportDate, reportMarkdown, generatedReport.metadata);
+      reportResults.stored = reportResults.storage.stored === true;
       if (options.forceRegenerate) {
         reportResults.replaced = Boolean(reportObject);
         await resetDeliveryReceipt(env, reportDate, generatedReport.metadata);
@@ -974,7 +978,7 @@ export function toBrief(snapshot) {
     },
     eventLedger: snapshot.eventLedger ?? null,
     opportunityGate: {
-      rule: "No actionable trade merely because it ranks highest. Action requires a verified fresh event, same-day earnings, a >=3% dislocation, or an extreme valuation/range trim setup. Discovery names require explicit liquidity and data-quality review.",
+      rule: "No actionable trade merely because it ranks highest. Research admission may come from a verified fresh event, same-day earnings, a >=3% dislocation, or an extreme valuation/range risk flag. Buy/Sell still require a verified catalyst; discovery names require explicit liquidity and data-quality review.",
       maximumOpportunities: 8,
       allowedTodayActions: TODAY_ACTIONS,
       defaultVerdict: "No high-conviction trade today",
@@ -1096,7 +1100,7 @@ function todaySetup(row, earnings) {
   if (verifiedNews.length) reasons.push(`${verifiedNews.length} fresh company headline(s)`);
   if (earningsToday) reasons.push("earnings scheduled today");
   if (dislocation) reasons.push(`${signed(row.changePercent)}% price dislocation`);
-  if (extremeTrim) reasons.push("valuation and range position both at/above 90th threshold");
+  if (extremeTrim) reasons.push("valuation-risk flag: valuation and range position both at/above 90th threshold");
   return {
     eligible: reasons.length > 0,
     score: verifiedNews.length * 3 + (earningsToday ? 3 : 0) + (dislocation ? 2 : 0) + (extremeTrim ? 2 : 0),
@@ -1113,65 +1117,51 @@ export async function generateAiReport(env, snapshot, override = null, options =
   const compact = compactSnapshotForReport(snapshot);
   compact.reportMode = selectedReportMode(env, options.reportMode);
   compact.engineVersion = SERVICE_VERSION;
+  compact.buildRevision = BUILD_REVISION;
   const research = await researchCandidates(env, route, compact);
   const researchConsistency = validateResearchConsistency(research, compact.opportunityGate?.candidates ?? []);
   if (!researchConsistency.ok) throw new Error(`Research funnel consistency failed: ${researchConsistency.errors.join("; ")}`);
   research.storage = await storeResearchPackets(env, compact, research);
   const synthesis = synthesisContext(compact, research);
   const requiredSymbols = research.packets.map((packet) => packet.symbol);
-  const failures = [];
-  let lastMetadata = null;
-
-  for (let attempt = 1; attempt <= MAX_AI_ATTEMPTS; attempt += 1) {
-    const prompt = reportPrompt(synthesis, {
-      retry: attempt > 1,
-      validationErrors: failures.at(-1),
-    });
-    const response = await requestAiReport(env, route, prompt, {
-      maxTokens: reportMaxTokens(env, synthesis.reportMode),
-    });
-    const extracted = extractAiReport(response.body, route, env);
-    const metadata = reportMetadata(route, response.body, extracted, attempt);
-    metadata.pipeline = "staged-research-v1";
-    metadata.researchBatches = research.batches.length;
-    metadata.researchComplete = research.funnel.researched;
-    metadata.researchIncomplete = research.funnel.incomplete;
-    metadata.researchPacketStorage = research.storage?.stored === true ? "stored" : research.storage?.reason ?? "failed";
-    lastMetadata = metadata;
-    if (!response.ok || extracted.finishReason !== "STOP" || !extracted.markdown) {
-      const diagnostic = aiFailureDiagnostic(response.status, route, extracted, env);
-      failures.push(`attempt ${attempt}: ${diagnostic}`);
-      continue;
-    }
-    const validation = validateReportCompleteness(extracted.markdown, requiredSymbols, synthesis);
-    metadata.validation = validation.ok ? "passed" : "failed";
-    metadata.validationErrors = validation.errors.join("; ");
-    if (validation.ok) return {
-      markdown: extracted.markdown,
-      provider,
-      model,
-      reportMode: synthesis.reportMode,
-      research,
-      metadata: { ...metadata, reportMode: synthesis.reportMode, engineVersion: SERVICE_VERSION },
-    };
-    failures.push(`attempt ${attempt}: ${validation.errors.join("; ")}`);
-  }
-  const error = new Error(`AI report incomplete after ${failures.length} attempt(s) (${provider}/${model}): ${failures.join(" | ")}`);
-  error.reportMetadata = {
-    ...(lastMetadata ?? {}),
+  const reportId = crypto.randomUUID();
+  const generatedAt = new Date().toISOString();
+  const markdown = renderMorningBrief(synthesis, { reportId, generatedAt });
+  const validation = validateReportCompleteness(markdown, requiredSymbols, synthesis);
+  const contentHash = await reportFingerprint(markdown);
+  const auditMarkdown = renderResearchAudit(synthesis, { reportId, generatedAt, contentHash });
+  research.auditStorage = await storeResearchAudit(env, compact, auditMarkdown, { reportId, contentHash });
+  const metadata = {
     aiProvider: provider,
     aiModel: model,
-    reportMode: synthesis.reportMode,
-    engineVersion: SERVICE_VERSION,
-    pipeline: "staged-research-v1",
+    ...(provider === "gemini" ? { geminiModel: model } : {}),
+    finishReason: "DETERMINISTIC_RENDER",
+    outputCharacters: markdown.length,
+    outputTokenCount: null,
+    thoughtsTokenCount: null,
+    totalTokenCount: null,
+    generationAttempts: 0,
+    generatedAt,
+    validation: validation.ok ? "passed" : "failed",
+    validationErrors: validation.errors.join("; "),
+    pipeline: "staged-research-deterministic-render-v1",
     researchBatches: research.batches.length,
     researchComplete: research.funnel.researched,
     researchIncomplete: research.funnel.incomplete,
     researchPacketStorage: research.storage?.stored === true ? "stored" : research.storage?.reason ?? "failed",
-    validation: "failed",
-    validationErrors: failures.join(" | "),
+    researchAuditStorage: research.auditStorage?.stored === true ? "stored" : research.auditStorage?.reason ?? "failed",
+    reportMode: synthesis.reportMode,
+    engineVersion: SERVICE_VERSION,
+    buildRevision: BUILD_REVISION,
+    reportId,
+    contentHash,
   };
-  throw error;
+  if (!validation.ok) {
+    const error = new Error(`Deterministic report validation failed: ${validation.errors.join("; ")}`);
+    error.reportMetadata = metadata;
+    throw error;
+  }
+  return { markdown, auditMarkdown, provider, model, reportMode: synthesis.reportMode, research, metadata };
 }
 
 async function researchCandidates(env, route, compact) {
@@ -1193,8 +1183,9 @@ async function researchCandidates(env, route, compact) {
       admitted: candidates.length,
       researched: packets.filter((packet) => packet.status === "complete").length,
       incomplete: packets.filter((packet) => packet.status !== "complete").length,
-      actionable: packets.filter((packet) => packet.gateResult === "pass").length,
-      rejected: packets.filter((packet) => packet.gateResult !== "pass").length,
+      gateQualified: packets.filter((packet) => packet.modelGateResult === "pass").length,
+      recommendedActions: packets.filter((packet) => packet.gateResult === "pass").length,
+      rejectedOrWatch: packets.filter((packet) => packet.gateResult !== "pass").length,
     },
     packets,
   };
@@ -1209,7 +1200,8 @@ export function validateResearchConsistency(research, candidates) {
   for (const symbol of actual) if (!expected.includes(symbol)) errors.push(`research packet outside admitted universe: ${symbol}`);
   if (research.funnel.admitted !== actual.length) errors.push(`admitted ${research.funnel.admitted} != packets ${actual.length}`);
   if (research.funnel.researched + research.funnel.incomplete !== research.funnel.admitted) errors.push("researched + incomplete != admitted");
-  if (research.funnel.actionable + research.funnel.rejected !== research.funnel.admitted) errors.push("actionable + rejected != admitted");
+  if (research.funnel.recommendedActions + research.funnel.rejectedOrWatch !== research.funnel.admitted) errors.push("recommendedActions + rejectedOrWatch != admitted");
+  if (research.funnel.gateQualified < research.funnel.recommendedActions) errors.push("gateQualified cannot be lower than recommendedActions");
   return { ok: errors.length === 0, errors };
 }
 
@@ -1264,9 +1256,10 @@ function candidateResearchPrompt(compact, candidates, options = {}) {
     "Use only the supplied evidence. Do not infer that a headline caused a move unless the linkage is direct.",
     `Analyze only these batch symbols: ${[...candidateSymbols].join(", ")}. Do not place any other equity ticker in candidate fields; non-candidate market facts are context only.`,
     "Discovery names cannot pass the action gate when valuation, fundamentals, liquidity context, or a verified fresh company catalyst is missing.",
-    "Price movement alone may support Watch, never Buy/Sell. An extremeTrim flag without portfolio holdings is a valuation-risk flag only: use Review position size, never infer ownership, weight, cost basis, benchmark exposure, or a quantity to sell.",
+    "Price movement alone may support Watch, never Buy/Sell. An extremeTrim flag without portfolio holdings is a valuation-risk flag only: use Review position size; Trim is not an allowed action.",
     "Return {\"candidates\":[...]} with exactly one object per supplied symbol and these fields:",
-    "symbol, catalystSummary, evidenceFor (array), evidenceAgainst (array), mispricingThesis, strategicPosition (Buy/Hold/Avoid), todayAction (Buy now/Buy on weakness/Trim/Sell/Watch/No action), confidence (High/Medium/Low), entryExitCondition, riskReward, invalidation, missingEvidence (array), sourceQuality, gateResult (pass/fail), gateReason.",
+    "symbol, catalystSummary, evidenceFor (array), evidenceAgainst (array), mispricingThesis, strategicPosition (Buy/Hold/Avoid), todayAction (Buy now/Buy on weakness/Sell/Review position size/Watch/No action), confidence (High/Medium/Low), entryExitCondition, riskReward, invalidation, missingEvidence (array), sourceQuality, gateResult (pass/fail), gateReason.",
+    "Do not invent target, support, resistance, stop, or entry prices. A dollar-denominated price may appear in entryExitCondition, invalidation, riskReward, or mispricingThesis only when it exactly matches the supplied current price, 52-week low, or 52-week high.",
     options.retry ? `Repair the previous failure exactly: ${options.validationErrors}` : "",
     `Batch: ${options.batchNumber}`,
     "Market context:",
@@ -1294,7 +1287,7 @@ function candidateResearchPrompt(compact, candidates, options = {}) {
   ].filter(Boolean).join("\n");
 }
 
-function validateResearchBatch(parsed, candidates) {
+export function validateResearchBatch(parsed, candidates) {
   const errors = [];
   if (!parsed || !Array.isArray(parsed.candidates)) return { ok: false, errors: ["response must contain candidates array"] };
   const expected = candidates.map((row) => row.symbol);
@@ -1310,6 +1303,7 @@ function validateResearchBatch(parsed, candidates) {
     if (!TODAY_ACTIONS.includes(row?.todayAction)) errors.push(`${row?.symbol ?? "unknown"} invalid todayAction`);
     if (!["High", "Medium", "Low"].includes(row?.confidence)) errors.push(`${row?.symbol ?? "unknown"} invalid confidence`);
     if (!["pass", "fail"].includes(row?.gateResult)) errors.push(`${row?.symbol ?? "unknown"} invalid gateResult`);
+    validatePacketPriceLevels(row, candidates.find((candidate) => candidate.symbol === row?.symbol), errors);
   }
   return { ok: errors.length === 0, errors };
 }
@@ -1317,17 +1311,18 @@ function validateResearchBatch(parsed, candidates) {
 export function normalizeResearchPacket(packet, candidate) {
   const discoveryBlocked = candidate?.sourceType === "discovery"
     && (!discoveryFinancialsComplete(candidate) || !candidate?.setup?.verifiedCatalyst);
-  const actionable = ["Buy now", "Buy on weakness", "Sell", "Trim"].includes(packet.todayAction)
+  const recommendedAction = ["Buy now", "Buy on weakness", "Sell"].includes(packet.todayAction)
     ? candidate?.setup?.verifiedCatalyst
     : false;
-  const gateResult = packet.gateResult === "pass" && actionable && !discoveryBlocked ? "pass" : "fail";
-  const portfolioReview = packet.todayAction === "Trim" && candidate?.setup?.extremeTrim && !candidate?.setup?.verifiedCatalyst;
+  const gateResult = packet.gateResult === "pass" && recommendedAction && !discoveryBlocked ? "pass" : "fail";
+  const portfolioReview = ["Trim", "Review position size"].includes(packet.todayAction) && candidate?.setup?.extremeTrim;
   return {
     ...packet,
     status: "complete",
+    modelGateResult: packet.gateResult,
     gateResult,
     todayAction: gateResult === "pass" ? packet.todayAction : portfolioReview ? "Review position size" : (["Review position size", "Watch", "No action"].includes(packet.todayAction) ? packet.todayAction : "Watch"),
-    gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, portfolioReview ? "extreme valuation is a risk flag; no holdings or target allocation were supplied" : null, !actionable && !portfolioReview ? "action lacks deterministic catalyst eligibility" : null].filter(Boolean).join("; "),
+    gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, portfolioReview ? "extreme valuation is a risk flag; no holdings or target allocation were supplied" : null, !recommendedAction && !portfolioReview ? "action lacks deterministic catalyst eligibility" : null].filter(Boolean).join("; "),
     sourceSnapshot: {
       symbol: candidate.symbol,
       sourceType: candidate.sourceType,
@@ -1348,6 +1343,18 @@ export function normalizeResearchPacket(packet, candidate) {
   };
 }
 
+function validatePacketPriceLevels(packet, candidate, errors) {
+  if (!candidate) return;
+  const supplied = [candidate.price, candidate.yearLow, candidate.yearHigh].filter(Number.isFinite);
+  for (const field of ["entryExitCondition", "invalidation", "riskReward", "mispricingThesis"]) {
+    const values = [...String(packet?.[field] ?? "").matchAll(/\$\s*([0-9]+(?:\.[0-9]+)?)/g)].map((match) => Number(match[1]));
+    for (const value of values) {
+      const sourced = supplied.some((known) => Math.abs(known - value) <= Math.max(0.01, Math.abs(known) * 0.001));
+      if (!sourced) errors.push(`${packet?.symbol ?? "unknown"} unsourced price level in ${field}: $${value}`);
+    }
+  }
+}
+
 function discoveryFinancialsComplete(candidate) {
   const valuationAvailable = Number.isFinite(candidate?.valuation?.trailingPE) || Number.isFinite(candidate?.valuation?.trailingPS);
   const growthAvailable = ["revenueTtmYoY", "revenueLatestQuarterYoY", "epsTtmYoY", "epsLatestQuarterYoY"]
@@ -1359,6 +1366,7 @@ function incompleteResearchPacket(candidate, failure) {
   return {
     symbol: candidate.symbol,
     status: "incomplete",
+    modelGateResult: "fail",
     gateResult: "fail",
     todayAction: "No action",
     confidence: "Low",
@@ -1393,6 +1401,7 @@ export function synthesisContext(compact, research) {
   return {
     schemaVersion: compact.schemaVersion,
     engineVersion: compact.engineVersion,
+    buildRevision: compact.buildRevision,
     reportMode: compact.reportMode,
     generatedAt: compact.generatedAt,
     session: compact.session,
@@ -1469,6 +1478,184 @@ export function synthesisContext(compact, research) {
   };
 }
 
+export function renderMorningBrief(compact, identity = {}) {
+  const reportId = identity.reportId ?? "unavailable";
+  const generatedAt = identity.generatedAt ?? new Date().toISOString();
+  const packets = compact.research?.packets ?? [];
+  const recommended = packets.filter((packet) => packet.status === "complete" && packet.gateResult === "pass");
+  const gateQualified = packets.filter((packet) => packet.status === "complete" && packet.modelGateResult === "pass");
+  const verified = packets.filter((packet) => packet.sourceSnapshot?.setup?.verifiedCatalyst);
+  const avoid = packets.filter((packet) => packet.status === "complete" && packet.strategicPosition === "Avoid");
+  const cycleRows = Object.entries(compact.decisionFramework?.aiCycle ?? {});
+  const sectorRows = Object.entries(compact.decisionFramework?.sectorScorecard ?? {});
+  const unavailableContext = Object.entries(compact.marketContext ?? {}).filter(([, group]) => group?.status !== "available").map(([name]) => name);
+  const best = recommended[0];
+  const catalyst = verified[0];
+  const lines = [
+    `# Growth Tech Morning Brief — ${generatedAt.slice(0, 10)}`,
+    "",
+    `**Report Mode:** ${compact.reportMode}`,
+    `**Engine Version:** ${compact.engineVersion}`,
+    `**Build Revision:** ${compact.buildRevision ?? BUILD_REVISION}`,
+    `**Report ID:** ${reportId}`,
+    `**Generated At:** ${generatedAt}`,
+    "",
+    "# Executive Summary",
+    `- **AI Cycle:** ${cycleRows.every(([, row]) => row.rating === "Insufficient Data") ? "Insufficient Data; direct CapEx, demand, utilization, and estimate-revision evidence is unavailable." : "Mixed; see the deterministic dashboard."}`,
+    `- **Key Catalyst:** ${catalyst ? `${catalyst.symbol} — ${cleanReportText(catalyst.catalystSummary)}` : "No verified company-specific catalyst in today's researched universe."}`,
+    `- **Principal Risk:** ${unavailableContext.length ? `Market inputs stale or unavailable: ${unavailableContext.join(", ")}.` : "Forward estimates and direct AI-cycle indicators are not in the snapshot; trailing data limit conviction."}`,
+    `- **Best Opportunity:** ${best ? `${best.symbol} — ${best.todayAction}; ${cleanReportText(best.gateReason)}` : `None clears the deterministic action gate; ${gateQualified.length} gate-qualified research setup(s), ${recommended.length} recommended action(s).`}`,
+    `- **Avoid:** ${avoid.length ? `${avoid.map((packet) => packet.symbol).join(", ")} — research packets classify these as Avoid.` : "No research-backed Avoid call today; do not act on unverified price moves."}`,
+    "",
+    "# Overnight and Market Context",
+    `- **As Of:** ${compact.generatedAt ?? generatedAt}; session=${compact.session ?? "unavailable"}.`,
+    `- **Global Markets:** Point-in-time Growth Tech context only; source status is preserved below and no broad-market conclusion is inferred.`,
+    `- **Futures:** ${formatMarketGroup(compact.marketContext?.futures, "futures")}`,
+    `- **Rates:** ${formatMarketGroup(compact.marketContext?.rates, "rates")}`,
+    `- **Dollar:** ${formatMarketGroup(compact.marketContext?.usd, "usd")}`,
+    `- **Oil:** ${formatMarketGroup(compact.marketContext?.oil, "oil")}`,
+    "",
+    "# AI Cycle Dashboard",
+    "| Segment | Rating | Trend | Evidence | Limitation |",
+    "|---|---|---|---|---|",
+    ...cycleRows.map(([segment, row]) => `| ${tableCell(segment)} | ${tableCell(row.rating)} | ${tableCell(row.trend)} | ${tableCell(row.evidence)} | ${tableCell(row.limitation)} |`),
+    "",
+    "# Sector Scorecard",
+    "| Sector | Fundamentals | Valuation | Momentum | Action | Evidence |",
+    "|---|---|---|---|---|---|",
+    ...sectorRows.map(([sector, row]) => `| ${tableCell(sector)} | ${tableCell(row.fundamentals)} | ${tableCell(row.valuation)} | ${tableCell(row.momentum)} | ${tableCell(row.action)} | ${tableCell(sectorEvidence(row))} |`),
+    "",
+    "# Watchlist",
+    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Historical Percentile | Catalyst | Risk | Action | Research Status |",
+    "|---|---:|---:|---:|---|---:|---|---|---|---|",
+    ...(compact.watchlist ?? []).map((row) => renderWatchlistRow(row)),
+  ];
+  return lines.join("\n");
+}
+
+export function renderResearchAudit(compact, identity = {}) {
+  const funnel = compact.research?.funnel ?? {};
+  const packets = compact.research?.packets ?? [];
+  const capacity = compact.opportunityGate?.researchCapacity ?? {};
+  const missing = materialMissingFields(packets);
+  const sourceFailures = compact.dataQuality?.discoveryFundamentals?.sourceFailures ?? 0;
+  const lines = [
+    `# Growth Tech Research Audit — ${(identity.generatedAt ?? compact.generatedAt ?? "").slice(0, 10)}`,
+    "",
+    `**Engine Version:** ${compact.engineVersion}`,
+    `**Build Revision:** ${compact.buildRevision ?? BUILD_REVISION}`,
+    `**Report ID:** ${identity.reportId ?? "unavailable"}`,
+    `**Report Content SHA-256:** ${identity.contentHash ?? "unavailable"}`,
+    "",
+    `**Funnel:** screened=${funnel.screened ?? "unavailable"}; admitted=${funnel.admitted ?? 0}; researched=${funnel.researched ?? 0}; incomplete=${funnel.incomplete ?? 0}; gateQualified=${funnel.gateQualified ?? 0}; recommendedActions=${funnel.recommendedActions ?? 0}; rejectedOrWatch=${funnel.rejectedOrWatch ?? 0}`,
+    `**Packet Completion:** capacity=${capacity.filled ?? packets.length}/${capacity.target ?? packets.length}; generated packets are not described as complete fields.`,
+    `**Field Completeness:** ${fieldCompletenessSummary(packets)}`,
+    `**Material Missing Fields:** ${missing.length ? missing.join("; ") : "None in the deterministic required-field set."}`,
+    `**Source Failures:** discovery fundamentals=${sourceFailures}; extraction gaps remain separate from provider failures.`,
+    "",
+    "## Research Packets",
+  ];
+  for (const packet of packets) {
+    lines.push(
+      `### ${packet.symbol} — ${packet.todayAction ?? "No action"}`,
+      `- Status: ${packet.status}; model gate=${packet.modelGateResult ?? "unavailable"}; recommended action=${packet.gateResult === "pass" ? "yes" : "no"}.`,
+      `- Catalyst: ${cleanReportText(packet.catalystSummary)}`,
+      `- Balance sheet: ${balanceSheetDisplay(packet.sourceSnapshot?.fundamentals)}.`,
+      `- Evidence against: ${normalizedEvidenceAgainst(packet).join("; ") || "unavailable"}.`,
+      `- Missing evidence: ${(packet.missingEvidence ?? []).map(cleanReportText).join("; ") || "none stated"}.`,
+      "",
+    );
+  }
+  return lines.join("\n").trim();
+}
+
+function renderWatchlistRow(row) {
+  const valuation = row.valuation;
+  const selected = valuation?.selectedMetric === "trailingPE" ? valuation.trailingPE : valuation?.trailingPS;
+  const metric = valuation?.selectedMetric === "trailingPE" ? "P/E" : "P/S";
+  const packetAction = ["Buy", "Hold", "Wait", "Avoid"].includes(row.expectedAction) ? row.expectedAction : "Wait";
+  return `| ${tableCell(row.symbol)} | ${money(row.price)} | ${percent(row.changePercent, true)} | ${percent(row.positionIn52WeekRange)} | ${Number.isFinite(selected) ? `${metric} ${round(selected)}` : "unavailable"} | ${percent(valuation?.selectedPercentile)} | ${tableCell(row.catalyst)} | ${tableCell(row.risk)} | ${packetAction} | ${row.researchStatus === "not_researched_today" ? "Not researched today" : "Researched"} |`;
+}
+
+function formatMarketGroup(group, category) {
+  if (!group || group.status === "unavailable") return `Unavailable${group?.reason ? ` — ${cleanReportText(group.reason)}` : ""}.`;
+  const items = (group.items ?? []).map((item) => {
+    if (category === "rates") return `${item.label} ${fmt(item.value)}${item.unit ?? "%"} (${Number.isFinite(item.change) ? `${item.change >= 0 ? "+" : ""}${round(item.change * 100)} bps` : "change unavailable"})`;
+    const unit = category === "oil" && item.unit === "USD" ? "$" : "";
+    return `${item.label} ${unit}${fmt(item.value)} (${percent(item.changePercent, true)})`;
+  });
+  return `${group.status}${group.asOf ? ` as of ${group.asOf}` : ""}: ${items.join(", ") || "no instruments"}.`;
+}
+
+function sectorEvidence(row) {
+  const symbols = row?.symbols?.join(", ") || "no covered symbols";
+  const growth = row?.metrics?.medianReportedRevenueTtmYoY;
+  const valuation = row?.metrics?.medianHistoricalValuationPercentile;
+  return `${symbols}; median reported revenue growth ${percent(growth)}; median valuation percentile ${percent(valuation)}`;
+}
+
+function balanceSheetDisplay(fundamentals) {
+  const netDebt = fundamentals?.netDebt;
+  if (!Number.isFinite(netDebt)) return "unavailable";
+  const amount = compactMoney(Math.abs(netDebt));
+  if (netDebt < 0) return `${amount} net cash (debt minus cash = ${compactMoney(netDebt)})`;
+  if (netDebt > 0) return `${amount} net debt (debt minus cash)`;
+  return "neutral net debt position";
+}
+
+function normalizedEvidenceAgainst(packet) {
+  const netDebt = packet.sourceSnapshot?.fundamentals?.netDebt;
+  return (packet.evidenceAgainst ?? []).map(cleanReportText).filter((item) => {
+    if (!(Number.isFinite(netDebt) && netDebt < 0)) return true;
+    return !/\b(?:debt load|high debt|significant net debt|balance[- ]sheet weakness|net debt position)\b/i.test(item);
+  });
+}
+
+function materialMissingFields(packets) {
+  const missing = [];
+  for (const packet of packets) {
+    const source = packet.sourceSnapshot ?? {};
+    if (!source.valuation) missing.push(`${packet.symbol}: valuation`);
+    if (!source.reportedGrowth) missing.push(`${packet.symbol}: reported growth`);
+    for (const field of packet.missingEvidence ?? []) missing.push(`${packet.symbol}: ${cleanReportText(field)}`);
+  }
+  return [...new Set(missing)];
+}
+
+function fieldCompletenessSummary(packets) {
+  if (!packets.length) return "0/0 packets; no fields available.";
+  const required = packets.length * 3;
+  const populated = packets.reduce((count, packet) => count
+    + Number(Boolean(packet.catalystSummary))
+    + Number(Boolean(packet.sourceSnapshot?.valuation))
+    + Number(Boolean(packet.sourceSnapshot?.reportedGrowth)), 0);
+  return `${populated}/${required} deterministic required fields populated across ${packets.length} packets; forward-data coverage is not implied.`;
+}
+
+function cleanReportText(value) {
+  return String(value ?? "unavailable").replace(/[\r\n|]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function tableCell(value) {
+  return cleanReportText(value).replaceAll("|", "\\|");
+}
+
+function percent(value, signedValue = false) {
+  if (!Number.isFinite(value)) return "unavailable";
+  return `${signedValue && value >= 0 ? "+" : ""}${round(value)}%`;
+}
+
+function money(value) {
+  return Number.isFinite(value) ? `$${round(value)}` : "unavailable";
+}
+
+function compactMoney(value) {
+  if (!Number.isFinite(value)) return "unavailable";
+  const abs = Math.abs(value);
+  const scaled = abs >= 1e9 ? `${round(abs / 1e9)}B` : abs >= 1e6 ? `${round(abs / 1e6)}M` : abs >= 1e3 ? `${round(abs / 1e3)}K` : String(round(abs));
+  return `${value < 0 ? "-" : ""}$${scaled}`;
+}
+
 function symbolsInValue(value) {
   return new Set(JSON.stringify(value ?? {}).match(/\b[A-Z.]{2,8}\b/g) ?? []);
 }
@@ -1501,13 +1688,33 @@ async function storeResearchPackets(env, compact, research) {
   }
 }
 
+async function storeResearchAudit(env, compact, markdown, identity = {}) {
+  if (!env.BRIEF_BUCKET?.put) return { stored: false, reason: "r2_not_configured" };
+  const reportDate = compact.generatedAt ? zonedParts(new Date(compact.generatedAt), "America/New_York").date : "unknown-date";
+  const options = {
+    httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+    customMetadata: stringifyMetadata({
+      reportDate,
+      reportId: identity.reportId,
+      reportContentHash: identity.contentHash,
+      engineVersion: SERVICE_VERSION,
+      buildRevision: BUILD_REVISION,
+    }),
+  };
+  try {
+    await Promise.all([
+      env.BRIEF_BUCKET.put(`research-audit/${reportDate}.md`, markdown, options),
+      env.BRIEF_BUCKET.put("research-audit/latest.md", markdown, options),
+    ]);
+    return { stored: true, datedKey: `research-audit/${reportDate}.md`, latestKey: "research-audit/latest.md" };
+  } catch (error) {
+    return { stored: false, reason: `research_audit_storage_failed: ${errorMessage(error)}` };
+  }
+}
+
 function parseJsonObject(text) {
   const cleaned = String(text ?? "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   try { return JSON.parse(cleaned); } catch { return null; }
-}
-
-function reportMaxTokens(env, mode) {
-  return positiveInteger(mode === "verbose" ? env.AI_VERBOSE_MAX_TOKENS : env.AI_STANDARD_MAX_TOKENS, mode === "verbose" ? DEFAULT_VERBOSE_MAX_TOKENS : DEFAULT_STANDARD_MAX_TOKENS);
 }
 
 function positiveInteger(value, fallback) {
@@ -1656,7 +1863,7 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
   validateDashboardTable(sectionBody(markdown, "AI Cycle Dashboard"), Object.keys(AI_CYCLE_SEGMENTS), "AI Cycle Dashboard", compact?.decisionFramework?.aiCycle, errors);
   validateDashboardTable(sectionBody(markdown, "Sector Scorecard"), Object.keys(SECTOR_MEMBERS), "Sector Scorecard", compact?.decisionFramework?.sectorScorecard, errors);
   validateWatchlistTable(sectionBody(markdown, "Watchlist"), compact, errors);
-  validateResearchAudit(markdown, compact, errors);
+  validateReportIdentity(markdown, compact, errors);
   validateTickerScope(markdown, compact, errors, symbols);
   validatePortfolioAndBalanceSheetClaims(markdown, compact, errors);
   validateUnsupportedClaims(markdown, compact, errors);
@@ -1730,12 +1937,13 @@ function validateWatchlistTable(section, compact, errors) {
 }
 
 function validatePortfolioAndBalanceSheetClaims(markdown, compact, errors) {
+  if (!compact?.portfolio && /\btrim\b/i.test(markdown)) errors.push("Trim is forbidden without portfolio holdings and target weights");
   for (const packet of compact?.research?.packets ?? []) {
     const symbol = packet.symbol;
     const lines = markdown.split("\n").filter((line) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(line));
     const netDebt = packet.sourceSnapshot?.fundamentals?.netDebt;
     if (Number.isFinite(netDebt) && netDebt < 0) for (const line of lines) {
-      if (/\b(?:debt load|balance[- ]sheet weakness|net debt position)\b/i.test(line) && !/\bnet cash\b/i.test(line)) {
+      if (/\b(?:debt load|high debt|significant net debt|balance[- ]sheet weakness|net debt position)\b/i.test(line) && !/\bnet cash\b/i.test(line)) {
         errors.push(`negative netDebt misclassified instead of net cash: ${symbol}`);
       }
     }
@@ -1748,31 +1956,15 @@ function validatePortfolioAndBalanceSheetClaims(markdown, compact, errors) {
   }
 }
 
-function validateResearchAudit(markdown, compact, errors) {
-  if (compact?.reportMode !== "verbose") return;
-  if (!/\*{0,2}Report Mode\*{0,2}\s*:\*{0,2}\s*verbose\b/i.test(markdown)) errors.push("verbose report must identify Report Mode: verbose");
-  const expectedVersion = compact.engineVersion ?? SERVICE_VERSION;
+function validateReportIdentity(markdown, compact, errors) {
+  const expectedMode = compact?.reportMode ?? "standard";
+  if (!new RegExp(`\\*{0,2}Report Mode\\*{0,2}\\s*:\\*{0,2}\\s*${escapeRegExp(expectedMode)}\\b`, "i").test(markdown)) errors.push(`report must identify Report Mode: ${expectedMode}`);
+  const expectedVersion = compact?.engineVersion ?? SERVICE_VERSION;
   if (!new RegExp(`\\*{0,2}Engine Version\\*{0,2}\\s*:\\*{0,2}\\s*${escapeRegExp(expectedVersion)}\\b`, "i").test(markdown)) errors.push("verbose report must identify the current engine version");
-  const audit = sectionBody(markdown, "Research Audit");
-  if (!audit) errors.push("missing subsection: Research Audit");
-  for (const label of REQUIRED_AUDIT_LABELS) if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(audit)) errors.push(`missing Research Audit field: ${label}`);
-  validateFunnelAudit(audit, compact, errors);
-  const capacity = compact?.opportunityGate?.researchCapacity;
-  if (capacity && !new RegExp(`capacity\\s*[=:]\\s*${capacity.filled}\\/${capacity.target}`, "i").test(audit)) errors.push(`Research Audit must disclose capacity=${capacity.filled}/${capacity.target}`);
-  for (const packet of compact?.research?.packets ?? []) {
-    if (!new RegExp(`\\b${escapeRegExp(packet.symbol)}\\b`).test(markdown)) errors.push(`verbose report silently omitted gated candidate: ${packet.symbol}`);
-  }
-}
-
-function validateFunnelAudit(audit, compact, errors) {
-  const expected = compact?.research?.funnel;
-  if (!expected) return;
-  const funnelLine = audit.split("\n").find((line) => /\*{0,2}Funnel\*{0,2}\s*:/i.test(line)) ?? "";
-  for (const field of ["screened", "admitted", "researched", "incomplete", "actionable", "rejected"]) {
-    const match = new RegExp(`${field}\\s*[=:]\\s*(\\d+)`, "i").exec(funnelLine);
-    if (!match) errors.push(`Research Audit Funnel missing count: ${field}`);
-    else if (expected[field] !== null && Number(match[1]) !== Number(expected[field])) errors.push(`funnel count mismatch for ${field}: expected ${expected[field]}, received ${match[1]}`);
-  }
+  const expectedBuild = compact?.buildRevision ?? BUILD_REVISION;
+  if (!new RegExp(`\\*{0,2}Build Revision\\*{0,2}\\s*:\\*{0,2}\\s*${escapeRegExp(expectedBuild)}\\b`, "i").test(markdown)) errors.push("report must identify the current build revision");
+  if (!/\*{0,2}Report ID\*{0,2}\s*:\*{0,2}\s*[0-9a-f-]{16,}\b/i.test(markdown)) errors.push("report must identify a unique report ID");
+  if (/^##\s+Research Audit\s*$/mi.test(markdown)) errors.push("Research Audit must be stored separately from the Morning Brief");
 }
 
 function validateTickerScope(markdown, compact, errors, fallbackSymbols = []) {
@@ -1787,7 +1979,7 @@ function validateTickerScope(markdown, compact, errors, fallbackSymbols = []) {
     }
   }
 
-  for (const section of ["Overnight and Market Context", "AI Cycle Dashboard", "Sector Scorecard"]) for (const line of sectionBody(markdown, section).split("\n")) {
+  for (const line of sectionBody(markdown, "Overnight and Market Context").split("\n")) {
     const symbols = [...contextOnlySymbols].filter((symbol) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(line));
     if (symbols.length && /\b(?:buy(?: now| on weakness)?|sell|trim|hold|avoid|under(?:valued|rated)|overvalued|mispriced|target price|preferred entry|rating)\b/i.test(line)) {
       for (const symbol of symbols) errors.push(`context-only ticker received investment judgment: ${symbol}`);
@@ -1851,55 +2043,6 @@ function endsIncomplete(markdown) {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function reportPrompt(compact, options = {}) {
-  const verbose = compact.reportMode === "verbose";
-  return [
-    `Produce a concise, institutional sell-side Growth Tech Morning Brief in Markdown in ${compact.reportMode} mode.`,
-    "The main report has exactly five top-level sections in the exact order specified below. Do not add, remove, rename, or reorder top-level sections.",
-    "Do not recommend a trade merely because a stock ranks highest. Default to 'No high-conviction trade today' unless an absolute setup threshold is cleared.",
-    `Use only research.packets for company analysis. Include at most ${compact.opportunityGate.maximumOpportunities} actionable names. A >=3% move without verified news may be Watch only, never Buy/Sell.`,
-    `Research symbols: ${(compact.researchSymbols ?? []).join(", ") || "none"}. Only these may support a Best Opportunity, Avoid thesis, target, mispricing claim, or company verdict.`,
-    `Context-only symbols: ${(compact.contextOnlySymbols ?? []).join(", ") || "none"}. They may appear as sourced facts in market, AI-cycle, sector, and watchlist coverage, but may not receive a thesis or verdict.`,
-    "Only a complete research packet whose gateResult is pass may receive Buy now, Buy on weakness, Trim, or Sell. Incomplete or failed packets must remain Watch/No action and be disclosed.",
-    "Buy now, Buy on weakness, Sell, and an actual Trim require a verified fresh company event or same-day earnings. An extremeTrim flag without supplied holdings is only a valuation-risk flag: say Review position size, never infer ownership, weight, cost basis, benchmark exposure, gains, or a quantity to sell.",
-    "Discovery candidates are not pre-approved investments. Explicitly discuss market cap, dollar liquidity, missing fundamental/valuation data, and source quality before any actionable call.",
-    "For fundamentals.netDebt, the definition is total debt minus cash. A negative value means net cash and must never be described as debt load or balance-sheet weakness.",
-    "News metadata is evidence, not automatically causal. Attribute a price move to an event only when relevance is direct; otherwise call the move unverified.",
-    "Federal Reserve items are from the official monetary-policy feed. Use them as market-regime inputs only when fresh and material to today's decision.",
-    "Reported growth is backward-looking SEC data. Price action cannot establish demand, CapEx, adoption, institutional flows, or fundamental strength.",
-    `Label market context as ${compact.session}; do not call regular-trading quotes overnight futures or premarket indications.`,
-    `Allowed Today's Actions: ${TODAY_ACTIONS.join(", ")}.`,
-    "Separate sourced facts from analysis. Mark every unavailable metric as unavailable; a completed packet is not the same as complete fields.",
-    "Use `+N bps` for yield moves, not ambiguous percentages. Do not call one-day oil/yield moves stagflation without direct supporting evidence.",
-    "",
-    `**Report Mode:** ${compact.reportMode}`,
-    `**Engine Version:** ${compact.engineVersion}`,
-    "Repeat those two metadata lines verbatim immediately beneath the report title.",
-    "",
-    "# Executive Summary",
-    "Exactly five bullets, in order, labeled **AI Cycle:**, **Key Catalyst:**, **Principal Risk:**, **Best Opportunity:**, and **Avoid:**. If no opportunity clears the gate, Best Opportunity must say none and may name only a researched near-miss.",
-    "",
-    "# Overnight and Market Context",
-    "Use exactly six concise bullets labeled **As Of:**, **Global Markets:**, **Futures:**, **Rates:**, **Dollar:**, and **Oil:**. Preserve each source status and timestamp; explicitly flag stale or unavailable inputs.",
-    "",
-    "# AI Cycle Dashboard",
-    "Use one Markdown table with columns Segment | Rating | Trend | Evidence | Limitation and exactly these supplied rows: Hyperscaler AI CapEx, GPU Demand, AI Cloud, Enterprise AI, Inference. Do not upgrade Insufficient Data based on price action.",
-    "",
-    "# Sector Scorecard",
-    "Use one Markdown table with columns Sector | Fundamentals | Valuation | Momentum | Action | Evidence and exactly these supplied rows: GPU, AI Cloud, GPU Cloud, Networking, Cooling, Power, Cybersecurity, Cloud Software. Do not change deterministic ratings or actions.",
-    "",
-    "# Watchlist",
-    "Use one Markdown table with columns Symbol | Price | Daily Change | 52-Week Position | Valuation | Historical Percentile | Catalyst | Risk | Action | Research Status. Include every symbol in watchlist exactly once. Action must be Buy, Hold, Wait, or Avoid. For any symbol with researchStatus=not_researched_today, Action must be Wait and Research Status must say Not researched today. Never turn a deterministic or packet risk flag into a portfolio-specific trade instruction.",
-    ...(verbose ? [
-      "After the Watchlist table add `## Research Audit` with exactly five labeled paragraphs: **Funnel:** using `screened=N; admitted=N; researched=N; incomplete=N; actionable=N; rejected=N`; **Packet Completion:** including `capacity=filled/target` from opportunityGate.researchCapacity and naming any excluded core rows; **Field Completeness:** distinguishing packet completion from populated fields; **Material Missing Fields:** naming material nulls; and **Source Failures:** distinguishing extraction gaps from provider failures.",
-    ] : []),
-    options.retry ? `Repair instruction: the previous response failed for exactly this reason: ${options.validationErrors}. Preserve the exact five top-level sections and required tables. Research symbols are ${(compact.researchSymbols ?? []).join(", ") || "none"}; remove unsupported verdicts for any other ticker.` : "",
-    "",
-    "Synthesis context JSON (structured research packets plus market context):",
-    JSON.stringify(compact),
-  ].filter(Boolean).join("\n");
 }
 
 function requestedReportMode(options) {
@@ -2006,12 +2149,23 @@ async function storeReport(env, reportDate, markdown, metadata = {}) {
       researchPacketStorage: metadata.researchPacketStorage,
       reportMode: metadata.reportMode,
       engineVersion: metadata.engineVersion ?? SERVICE_VERSION,
+      buildRevision: metadata.buildRevision ?? BUILD_REVISION,
+      reportId: metadata.reportId,
+      contentHash: metadata.contentHash,
     }),
   };
   await Promise.all([
     env.BRIEF_BUCKET.put(`reports/${reportDate}.md`, markdown, options),
     env.BRIEF_BUCKET.put("reports/latest.md", markdown, options),
   ]);
+  return {
+    stored: true,
+    datedKey: `reports/${reportDate}.md`,
+    latestKey: "reports/latest.md",
+    reportId: metadata.reportId ?? null,
+    contentHash: metadata.contentHash ?? null,
+    buildRevision: metadata.buildRevision ?? BUILD_REVISION,
+  };
 }
 
 function stringifyMetadata(metadata) {
@@ -2089,6 +2243,10 @@ async function resetDeliveryReceipt(env, reportDate, metadata = {}) {
       aiModel: metadata.aiModel,
       geminiModel: metadata.geminiModel,
       generatedAt: metadata.generatedAt,
+      engineVersion: metadata.engineVersion,
+      buildRevision: metadata.buildRevision,
+      reportId: metadata.reportId,
+      contentHash: metadata.contentHash,
     }),
     discord: {
       sent: false,
@@ -2247,12 +2405,14 @@ async function settleDelivery(delivery) {
 }
 
 function markdownToHtml(markdown) {
-  return markdown.split(/\n{2,}/).map((block) => {
-    const escaped = escapeHtml(block).replace(/\n/g, "<br>");
-    if (block.startsWith("# ")) return `<h1>${escaped.slice(2)}</h1>`;
-    if (block.startsWith("## ")) return `<h2>${escaped.slice(3)}</h2>`;
-    return `<p>${escaped}</p>`;
-  }).join("\n");
+  return markdown.split("\n").map((line) => {
+    const escaped = escapeHtml(line);
+    if (line.startsWith("# ")) return `<h1>${escaped.slice(2)}</h1>`;
+    if (line.startsWith("## ")) return `<h2>${escaped.slice(3)}</h2>`;
+    if (line.startsWith("### ")) return `<h3>${escaped.slice(4)}</h3>`;
+    if (/^\s*[-*]\s+/.test(line)) return `<p>${escaped.replace(/^\s*[-*]\s+/, "• ")}</p>`;
+    return line ? `<p>${escaped}</p>` : "";
+  }).filter(Boolean).join("\n");
 }
 
 function escapeHtml(value) {
