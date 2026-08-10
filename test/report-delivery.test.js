@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { compactSnapshotForReport, normalizeResearchPacket, runScheduledBrief, selectResearchCandidates, sendReportEmail, sendReportWebhook, synthesisContext, validateReportCompleteness, validateResearchConsistency } from "../src/index.js";
+import worker, { compactSnapshotForReport, normalizeResearchPacket, renderMorningBrief, renderResearchAudit, runScheduledBrief, selectResearchCandidates, sendReportEmail, sendReportWebhook, synthesisContext, validateReportCompleteness, validateResearchBatch, validateResearchConsistency } from "../src/index.js";
 
 function r2(initial = {}) {
   const objects = new Map(Object.entries(initial));
@@ -55,6 +55,9 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "",
     "**Report Mode:** standard",
     "**Engine Version:** 0.5.7",
+    "**Build Revision:** 0.5.7-hf3",
+    "**Report ID:** 00000000-0000-4000-8000-000000000000",
+    "**Generated At:** 2026-08-05T13:35:00.000Z",
     "",
     "# Executive Summary",
     "- **AI Cycle:** Insufficient Data; price action cannot establish the cycle.",
@@ -100,44 +103,35 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
 }
 
 function verboseNoTradeReport(symbols = ["NVDA"]) {
-  return completeReport(symbols).replace("**Report Mode:** standard", "**Report Mode:** verbose") + [
-    "",
-    "## Research Audit",
-    `**Funnel:** screened=0; admitted=${symbols.length}; researched=${symbols.length}; incomplete=0; actionable=0; rejected=${symbols.length}`,
-    `**Packet Completion:** capacity=${symbols.length}/${symbols.length}; every admitted packet completed.`,
-    "**Field Completeness:** Packet completion is separate from populated fields; material nulls remain unavailable.",
-    "**Material Missing Fields:** Forward estimates, direct demand indicators, and verified catalysts are unavailable.",
-    "**Source Failures:** None; missing fields are evidence gaps rather than provider failures.",
-  ].join("\n");
+  return completeReport(symbols).replace("**Report Mode:** standard", "**Report Mode:** verbose");
 }
 
-test("verbose validation requires an auditable no-trade explanation", () => {
+test("verbose Morning Brief keeps research audit out of the five-section product", () => {
   const compact = {
     reportMode: "verbose",
     engineVersion: "0.5.7",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
-    research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, actionable: 0, rejected: 1 }, packets: [{ symbol: "NVDA" }] },
+    buildRevision: "0.5.7-hf3",
+    research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
   assert.deepEqual(valid, { ok: true, errors: [] });
 
-  const silent = validateReportCompleteness(verboseNoTradeReport().replace(/NVDA/g, "the candidate"), ["NVDA"], compact);
-  assert.equal(silent.ok, false);
-  assert.match(silent.errors.join("; "), /silently omitted gated candidate: NVDA/);
+  const embeddedAudit = `${verboseNoTradeReport()}\n\n## Research Audit\nlegacy audit`;
+  assert.match(validateReportCompleteness(embeddedAudit, ["NVDA"], compact).errors.join("; "), /Research Audit must be stored separately/);
 });
 
 test("verbose validation applies section-aware research and context-only ticker scopes", () => {
   const compact = {
     reportMode: "verbose",
     engineVersion: "0.5.7",
+    buildRevision: "0.5.7-hf3",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
-    research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, actionable: 0, rejected: 1 }, packets: [{ symbol: "NVDA" }] },
+    research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
     researchSymbols: ["NVDA"],
     contextOnlySymbols: ["GOOGL"],
   };
-  const wrongCount = validateReportCompleteness(verboseNoTradeReport().replace("screened=0", "screened=99"), ["NVDA"], compact);
-  assert.match(wrongCount.errors.join("; "), /funnel count mismatch for screened/);
   const foreignTicker = validateReportCompleteness(verboseNoTradeReport().replace("NVDA remains a researched near-miss", "GOOGL remains a researched near-miss"), ["NVDA"], compact);
   assert.match(foreignTicker.errors.join("; "), /ticker reference outside research universe in Executive Summary: GOOGL/);
 
@@ -255,7 +249,7 @@ test("research consistency rejects duplicate, missing, and inconsistent packets"
   const candidates = [{ symbol: "NVDA" }, { symbol: "ANET" }];
   const result = validateResearchConsistency({
     packets: [{ symbol: "NVDA" }, { symbol: "NVDA" }],
-    funnel: { admitted: 3, researched: 2, incomplete: 0, actionable: 0, rejected: 2 },
+    funnel: { admitted: 3, researched: 2, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 2 },
   }, candidates);
   assert.equal(result.ok, false);
   assert.match(result.errors.join("; "), /duplicate research packet symbol/);
@@ -324,7 +318,7 @@ async function withFetchStub(handler, run, options = {}) {
 
 test("scheduled run stores Gemini report, sends Resend email, and preserves webhook delivery", async () => {
   const bucket = r2();
-  const markdown = completeReport(["NVDA"], "Action: Hold NVDA.");
+  let webhookMarkdown = "";
   const env = {
     WATCHLIST: "NVDA",
     GEMINI_API_KEY: "gemini-test-key",
@@ -338,29 +332,20 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
   const result = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ entityName: "NVIDIA", facts: { "us-gaap": {} } });
-    if (url.startsWith("https://generativelanguage.googleapis.com")) {
-      const geminiUrl = new URL(url);
-      assert.equal(geminiUrl.pathname, "/v1beta/models/gemini-3.5-flash:generateContent");
-      assert.equal(geminiUrl.searchParams.get("key"), "gemini-test-key");
-      assert.equal(init.headers["x-goog-api-key"], undefined);
-      const body = JSON.parse(init.body);
-      assert.match(body.contents[0].parts[0].text, /institutional sell-side Growth Tech Morning Brief/);
-      assert.match(body.contents[0].parts[0].text, /No high-conviction trade today/);
-      assert.equal(body.generationConfig.maxOutputTokens, 12000);
-      assert.deepEqual(body.generationConfig.thinkingConfig, { thinkingLevel: "low" });
-      return responseJson(geminiReport(markdown, "STOP", { candidatesTokenCount: 8192, thoughtsTokenCount: 12, totalTokenCount: 8204 }));
-    }
     if (url === "https://api.resend.com/emails") {
       assert.equal(init.headers.authorization, "Bearer resend-test-key");
       assert.equal(init.headers["idempotency-key"], "growth-tech-morning-brief-2026-08-05");
       const body = JSON.parse(init.body);
       assert.equal(body.to[0], "pm@example.com");
-      assert.match(body.html, /<h1>Growth Tech Morning Brief<\/h1>/);
-      assert.match(body.text, /Action: Hold NVDA/);
+      assert.match(body.html, /<h1>Growth Tech Morning Brief — 2026-08-10<\/h1>/);
+      assert.match(body.text, /# Executive Summary/);
+      assert.doesNotMatch(body.text, /# Today's Verdict/);
       return responseJson({ id: "email_123" });
     }
     if (url === "https://hooks.example.test/brief") {
-      assert.deepEqual(JSON.parse(init.body), { date: "2026-08-05", markdown });
+      const body = JSON.parse(init.body);
+      assert.equal(body.date, "2026-08-05");
+      webhookMarkdown = body.markdown;
       return new Response(null, { status: 204 });
     }
     throw new Error(`Unexpected fetch ${url}`);
@@ -371,21 +356,21 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
   assert.equal(result.report.stored, true);
   assert.deepEqual(result.report.email, { sent: true, id: "email_123" });
   assert.deepEqual(result.report.webhook, { sent: true, provider: "generic" });
-  assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
-  assert.equal(bucket.objects.get("reports/latest.md"), markdown);
+  const stored = bucket.objects.get("reports/2026-08-05.md");
+  assert.equal(stored, webhookMarkdown);
+  assert.equal(bucket.objects.get("reports/latest.md"), stored);
+  assert.match(stored, /\*\*Build Revision:\*\* 0\.5\.7-hf3/);
+  assert.doesNotMatch(stored, /Research Audit/);
+  assert.ok(bucket.objects.has("research-audit/2026-08-05.md"));
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportDate, "2026-08-05");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.geminiModel, "gemini-3.5-flash");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.finishReason, "STOP");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.outputTokenCount, "8192");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.thoughtsTokenCount, "12");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.totalTokenCount, "8204");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.generationAttempts, "1");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.finishReason, "DETERMINISTIC_RENDER");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.generationAttempts, "0");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.validation, "passed");
 });
 
 test("delivery failures are isolated after the R2 report is stored", async () => {
   const bucket = r2();
-  const markdown = completeReport(["NVDA"], "Delivery channels fail after storage.");
   const env = {
     WATCHLIST: "NVDA",
     GEMINI_API_KEY: "gemini-test-key",
@@ -399,13 +384,12 @@ test("delivery failures are isolated after the R2 report is stored", async () =>
   const result = await withFetchStub((url) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
-    if (url.startsWith("https://generativelanguage.googleapis.com")) return responseJson(geminiReport(markdown));
     if (url === "https://api.resend.com/emails") return responseJson({ message: "quota exceeded" }, 429);
     if (url === "https://hooks.example.test/brief") return new Response("bad gateway", { status: 502 });
     throw new Error(`Unexpected fetch ${url}`);
   }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
 
-  assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
+  assert.match(bucket.objects.get("reports/2026-08-05.md"), /# Executive Summary/);
   assert.equal(result.report.stored, true);
   assert.equal(result.report.email.failed, true);
   assert.match(result.report.email.error, /Resend email failed \(429\)/);
@@ -415,7 +399,6 @@ test("delivery failures are isolated after the R2 report is stored", async () =>
 
 test("Gemini model can be overridden with GEMINI_MODEL", async () => {
   const bucket = r2();
-  const markdown = completeReport(["NVDA"], "Override model produces a complete report.");
   const env = {
     WATCHLIST: "NVDA",
     GEMINI_API_KEY: "gemini-test-key",
@@ -426,23 +409,16 @@ test("Gemini model can be overridden with GEMINI_MODEL", async () => {
   const result = await withFetchStub((url) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
-    if (url.startsWith("https://generativelanguage.googleapis.com")) {
-      const geminiUrl = new URL(url);
-      assert.equal(geminiUrl.pathname, "/v1beta/models/gemini-3.5-flash-preview:generateContent");
-      assert.equal(geminiUrl.searchParams.get("key"), "gemini-test-key");
-      return responseJson(geminiReport(markdown));
-    }
     throw new Error(`Unexpected fetch ${url}`);
   }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
 
   assert.equal(result.report.generated, true);
   assert.equal(result.report.geminiModel, "gemini-3.5-flash-preview");
-  assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
+  assert.match(bucket.objects.get("reports/2026-08-05.md"), /# Watchlist/);
 });
 
-test("DeepSeek route sets an explicit output budget", async () => {
+test("DeepSeek route sets an explicit research-packet output budget", async () => {
   const bucket = r2();
-  const markdown = completeReport(["NVDA"], "DeepSeek generated this complete report.");
   const env = {
     WATCHLIST: "NVDA",
     AI_PROVIDER: "deepseek",
@@ -458,25 +434,21 @@ test("DeepSeek route sets an explicit output budget", async () => {
     const body = JSON.parse(init.body);
     assert.equal(body.model, "deepseek-v4-flash");
     assert.deepEqual(body.thinking, { type: "disabled" });
-    assert.equal(body.max_tokens, 12000);
-    assert.match(body.messages[0].content, /# Executive Summary/);
-    return responseJson({
-      choices: [{ finish_reason: "stop", message: { role: "assistant", content: markdown } }],
-      usage: { completion_tokens: 1400, total_tokens: 3200 },
-    });
-  }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
+    assert.equal(body.max_tokens, 4000);
+    assert.match(body.messages[0].content, /Research this bounded Growth-Tech candidate batch/);
+    return researchFixtureResponse(url, init);
+  }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
 
   assert.equal(result.report.generated, true);
   assert.equal(result.report.aiProvider, "deepseek");
   assert.equal(result.report.aiModel, "deepseek-v4-flash");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.aiProvider, "deepseek");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.aiModel, "deepseek-v4-flash");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.outputTokenCount, "1400");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.finishReason, "DETERMINISTIC_RENDER");
 });
 
 test("authenticated run-report can route a forced verbose regeneration to a selected DeepSeek model", async () => {
   const bucket = r2({ "reports/2026-08-05.md": "old report", "reports/latest.md": "old report" });
-  const markdown = verboseNoTradeReport(["NVDA"]);
   const env = {
     RUN_TOKEN_REQUIRED: "true",
     RUN_TOKEN: "secret",
@@ -492,14 +464,13 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
     assert.equal(url, "https://api.deepseek.com/chat/completions");
     const requestBody = JSON.parse(init.body);
     assert.equal(requestBody.model, "deepseek-v4-pro");
-    assert.match(requestBody.messages[0].content, /exactly five top-level sections/);
-    assert.match(requestBody.messages[0].content, /Research Audit/);
-    return responseJson({ choices: [{ finish_reason: "stop", message: { content: markdown } }] });
+    assert.match(requestBody.messages[0].content, /Research this bounded Growth-Tech candidate batch/);
+    return researchFixtureResponse(url, init);
   }, () => worker.fetch(new Request("https://example.test/run-report", {
     method: "POST",
     headers: { authorization: "Bearer secret", "content-type": "application/json" },
     body: JSON.stringify({ forceRegenerate: true, provider: "deepseek", model: "deepseek-v4-pro", reportMode: "verbose" }),
-  }), env));
+  }), env), { autoResearch: false });
 
   assert.equal(response.status, 200);
   const body = await response.json();
@@ -507,9 +478,12 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
   assert.equal(body.report.reportEngineVersion, "0.5.7");
+  assert.equal(body.report.reportBuildRevision, "0.5.7-hf3");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.7");
-  assert.equal(bucket.objects.get("reports/latest.md"), markdown);
+  assert.match(bucket.objects.get("reports/latest.md"), /# Executive Summary/);
+  assert.doesNotMatch(bucket.objects.get("reports/latest.md"), /Research Audit/);
+  assert.ok(bucket.objects.has("research-audit/latest.md"));
 });
 
 test("run-report rejects provider/model overrides unless regeneration is explicit", async () => {
@@ -543,7 +517,7 @@ test("openai-compatible route uses only the preconfigured HTTPS base URL", async
     OPENAI_COMPAT_BASE_URL: "https://models.example.test/v1/",
     OPENAI_COMPAT_MODEL: "research-model",
     BRIEF_BUCKET: r2(),
-  }, new Date("2026-08-05T13:35:00.000Z")));
+  }, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
 
   assert.equal(result.report.aiProvider, "openai-compatible");
   assert.equal(result.report.aiModel, "research-model");
@@ -586,12 +560,10 @@ test("semantic no-trade validation accepts equivalent threshold wording", () => 
   assert.deepEqual(validateReportCompleteness(markdown, ["NVDA"]), { ok: true, errors: [] });
 });
 
-test("candidate research runs in bounded batches, persists packets, and feeds compact synthesis", async () => {
+test("candidate research runs in bounded batches and feeds the deterministic renderer", async () => {
   const bucket = r2();
   const symbols = ["NVDA", "AMZN", "MSFT", "ANET"];
-  const report = completeReport(symbols, "Staged synthesis used validated research packets.");
   const researchPrompts = [];
-  let synthesisPrompt = "";
 
   const result = await withFetchStub((url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
@@ -604,9 +576,7 @@ test("candidate research runs in bounded batches, persists packets, and feeds co
         assert.equal(request.generationConfig.maxOutputTokens, 4000);
         return researchFixtureResponse(url, init);
       }
-      synthesisPrompt = prompt;
-      assert.equal(request.generationConfig.maxOutputTokens, 12000);
-      return responseJson(geminiReport(report));
+      throw new Error("A free-form final synthesis call is forbidden");
     }
     throw new Error(`Unexpected fetch ${url}`);
   }, () => runScheduledBrief({
@@ -619,20 +589,18 @@ test("candidate research runs in bounded batches, persists packets, and feeds co
   assert.equal(researchPrompts.length, 2);
   assert.ok(researchPrompts.every((prompt) => /Analyze only these batch symbols:/.test(prompt)));
   assert.deepEqual(researchPrompts.map((prompt) => JSON.parse(prompt.split("\nCandidates:\n").at(-1)).length), [2, 2]);
-  assert.match(synthesisPrompt, /"schemaVersion":"candidate-research-v1"/);
-  assert.match(synthesisPrompt, /"sectorScorecard"/);
-  assert.doesNotMatch(synthesisPrompt, /"history"/);
-  assert.deepEqual(result.report.research, { screened: 0, admitted: 4, researched: 4, incomplete: 0, actionable: 0, rejected: 4 });
+  assert.deepEqual(result.report.research, { screened: 0, admitted: 4, researched: 4, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 4 });
+  assert.match(bucket.objects.get("reports/2026-08-05.md"), /# Executive Summary/);
+  assert.doesNotMatch(bucket.objects.get("reports/2026-08-05.md"), /# Decision Reasoning/);
   const stored = JSON.parse(bucket.objects.get("research/2026-08-05.json"));
   assert.equal(stored.packets.length, 4);
   assert.equal(bucket.objects.get("research/latest.json"), bucket.objects.get("research/2026-08-05.json"));
+  assert.match(bucket.objects.get("research-audit/2026-08-05.md"), /gateQualified=0; recommendedActions=0; rejectedOrWatch=4/);
 });
 
-test("an exhausted research batch becomes visible incomplete evidence instead of aborting synthesis", async () => {
+test("an exhausted research batch becomes visible incomplete evidence in the separate audit", async () => {
   const bucket = r2();
-  const report = completeReport(["NVDA"], "The incomplete candidate batch is disclosed and no action is taken.", "Wait");
   let researchCalls = 0;
-  let synthesisPrompt = "";
 
   const result = await withFetchStub((url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
@@ -643,17 +611,15 @@ test("an exhausted research batch becomes visible incomplete evidence instead of
         researchCalls += 1;
         return responseJson(geminiReport("{}"));
       }
-      synthesisPrompt = prompt;
-      return responseJson(geminiReport(report));
+      throw new Error("A free-form final synthesis call is forbidden");
     }
     throw new Error(`Unexpected fetch ${url}`);
   }, () => runScheduledBrief({ WATCHLIST: "NVDA", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
 
   assert.equal(researchCalls, 2);
   assert.equal(result.report.generated, true);
-  assert.deepEqual(result.report.research, { screened: 0, admitted: 1, researched: 0, incomplete: 1, actionable: 0, rejected: 1 });
-  assert.match(synthesisPrompt, /"status":"incomplete"/);
-  assert.match(synthesisPrompt, /research incomplete/);
+  assert.deepEqual(result.report.research, { screened: 0, admitted: 1, researched: 0, incomplete: 1, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 });
+  assert.match(bucket.objects.get("research-audit/2026-08-05.md"), /Status: incomplete/);
   assert.equal(JSON.parse(bucket.objects.get("research/2026-08-05.json")).packets[0].status, "incomplete");
 });
 
@@ -675,6 +641,42 @@ test("extreme valuation without holdings becomes a position-size review, not Tri
   assert.match(normalized.gateReason, /no holdings or target allocation were supplied/);
 });
 
+test("research packets reject unsourced support, resistance, target, and stop prices", () => {
+  const candidate = { symbol: "CEVA", price: 40, yearLow: 25, yearHigh: 45 };
+  const packet = {
+    symbol: "CEVA",
+    catalystSummary: "Verified earnings event.",
+    evidenceFor: [], evidenceAgainst: [], missingEvidence: [],
+    mispricingThesis: "Wait for evidence.",
+    strategicPosition: "Hold", todayAction: "Watch", confidence: "Medium",
+    entryExitCondition: "Wait for support near $30.",
+    riskReward: "Not asymmetric.", invalidation: "Reassess on new evidence.",
+    sourceQuality: "primary filing", gateResult: "fail", gateReason: "Threshold not cleared.",
+  };
+  const invalid = validateResearchBatch({ candidates: [packet] }, [candidate]);
+  assert.match(invalid.errors.join("; "), /CEVA unsourced price level in entryExitCondition: \$30/);
+  packet.entryExitCondition = "Reassess at the supplied 52-week low of $25.";
+  assert.deepEqual(validateResearchBatch({ candidates: [packet] }, [candidate]), { ok: true, errors: [] });
+});
+
+test("separate research audit deterministically renders negative net debt as net cash", () => {
+  const audit = renderResearchAudit({
+    engineVersion: "0.5.7", buildRevision: "0.5.7-hf3",
+    opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
+    dataQuality: { discoveryFundamentals: { sourceFailures: 0 } },
+    research: {
+      funnel: { screened: 1, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 },
+      packets: [{
+        symbol: "VREX", status: "complete", modelGateResult: "fail", gateResult: "fail", todayAction: "Watch",
+        catalystSummary: "No verified catalyst", evidenceAgainst: ["high debt"], missingEvidence: [],
+        sourceSnapshot: { fundamentals: { netDebt: -262_300_000 }, valuation: { trailingPS: 1 }, reportedGrowth: { revenueTtmYoY: 3 } },
+      }],
+    },
+  }, { reportId: "00000000-0000-4000-8000-000000000000", generatedAt: "2026-08-10T22:00:00.000Z", contentHash: "abc" });
+  assert.match(audit, /\$262\.3M net cash/);
+  assert.doesNotMatch(audit, /high debt|significant net debt|debt load/i);
+});
+
 test("final validation rejects negative net debt as debt load and portfolio-specific Trim assumptions", () => {
   const compact = {
     researchSymbols: ["ANET"],
@@ -692,11 +694,12 @@ test("final validation rejects negative net debt as debt load and portfolio-spec
   assert.match(errors, /portfolio-specific Trim assumption without holdings: ANET/);
 });
 
-test("Gemini 404 diagnostics include status and model without exposing the API key", async () => {
+test("research-provider failures become incomplete packets without exposing the API key", async () => {
+  const bucket = r2();
   const env = {
     WATCHLIST: "NVDA",
     GEMINI_API_KEY: "gemini-secret-key",
-    BRIEF_BUCKET: r2(),
+    BRIEF_BUCKET: bucket,
   };
 
   const result = await withFetchStub((url) => {
@@ -706,23 +709,23 @@ test("Gemini 404 diagnostics include status and model without exposing the API k
       return responseJson({ error: { message: "models/gemini-old is unavailable for gemini-secret-key" } }, 404);
     }
     throw new Error(`Unexpected fetch ${url}`);
-  }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
+  }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
 
-  assert.match(result.report.error, /AI report failed \(404, provider: gemini, model: gemini-3.5-flash, finishReason: missing\):/);
-  assert.match(result.report.error, /models\/gemini-old is unavailable for \[redacted\]/);
-  assert.doesNotMatch(result.report.error, /gemini-secret-key/);
+  assert.equal(result.report.generated, true);
+  assert.equal(result.report.research.incomplete, 1);
+  const audit = bucket.objects.get("research-audit/2026-08-05.md");
+  assert.match(audit, /Status: incomplete/);
+  assert.doesNotMatch(audit, /gemini-secret-key/);
   assert.equal(result.report.aiProvider, "gemini");
   assert.equal(result.report.aiModel, "gemini-3.5-flash");
   assert.equal(result.report.reportMode, "standard");
   assert.equal(result.report.reportEngineVersion, "0.5.7");
-  assert.equal(result.report.generation.validation, "failed");
-  assert.deepEqual(result.report.storage, { skipped: true, reason: "generation_failed" });
-  assert.deepEqual(result.report.webhook, { skipped: true, reason: "generation_failed" });
+  assert.equal(result.report.generation.validation, "passed");
+  assert.equal(result.report.storage.stored, true);
 });
 
 test("successful Gemini generation stores the report and delivers Discord", async () => {
   const bucket = r2();
-  const markdown = completeReport(["NVDA"], "Discord delivery receives a complete generated report.");
   const env = {
     WATCHLIST: "NVDA",
     GEMINI_API_KEY: "gemini-test-key",
@@ -734,53 +737,50 @@ test("successful Gemini generation stores the report and delivers Discord", asyn
   const result = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
-    if (url.startsWith("https://generativelanguage.googleapis.com")) {
-      const geminiUrl = new URL(url);
-      assert.equal(geminiUrl.pathname, "/v1beta/models/gemini-3.5-flash:generateContent");
-      return responseJson(geminiReport(markdown));
-    }
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
     const { payload, file } = discordForm(init);
-    assert.match(payload.content, /Discord delivery receives/);
+    assert.match(payload.content, /ID: `/);
     discordFiles.push(await file.text());
     return new Response(null, { status: 204 });
   }, () => runScheduledBrief(env, new Date("2026-08-05T13:35:00.000Z")));
 
   assert.equal(result.report.generated, true);
   assert.equal(result.report.geminiModel, "gemini-3.5-flash");
-  assert.equal(bucket.objects.get("reports/2026-08-05.md"), markdown);
+  const markdown = bucket.objects.get("reports/2026-08-05.md");
   assert.deepEqual(discordFiles, [markdown]);
   assert.equal(result.report.webhook.sent, true);
   assert.equal(result.report.webhook.provider, "discord");
   assert.equal(result.report.webhook.messages, 1);
+  assert.equal(result.report.contentHash, result.report.storage.contentHash);
+  assert.equal(result.report.contentHash, result.report.webhook.fingerprint);
   assert.deepEqual(result.report.webhook.chunks, { expected: 1, delivered: 1, failed: 0 });
 });
 
-test("Gemini joins multiple non-thought parts and excludes thought parts", async () => {
+test("Gemini research joins multiple non-thought JSON parts and excludes thought parts", async () => {
   const bucket = r2();
-  const first = completeReport(["NVDA"], "Part one covers the required sections.");
-  const splitAt = Math.floor(first.length / 2);
-  const parts = [
-    { text: "internal thinking summary", thought: true },
-    { text: first.slice(0, splitAt) },
-    { text: first.slice(splitAt) },
-  ];
 
-  const result = await withFetchStub((url) => {
+  const result = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
-    if (url.startsWith("https://generativelanguage.googleapis.com")) return responseJson(geminiReport("", "STOP", {}, parts));
+    if (url.startsWith("https://generativelanguage.googleapis.com")) {
+      const fixture = await researchFixtureResponse(url, init).json();
+      const content = fixture.candidates[0].content.parts[0].text;
+      const splitAt = Math.floor(content.length / 2);
+      return responseJson(geminiReport("", "STOP", {}, [
+        { text: "internal thinking summary", thought: true },
+        { text: content.slice(0, splitAt) },
+        { text: content.slice(splitAt) },
+      ]));
+    }
     throw new Error(`Unexpected fetch ${url}`);
-  }, () => runScheduledBrief({ WATCHLIST: "NVDA", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")));
+  }, () => runScheduledBrief({ WATCHLIST: "NVDA", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
 
   assert.equal(result.report.generated, true);
-  assert.equal(bucket.objects.get("reports/2026-08-05.md"), first);
   assert.doesNotMatch(bucket.objects.get("reports/2026-08-05.md"), /internal thinking/);
 });
 
-test("MAX_TOKENS triggers exactly one concise retry", async () => {
+test("MAX_TOKENS in candidate research triggers exactly one bounded retry", async () => {
   const bucket = r2();
-  const completed = completeReport(["NVDA"], "The retry is shorter but still complete.");
   let geminiCalls = 0;
 
   const result = await withFetchStub((url, init) => {
@@ -790,19 +790,19 @@ test("MAX_TOKENS triggers exactly one concise retry", async () => {
       geminiCalls += 1;
       const request = JSON.parse(init.body);
       if (geminiCalls === 1) return responseJson(geminiReport("truncated", "MAX_TOKENS"));
-      assert.match(request.contents[0].parts[0].text, /previous response failed for exactly this reason/);
-      return responseJson(geminiReport(completed, "STOP"));
+      assert.match(request.contents[0].parts[0].text, /Repair the previous failure exactly/);
+      return researchFixtureResponse(url, init);
     }
     throw new Error(`Unexpected fetch ${url}`);
-  }, () => runScheduledBrief({ WATCHLIST: "NVDA", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")));
+  }, () => runScheduledBrief({ WATCHLIST: "NVDA", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
 
   assert.equal(geminiCalls, 2);
   assert.equal(result.report.generated, true);
-  assert.equal(bucket.objects.get("reports/2026-08-05.md"), completed);
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.generationAttempts, "2");
+  assert.equal(JSON.parse(bucket.objects.get("research/2026-08-05.json")).batches[0].attempts, 2);
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.generationAttempts, "0");
 });
 
-test("a second truncated Gemini response is rejected and not stored", async () => {
+test("a second truncated research response becomes incomplete while the conservative report is stored", async () => {
   const bucket = r2();
   let geminiCalls = 0;
 
@@ -814,14 +814,15 @@ test("a second truncated Gemini response is rejected and not stored", async () =
       return responseJson(geminiReport("still truncated", "MAX_TOKENS"));
     }
     throw new Error(`Unexpected fetch ${url}`);
-  }, () => runScheduledBrief({ WATCHLIST: "NVDA", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")));
+  }, () => runScheduledBrief({ WATCHLIST: "NVDA", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
 
   assert.equal(geminiCalls, 2);
-  assert.match(result.report.error, /MAX_TOKENS/);
-  assert.equal(bucket.objects.has("reports/2026-08-05.md"), false);
+  assert.equal(result.report.research.incomplete, 1);
+  assert.equal(bucket.objects.has("reports/2026-08-05.md"), true);
+  assert.match(bucket.objects.get("research-audit/2026-08-05.md"), /Status: incomplete/);
 });
 
-test("missing required sections are rejected", async () => {
+test("free-form research output cannot replace deterministic report sections", async () => {
   const bucket = r2();
   const result = await withFetchStub((url) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
@@ -830,49 +831,49 @@ test("missing required sections are rejected", async () => {
     throw new Error(`Unexpected fetch ${url}`);
   }, () => runScheduledBrief({ WATCHLIST: "NVDA", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")));
 
-  assert.match(result.report.error, /missing section: Executive Summary/);
-  assert.equal(bucket.objects.has("reports/2026-08-05.md"), false);
+  assert.equal(result.report.generated, true);
+  assert.match(bucket.objects.get("reports/2026-08-05.md"), /# Executive Summary/);
+  assert.doesNotMatch(bucket.objects.get("reports/2026-08-05.md"), /# Today's Verdict/);
 });
 
-test("Watchlist cannot omit a covered core symbol", async () => {
+test("deterministic Watchlist cannot omit a covered core symbol", async () => {
   const bucket = r2();
-  const markdown = completeReport(["NVDA"], "This intentionally omits the second symbol.");
 
   const result = await withFetchStub((url) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart(url.includes("AMZN") ? "AMZN" : "NVDA"));
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
-    if (url.startsWith("https://generativelanguage.googleapis.com")) return responseJson(geminiReport(markdown));
     throw new Error(`Unexpected fetch ${url}`);
   }, () => runScheduledBrief({ WATCHLIST: "NVDA,AMZN", GEMINI_API_KEY: "key", BRIEF_BUCKET: bucket }, new Date("2026-08-05T13:35:00.000Z")));
 
-  assert.equal(result.report.generated, false);
-  assert.match(result.report.error, /Watchlist missing core symbol: AMZN/);
-  assert.equal(bucket.objects.has("reports/2026-08-05.md"), false);
+  assert.equal(result.report.generated, true);
+  const report = bucket.objects.get("reports/2026-08-05.md");
+  assert.match(report, /\| NVDA \|/);
+  assert.match(report, /\| AMZN \|/);
 });
 
-test("incomplete Gemini response is never written to R2 or delivered", async () => {
+test("incomplete research is disclosed and cannot block the deterministic report", async () => {
   const bucket = r2();
   const result = await withFetchStub((url) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
     if (url.startsWith("https://generativelanguage.googleapis.com")) return responseJson(geminiReport("## Executive Summary\nNVDA starts but"));
-    if (url.startsWith("https://discord.com")) throw new Error("Discord should not be called");
+    if (url.startsWith("https://discord.com")) return new Response(null, { status: 204 });
     throw new Error(`Unexpected fetch ${url}`);
   }, () => runScheduledBrief({
     WATCHLIST: "NVDA",
     GEMINI_API_KEY: "key",
     DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/token",
     BRIEF_BUCKET: bucket,
-  }, new Date("2026-08-05T13:35:00.000Z")));
+  }, new Date("2026-08-05T13:35:00.000Z")), { autoResearch: false });
 
-  assert.match(result.report.error, /incomplete/);
-  assert.equal(bucket.objects.has("reports/2026-08-05.md"), false);
+  assert.equal(result.report.research.incomplete, 1);
+  assert.equal(bucket.objects.has("reports/2026-08-05.md"), true);
+  assert.match(bucket.objects.get("research-audit/2026-08-05.md"), /Status: incomplete/);
 });
 
 test("forceRegenerate replaces an existing incomplete report after validation succeeds", async () => {
   const reportDate = currentNewYorkDate();
   const bucket = r2({ [`reports/${reportDate}.md`]: "old incomplete", "reports/latest.md": "old incomplete" });
-  const markdown = completeReport(["NVDA"], "Regeneration produces a complete replacement.");
   const env = {
     RUN_TOKEN_REQUIRED: "true",
     RUN_TOKEN: "secret",
@@ -886,7 +887,6 @@ test("forceRegenerate replaces an existing incomplete report after validation su
   const response = await withFetchStub(async (url, init) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
-    if (url.startsWith("https://generativelanguage.googleapis.com")) return responseJson(geminiReport(markdown));
     assert.equal(url, env.DISCORD_WEBHOOK_URL);
     const { file } = discordForm(init);
     discordFiles.push(await file.text());
@@ -898,20 +898,24 @@ test("forceRegenerate replaces an existing incomplete report after validation su
   }), env));
 
   assert.equal(response.status, 200);
-  assert.match(discordFiles.join("\n"), /Regeneration produces/);
+  assert.match(discordFiles.join("\n"), /# Executive Summary/);
   const body = await response.json();
   assert.equal(body.report.replaced, true);
-  assert.equal(bucket.objects.get(`reports/${reportDate}.md`), markdown);
-  assert.equal(bucket.objects.get("reports/latest.md"), markdown);
+  assert.match(bucket.objects.get(`reports/${reportDate}.md`), /\*\*Report ID:\*\*/);
+  assert.equal(bucket.objects.get("reports/latest.md"), bucket.objects.get(`reports/${reportDate}.md`));
   assert.equal(JSON.parse(bucket.objects.get(`deliveries/${reportDate}.json`)).discord.sent, true);
 });
 
-test("failed forced regeneration preserves the previous stored report", async () => {
+test("failed report storage preserves the previous stored report", async () => {
   const bucket = r2({ "reports/2026-08-05.md": "previous report", "reports/latest.md": "previous report" });
+  const originalPut = bucket.put;
+  bucket.put = async (key, value, options) => {
+    if (key.startsWith("reports/")) throw new Error("simulated report storage failure");
+    return originalPut(key, value, options);
+  };
   const response = await withFetchStub((url) => {
     if (url.startsWith("https://query1.finance.yahoo.com")) return responseJson(yahooChart());
     if (url.startsWith("https://data.sec.gov")) return responseJson({ facts: { "us-gaap": {} } });
-    if (url.startsWith("https://generativelanguage.googleapis.com")) return responseJson(geminiReport("truncated", "MAX_TOKENS"));
     if (url.startsWith("https://discord.com")) throw new Error("Discord should not be called");
     throw new Error(`Unexpected fetch ${url}`);
   }, () => worker.fetch(new Request("https://example.test/run-report", {
@@ -929,7 +933,7 @@ test("failed forced regeneration preserves the previous stored report", async ()
 
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.match(body.report.error, /MAX_TOKENS/);
+  assert.match(body.report.error, /simulated report storage failure/);
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), "previous report");
   assert.equal(bucket.objects.get("reports/latest.md"), "previous report");
 });
@@ -947,13 +951,18 @@ test("existing dated report prevents duplicate report generation but still evalu
   assert.deepEqual(result.report, {
     date: "2026-08-05",
     engineVersion: "0.5.7",
+    buildRevision: "0.5.7-hf3",
     generated: false,
     stored: true,
+    storage: null,
     email: null,
     webhook: { skipped: true, reason: "webhook_not_configured" },
     reused: true,
     reportMode: "unknown",
     reportEngineVersion: "unknown",
+    reportBuildRevision: "unknown",
+    reportId: "unknown",
+    contentHash: "unknown",
   });
   assert.equal(bucket.objects.get("reports/2026-08-05.md"), "already sent");
 });

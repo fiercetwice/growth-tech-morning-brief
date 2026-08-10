@@ -68,16 +68,19 @@ jobs:
           fi
 
           expected_version="$(jq -r '.version' package.json)"
+          expected_build_revision="$(jq -r '.buildRevision' package.json)"
           for attempt in $(seq 1 24); do
-            deployed_version="$(curl --fail --silent --show-error \
+            health="$(curl --fail --silent --show-error \
               --connect-timeout 10 \
               --max-time 30 \
-              "$WORKER_URL/health" | jq -r '.version // empty' || true)"
-            if [ "$deployed_version" = "$expected_version" ]; then
+              "$WORKER_URL/health" || true)"
+            deployed_version="$(jq -r '.version // empty' <<< "$health" 2>/dev/null || true)"
+            deployed_build_revision="$(jq -r '.buildRevision // empty' <<< "$health" 2>/dev/null || true)"
+            if [ "$deployed_version" = "$expected_version" ] && [ "$deployed_build_revision" = "$expected_build_revision" ]; then
               break
             fi
             if [ "$attempt" = "24" ]; then
-              echo "::error::Worker v$expected_version did not become active before the smoke-test deadline."
+              echo "::error::Worker v$expected_version build $expected_build_revision did not become active before the smoke-test deadline."
               exit 1
             fi
             sleep 5
@@ -138,6 +141,9 @@ jobs:
             aiModel: .report.aiModel,
             reportMode: .report.reportMode,
             reportEngineVersion: .report.reportEngineVersion,
+            reportBuildRevision: .report.reportBuildRevision,
+            reportId: .report.reportId,
+            contentHash: .report.contentHash,
             validation: .report.generation.validation,
             research: .report.research,
             discoveryFundamentals: .snapshot.discovery.fundamentalsCoverage,
@@ -153,7 +159,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          failures="$(jq -r --arg expected_version "$expected_version" '
+          failures="$(jq -r --arg expected_version "$expected_version" --arg expected_build_revision "$expected_build_revision" '
             if .report.generated != true then
               ["Report generation did not complete: \(.report.error // "no error reported"); storage and Discord delivery were not attempted"]
             else [
@@ -162,11 +168,13 @@ jobs:
               if .report.aiModel == "deepseek-v4-flash" then empty else "Unexpected AI model: \(.report.aiModel // "missing")" end,
               if .report.reportMode == "verbose" then empty else "Unexpected report mode: \(.report.reportMode // "missing")" end,
               if .report.reportEngineVersion == $expected_version then empty else "Stale report engine: expected \($expected_version), received \(.report.reportEngineVersion // "missing")" end,
+              if .report.reportBuildRevision == $expected_build_revision then empty else "Stale report build: expected \($expected_build_revision), received \(.report.reportBuildRevision // "missing")" end,
               if .report.generation.validation == "passed" then empty else "Report validation failed: \(.report.generation.validation // "missing")" end,
               if .snapshot.eventLedger.schemaVersion == "event-ledger-v1" then empty else "Event ledger was not stored in the snapshot contract" end,
-              if (.report.research.admitted == (.report.research.researched + .report.research.incomplete)) and (.report.research.admitted == (.report.research.actionable + .report.research.rejected)) then empty else "Research funnel invariant failed: \(.report.research)" end,
+              if (.report.research.admitted == (.report.research.researched + .report.research.incomplete)) and (.report.research.admitted == (.report.research.recommendedActions + .report.research.rejectedOrWatch)) and (.report.research.gateQualified >= .report.research.recommendedActions) then empty else "Research funnel invariant failed: \(.report.research)" end,
               if (.snapshot.discovery.fundamentalsCoverage.total == ((.snapshot.discovery.fundamentalsCoverage.available // 0) + (.snapshot.discovery.fundamentalsCoverage.unavailable // 0) + (.snapshot.discovery.fundamentalsCoverage.sourceFailures // 0) + (.snapshot.discovery.fundamentalsCoverage.mappingMissing // 0))) then empty else "Discovery fundamental coverage totals are inconsistent" end,
-              if .report.webhook.sent == true then empty else "Discord delivery incomplete: \(.report.webhook.chunks.delivered // 0)/\(.report.webhook.chunks.expected // "unknown") deliveries completed; \(.report.webhook.error // .report.webhook.reason // "no error reported")" end
+              if .report.webhook.sent == true then empty else "Discord delivery incomplete: \(.report.webhook.chunks.delivered // 0)/\(.report.webhook.chunks.expected // "unknown") deliveries completed; \(.report.webhook.error // .report.webhook.reason // "no error reported")" end,
+              if (.report.contentHash == .report.storage.contentHash) and (.report.contentHash == .report.webhook.fingerprint) then empty else "Report identity mismatch across generation, R2, and Discord: generated=\(.report.contentHash // "missing") stored=\(.report.storage.contentHash // "missing") delivered=\(.report.webhook.fingerprint // "missing")" end
             ] end | .[]' <<< "$response")"
 
           if [ -n "$failures" ]; then

@@ -40,7 +40,7 @@ test("Worker accepts a trailing slash on the GPT read route", async () => {
 test("health exposes the deployed release for propagation-safe smoke tests", async () => {
   const response = await worker.fetch(new Request("https://example.test/health"), {});
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.7" });
+  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.7", buildRevision: "0.5.7-hf3" });
 });
 
 test("release-specific report route rejects old isolates without starting generation", async () => {
@@ -58,6 +58,8 @@ test("release-specific report route rejects old isolates without starting genera
 
 test("post-deploy smoke test retries only the versioned route while an old isolate returns 404", () => {
   assert.match(deployWorkflow, /report_url="\$WORKER_URL\/run-report\/v\$expected_version"/);
+  assert.match(deployWorkflow, /deployed_build_revision/);
+  assert.match(deployWorkflow, /Report identity mismatch across generation, R2, and Discord/);
   assert.match(deployWorkflow, /if \[ "\$http_status" = "404" \] && \[ "\$attempt" != "24" \]/);
   assert.doesNotMatch(deployWorkflow, /--url "\$WORKER_URL\/run-report"/);
 });
