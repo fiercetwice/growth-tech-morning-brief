@@ -43,6 +43,25 @@ test("health exposes the deployed release for propagation-safe smoke tests", asy
   assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.7" });
 });
 
+test("release-specific report route rejects old isolates without starting generation", async () => {
+  const current = await worker.fetch(new Request("https://example.test/run-report/v0.5.7", {
+    method: "POST",
+  }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
+  assert.equal(current.status, 401);
+
+  const stale = await worker.fetch(new Request("https://example.test/run-report/v0.5.6", {
+    method: "POST",
+  }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
+  assert.equal(stale.status, 404);
+  assert.deepEqual(await stale.json(), { error: "not_found" });
+});
+
+test("post-deploy smoke test retries only the versioned route while an old isolate returns 404", () => {
+  assert.match(deployWorkflow, /report_url="\$WORKER_URL\/run-report\/v\$expected_version"/);
+  assert.match(deployWorkflow, /if \[ "\$http_status" = "404" \] && \[ "\$attempt" != "24" \]/);
+  assert.doesNotMatch(deployWorkflow, /--url "\$WORKER_URL\/run-report"/);
+});
+
 test("post-deploy failures print actionable diagnostics before exiting", () => {
   const summaryIndex = deployWorkflow.indexOf('echo "$summary"');
   const failureIndex = deployWorkflow.indexOf('if [ -n "$failures" ]');
