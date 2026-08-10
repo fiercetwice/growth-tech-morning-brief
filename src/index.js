@@ -2020,13 +2020,20 @@ function validateAvailableContextIsUsed(overnight, compact, errors) {
   ];
   for (const [label, context] of categories) {
     const line = overnight.split("\n").find((candidate) => new RegExp(`${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(candidate));
-    if (context?.status === "available" && (!line || /\bunavailable\b|not in snapshot/i.test(line))) {
+    const renderedStatus = contextCategoryStatus(line, label);
+    if (context?.status === "available" && renderedStatus !== "available") {
       errors.push(`available context incorrectly marked unavailable: ${label}`);
     }
-    if (context?.status === "unavailable" && (!line || !/\bunavailable\b/i.test(line))) {
+    if (context?.status === "unavailable" && renderedStatus !== "unavailable") {
       errors.push(`unavailable context not flagged unavailable: ${label}`);
     }
   }
+}
+
+function contextCategoryStatus(line, label) {
+  if (!line) return null;
+  const match = line.match(new RegExp(`${escapeRegExp(label)}(?:\\*{0,2})\\s*:\\s*(?:\\*{0,2})?\\s*(available|unavailable)\\b`, "i"));
+  return match?.[1]?.toLowerCase() ?? null;
 }
 
 function validAction(value) {

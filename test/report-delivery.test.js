@@ -121,6 +121,23 @@ test("verbose Morning Brief keeps research audit out of the five-section product
   assert.match(validateReportCompleteness(embeddedAudit, ["NVDA"], compact).errors.join("; "), /Research Audit must be stored separately/);
 });
 
+test("available market context permits an unavailable child change metric", () => {
+  const compact = { marketContext: { usd: { status: "available" } } };
+  const report = completeReport().replace(
+    "- **Dollar:** Available in the supplied snapshot.",
+    "- **Dollar:** available as of 2026-08-05T13:35:00.000Z: U.S. Dollar Index 98.5 (change unavailable).",
+  );
+
+  assert.deepEqual(validateReportCompleteness(report, ["NVDA"], compact), { ok: true, errors: [] });
+});
+
+test("unavailable market context must be marked unavailable at category level", () => {
+  const compact = { marketContext: { usd: { status: "unavailable" } } };
+  const validation = validateReportCompleteness(completeReport(), ["NVDA"], compact);
+
+  assert.match(validation.errors.join("; "), /unavailable context not flagged unavailable: Dollar/);
+});
+
 test("verbose validation applies section-aware research and context-only ticker scopes", () => {
   const compact = {
     reportMode: "verbose",
