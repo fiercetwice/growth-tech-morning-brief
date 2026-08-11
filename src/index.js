@@ -10,8 +10,8 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.8.3";
-const BUILD_REVISION = "0.5.8.3";
+const SERVICE_VERSION = "0.5.8.4";
+const BUILD_REVISION = "0.5.8.4";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -24,10 +24,10 @@ const REQUIRED_REPORT_SECTIONS = [
 const REQUIRED_EXECUTIVE_LABELS = [
   "AI Cycle and Sector Implications",
   "Market Context",
-  "Key Scheduled Event",
   "Highest-Ranked Recommendation",
   "Primary Valuation Risk",
 ];
+const EXECUTIVE_EVENT_LABELS = ["Key Scheduled Event", "Key Reported Event", "Key Event Status"];
 const REQUIRED_CONTEXT_LABELS = ["As Of", "Global Markets", "Futures", "Rates", "Dollar", "Oil"];
 const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Sell", "Review position size", "Watch", "No action"];
 const REPORT_MODES = new Set(["standard", "verbose"]);
@@ -1030,8 +1030,50 @@ function momentumScore(row) {
 }
 
 function catalystFor(row, earnings) {
+  if (earnings?.lifecycle?.status === "reported_pending_verification") return "Earnings reported; result pending verification";
+  if (earnings?.lifecycle?.status === "verified_result") return "Earnings result verified from structured evidence";
+  if (earnings?.lifecycle?.status === "pending_verification") return "Earnings event status pending verification";
   if (earnings) return `Earnings scheduled today${earnings.time ? ` (${earnings.time})` : ""}`;
   return "n/a — no company-specific catalyst in snapshot";
+}
+
+export function earningsLifecycle(event, generatedAt, companyNews = []) {
+  if (!event) return null;
+  if (event.lifecycle?.status === "verified_result") {
+    return verifiedEarningsEvidence(event.lifecycle.evidence)
+      ? event.lifecycle
+      : { status: "reported_pending_verification", label: "Reported; result pending verification", evidence: event.lifecycle.evidence ?? null };
+  }
+  if (["reported_pending_verification", "pending_verification", "scheduled"].includes(event.lifecycle?.status)) return event.lifecycle;
+  const now = new Date(generatedAt);
+  const ny = zonedParts(Number.isNaN(now.getTime()) ? new Date() : now, "America/New_York");
+  const eventDate = event.date ?? ny.date;
+  const resultNews = companyNews
+    .filter((item) => item.symbols?.includes(event.symbol) && item.verified && isEarningsResultHeadline(item.title)
+      && item.publishedAt && zonedParts(new Date(item.publishedAt), "America/New_York").date === eventDate)
+    .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))[0];
+  if (resultNews) {
+    return {
+      status: "reported_pending_verification",
+      label: "Reported; result pending verification",
+      evidence: { title: resultNews.title, publishedAt: resultNews.publishedAt, source: resultNews.source, url: resultNews.url },
+    };
+  }
+  const time = String(event.time ?? "").toLowerCase();
+  const minutes = ny.hour * 60 + ny.minute;
+  const expectedWindowOpened = eventDate < ny.date
+    || (eventDate === ny.date && (time.includes("pre") ? minutes >= 9 * 60 + 30 : time.includes("after") ? minutes >= 16 * 60 : minutes >= 16 * 60));
+  return expectedWindowOpened
+    ? { status: "pending_verification", label: "Scheduled window opened; event status pending verification", evidence: null }
+    : { status: "scheduled", label: "Scheduled", evidence: null };
+}
+
+function isEarningsResultHeadline(title = "") {
+  return /\b(?:reports?|announces?|posts?|releases?)\b.*\b(?:earnings|results?|revenue|quarter)\b|\b(?:earnings|quarterly)\s+results?\b/i.test(title);
+}
+
+function verifiedEarningsEvidence(evidence) {
+  return Number.isFinite(evidence?.actual) && Number.isFinite(evidence?.consensus) && Boolean(evidence?.sourceUrl);
 }
 
 function riskFor(row) {
@@ -1054,8 +1096,16 @@ function median(values) {
 export function toBrief(snapshot) {
   const rows = snapshot.watchlist.map(compactRow);
   const discoveredRows = (snapshot.discovery?.candidates ?? []).map(compactDiscoveryRow);
-  const earningsBySymbol = new Map((snapshot.calendars?.earnings?.events ?? []).map((event) => [event.symbol, event]));
   const companyNews = snapshot.news?.company?.items ?? [];
+  const earningsBySymbol = new Map((snapshot.calendars?.earnings?.events ?? []).map((event) => [event.symbol, {
+    ...event,
+    date: snapshot.calendars?.earnings?.date ?? snapshot.generatedAt?.slice(0, 10),
+    lifecycle: earningsLifecycle(event, snapshot.generatedAt, companyNews),
+  }]));
+  const calendars = snapshot.calendars ? {
+    ...snapshot.calendars,
+    earnings: snapshot.calendars.earnings ? { ...snapshot.calendars.earnings, events: [...earningsBySymbol.values()] } : snapshot.calendars.earnings,
+  } : snapshot.calendars;
   for (const row of rows) {
     if (row.missing) continue;
     row.catalyst = catalystFor(row, earningsBySymbol.get(row.symbol));
@@ -1089,7 +1139,7 @@ export function toBrief(snapshot) {
     coverage: snapshot.coverage,
     dataQuality,
     marketContext: snapshot.marketContext ?? unavailableMarketContext("not in snapshot"),
-    calendars: snapshot.calendars ?? unavailableCalendars("not in snapshot"),
+    calendars: calendars ?? unavailableCalendars("not in snapshot"),
     news: snapshot.news ?? {
       monetaryPolicy: unavailableNews("Federal Reserve monetary policy RSS (official)", "not in snapshot"),
       company: unavailableNews("Yahoo Finance search news (unofficial)", "not in snapshot"),
@@ -1226,9 +1276,13 @@ function todaySetup(row, earnings) {
   const dislocation = Number.isFinite(row.changePercent) && Math.abs(row.changePercent) >= 3;
   const extremeTrim = (row.valuation?.selectedPercentile ?? 0) >= 90 && (row.positionIn52WeekRange ?? 0) >= 90;
   const earningsToday = Boolean(earnings);
+  const verifiedEarningsResult = earnings?.lifecycle?.status === "verified_result";
   const reasons = [];
   if (verifiedNews.length) reasons.push(`${verifiedNews.length} fresh company headline(s)`);
-  if (earningsToday) reasons.push("earnings scheduled today");
+  if (earnings?.lifecycle?.status === "scheduled") reasons.push("earnings scheduled today");
+  if (earnings?.lifecycle?.status === "pending_verification") reasons.push("earnings event status pending verification");
+  if (earnings?.lifecycle?.status === "reported_pending_verification") reasons.push("earnings reported; result pending verification");
+  if (verifiedEarningsResult) reasons.push("earnings result verified");
   if (dislocation) reasons.push(`${signed(row.changePercent)}% price dislocation`);
   if (extremeTrim) reasons.push("valuation-risk flag: valuation and range position both at/above 90th threshold");
   return {
@@ -1236,7 +1290,8 @@ function todaySetup(row, earnings) {
     score: verifiedNews.length * 3 + (earningsToday ? 3 : 0) + (dislocation ? 2 : 0) + (extremeTrim ? 2 : 0)
       + (row.targetAndMispricing?.valuationAdjustment ?? 0),
     reasons,
-    verifiedCatalyst: verifiedNews.length > 0 || earningsToday,
+    verifiedCatalyst: verifiedNews.length > 0 || verifiedEarningsResult,
+    eventStatus: earnings?.lifecycle?.status ?? null,
     dislocation,
     extremeTrim,
   };
@@ -1393,6 +1448,7 @@ function candidateResearchPrompt(compact, candidates, options = {}) {
   return [
     "Research this bounded Growth-Tech candidate batch. Return JSON only, without Markdown fences.",
     "Use only the supplied evidence. Do not infer that a headline caused a move unless the linkage is direct.",
+    "Treat earnings lifecycle fields literally. Scheduled and pending-verification events are not reported results; never describe them as a beat, miss, result, or verified catalyst. A reported_pending_verification event confirms only that a report exists, not its direction or magnitude.",
     `Analyze only these batch symbols: ${[...candidateSymbols].join(", ")}. Do not place any other equity ticker in candidate fields; non-candidate market facts are context only.`,
     "Discovery names cannot pass the action gate when valuation, fundamentals, liquidity context, or a verified fresh company catalyst is missing.",
     "Price movement alone may support Watch, never Buy/Sell. A core name without same-day news may support a value call only when the supplied target engine has Medium/High confidence, at least 20% base upside, complete financial evidence, and you state a testable rerating path within 1Q or 2Q. Discovery names still require a verified fresh catalyst.",
@@ -1481,6 +1537,15 @@ export function normalizeResearchPacket(packet, candidate) {
       : unsupportedPortfolioAction
         ? "Watch"
         : (["Review position size", "Watch", "No action"].includes(valuationAdjustedAction) ? valuationAdjustedAction : "Watch");
+  const gateAudit = {
+    result: gateResult,
+    researchAssessment: packet.gateResult,
+    strategicPosition: packet.strategicPosition,
+    targetConfidence: target?.status === "available" ? (target.confidence ?? "Unavailable") : "Unavailable",
+    freshCatalyst: Boolean(candidate?.setup?.verifiedCatalyst),
+    reratingPath: reratingEligible ? packet.reratingHorizon : "Unavailable",
+    finalAction,
+  };
   return {
     ...packet,
     status: "complete",
@@ -1488,7 +1553,11 @@ export function normalizeResearchPacket(packet, candidate) {
     gateResult,
     todayAction: finalAction,
     finalAction,
-    gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, unsupportedPortfolioAction ? "position-size action requires supplied holdings and target weights; valuation risk remains Watch-only" : null, ["Buy now", "Buy on weakness"].includes(packet.todayAction) && !targetUsable ? "actionable Buy requires an available Medium/High-confidence deterministic target" : null, packet.todayAction === "Buy now" && targetUsable && baseUpside < 10 ? "Buy now requires at least neutral (10%) base upside; 5-10% prefers Buy on weakness and below 5% remains Watch" : null, !recommendedAction && !portfolioReview && !unsupportedPortfolioAction ? "action lacks deterministic catalyst or qualified 1Q/2Q rerating-path eligibility" : null].filter(Boolean).join("; "),
+    modelGateReason: packet.gateReason,
+    gateAudit,
+    gateReason: structuredGateReason(gateAudit, { discoveryBlocked, unsupportedPortfolioAction }),
+    modelInvalidation: packet.invalidation,
+    invalidation: deterministicInvalidation(candidate, reratingEligible ? packet.reratingHorizon : null, gateResult),
     sourceSnapshot: {
       symbol: candidate.symbol,
       sourceType: candidate.sourceType,
@@ -1508,6 +1577,27 @@ export function normalizeResearchPacket(packet, candidate) {
       news: candidate.news,
     },
   };
+}
+
+function structuredGateReason(audit, flags = {}) {
+  const reasons = [
+    `target confidence ${audit.targetConfidence}`,
+    audit.freshCatalyst ? "fresh catalyst verified" : "fresh catalyst unavailable",
+    audit.reratingPath !== "Unavailable" ? `qualified rerating path ${audit.reratingPath}` : "qualified rerating path unavailable",
+    audit.researchAssessment !== "pass" ? "research assessment failed" : null,
+    audit.strategicPosition ? `strategic position ${audit.strategicPosition}` : null,
+    flags.discoveryBlocked ? "discovery evidence incomplete" : null,
+    flags.unsupportedPortfolioAction ? "portfolio inputs unavailable" : null,
+    `final action ${audit.finalAction}`,
+  ].filter(Boolean);
+  return reasons.join("; ");
+}
+
+function deterministicInvalidation(candidate, reratingHorizon, gateResult) {
+  if (gateResult !== "pass") return "No actionable recommendation; valuation scenario prices are not stop levels.";
+  if (reratingHorizon) return `Reassess if the stated ${reratingHorizon} fundamental rerating path does not materialize; valuation scenario prices are not stop levels.`;
+  if (candidate?.setup?.verifiedCatalyst) return "Reassess if subsequent company disclosure contradicts the verified catalyst; valuation scenario prices are not stop levels.";
+  return "Thesis invalidation unavailable; valuation scenario prices are not stop levels.";
 }
 
 function validatePacketPriceLevels(packet, candidate, errors) {
@@ -1660,15 +1750,20 @@ export function synthesisContext(compact, research) {
 function recommendationGateResult(packet, researched) {
   if (!researched) return "Not evaluated — not researched today";
   if (!packet || packet.status !== "complete") return `Unavailable — ${cleanReportText(packet?.gateReason || "research incomplete")}`;
-  const action = packet.finalAction ?? packet.todayAction ?? "No action";
-  if (packet.gateResult === "pass") return `Passed — ${action}; ${cleanReportText(packet.gateReason)}`;
-  const reasons = [
-    packet.modelGateResult !== "pass" ? "model research gate failed" : null,
-    packet.strategicPosition ? `strategic position ${packet.strategicPosition}` : null,
-    `final action ${action}`,
-    cleanReportText(packet.gateReason),
-  ].filter(Boolean);
-  return `Rejected — ${[...new Set(reasons)].join("; ")}`;
+  const audit = gateAuditForPacket(packet);
+  return `${audit.result === "pass" ? "Passed" : "Rejected"} — ${structuredGateReason(audit)}`;
+}
+
+function gateAuditForPacket(packet) {
+  return packet.gateAudit ?? {
+    result: packet.gateResult,
+    researchAssessment: packet.modelGateResult,
+    strategicPosition: packet.strategicPosition,
+    targetConfidence: packet.sourceSnapshot?.targetAndMispricing?.confidence ?? packet.confidence ?? "Unavailable",
+    freshCatalyst: Boolean(packet.sourceSnapshot?.setup?.verifiedCatalyst),
+    reratingPath: ["1Q", "2Q"].includes(packet.reratingHorizon) && packet.gateResult === "pass" ? packet.reratingHorizon : "Unavailable",
+    finalAction: packet.finalAction ?? packet.todayAction ?? "No action",
+  };
 }
 
 export function renderMorningBrief(compact, identity = {}) {
@@ -1680,7 +1775,7 @@ export function renderMorningBrief(compact, identity = {}) {
   const cycleRows = Object.entries(compact.decisionFramework?.aiCycle ?? {});
   const sectorRows = Object.entries(compact.decisionFramework?.sectorScorecard ?? {});
   const best = highestRankedRecommendation(recommended);
-  const scheduledEvent = keyScheduledEvent(compact);
+  const keyEvent = keyCompanyEvent(compact);
   const valuationRisk = primaryValuationRisk(compact.watchlist ?? [], sectorRows);
   const lines = [
     `# Growth Tech Morning Brief — ${generatedAt.slice(0, 10)}`,
@@ -1694,7 +1789,7 @@ export function renderMorningBrief(compact, identity = {}) {
     "# Executive Summary",
     `- **AI Cycle and Sector Implications:** ${summarizeCycleAndSectors(cycleRows, sectorRows)}`,
     `- **Market Context:** ${summarizeMarketContext(compact.marketContext)}`,
-    `- **Key Scheduled Event:** ${scheduledEvent}`,
+    `- **${keyEvent.label}:** ${keyEvent.text}`,
     `- **Highest-Ranked Recommendation:** ${best ? formatHighestRankedRecommendation(best) : formatRecommendationAbsence(packets, gateQualified.length, recommended.length)}`,
     `- **Primary Valuation Risk:** ${valuationRisk}`,
     "",
@@ -1761,16 +1856,28 @@ function marketGroupLabel(name) {
   return ({ futures: "futures", rates: "rates", usd: "dollar", oil: "oil" })[name] ?? name;
 }
 
-function keyScheduledEvent(compact) {
+function keyCompanyEvent(compact) {
   const researchSymbols = new Set(compact.researchSymbols ?? (compact.research?.packets ?? []).map((packet) => packet.symbol));
   const earnings = compact.calendars?.earnings;
   const events = (earnings?.events ?? [])
     .filter((event) => researchSymbols.has(event.symbol) && Object.hasOwn(CIKS, event.symbol))
     .sort((a, b) => marketNumber(b.marketCap) - marketNumber(a.marketCap));
   const event = events[0];
-  if (!event) return "No material scheduled event identified among researched core-watchlist names.";
+  if (!event) return { label: "Key Event Status", text: "No material company event identified among researched core-watchlist names." };
   const sectors = Object.entries(SECTOR_MEMBERS).filter(([, symbols]) => symbols.includes(event.symbol)).map(([sector]) => sector);
-  return `${event.symbol} earnings${event.time ? ` (${cleanReportText(event.time)})` : ""}${sectors.length ? `; relevant scorecard exposure: ${sectors.join(", ")}` : ""}.`;
+  const exposure = sectors.length ? `; relevant scorecard exposure: ${sectors.join(", ")}` : "";
+  if (event.lifecycle?.status === "reported_pending_verification") {
+    return { label: "Key Reported Event", text: `${event.symbol} earnings reported; result status pending verification${exposure}.` };
+  }
+  if (event.lifecycle?.status === "verified_result") {
+    return verifiedEarningsEvidence(event.lifecycle.evidence)
+      ? { label: "Key Reported Event", text: `${event.symbol} earnings result verified from structured evidence${exposure}.` }
+      : { label: "Key Reported Event", text: `${event.symbol} earnings reported; result status pending verification${exposure}.` };
+  }
+  if (event.lifecycle?.status === "pending_verification") {
+    return { label: "Key Event Status", text: `${event.symbol} earnings scheduled window has opened; event status pending verification${exposure}.` };
+  }
+  return { label: "Key Scheduled Event", text: `${event.symbol} earnings${event.time ? ` (${cleanReportText(event.time)})` : ""}${exposure}.` };
 }
 
 function highestRankedRecommendation(packets) {
@@ -1787,18 +1894,23 @@ function recommendationRank(packet) {
 
 function formatHighestRankedRecommendation(packet) {
   const action = packet.finalAction ?? packet.todayAction;
-  const risk = cleanReportText(packet.invalidation || packet.evidenceAgainst?.[0] || "No thesis-specific invalidation supplied.");
-  return `${packet.symbol} — ${action}; ${cleanReportText(packet.gateReason)}; invalidation: ${risk}`;
+  const audit = gateAuditForPacket(packet);
+  const basis = [
+    `target confidence ${audit.targetConfidence}`,
+    audit.freshCatalyst ? "fresh catalyst verified" : null,
+    audit.reratingPath !== "Unavailable" ? `qualified rerating path ${audit.reratingPath}` : null,
+  ].filter(Boolean).join("; ");
+  return `${packet.symbol} — ${action}; ${basis}.`;
 }
 
-function formatRecommendationAbsence(packets, modelQualifiedCount, recommendedCount) {
+function formatRecommendationAbsence(packets, _modelQualifiedCount, _recommendedCount) {
   const rejected = [...packets]
     .filter((packet) => packet.status === "complete" && packet.gateResult !== "pass")
     .sort((a, b) => recommendationNearMissRank(b) - recommendationNearMissRank(a))
-    .slice(0, 3)
-    .map((packet) => `${packet.symbol} rejected: ${cleanReportText(packet.gateReason || "deterministic gate not passed")}`);
+    .slice(0, 2)
+    .map((packet) => `${packet.symbol} rejected: ${cleanReportText(recommendationGateResult(packet, true).replace(/^Rejected\s+—\s+/, ""))}`);
   const audit = rejected.length ? ` Leading researched setups: ${rejected.join("; ")}.` : "";
-  return `No gate-qualified recommendation; ${modelQualifiedCount} model-qualified research setup(s), ${recommendedCount} deterministic recommendation(s).${audit}`;
+  return `No gate-qualified recommendation.${audit}`;
 }
 
 function recommendationNearMissRank(packet) {
@@ -1865,7 +1977,10 @@ export function renderResearchAudit(compact, identity = {}) {
     lines.push(
       `### ${packet.symbol} — ${packet.todayAction ?? "No action"}`,
       `- Status: ${packet.status}; model gate=${packet.modelGateResult ?? "unavailable"}; recommended action=${packet.gateResult === "pass" ? "yes" : "no"}.`,
-      `- Catalyst: ${cleanReportText(packet.catalystSummary)}`,
+      `- Deterministic gate: ${cleanReportText(recommendationGateResult(packet, true))}.`,
+      `- Model catalyst analysis: ${cleanReportText(packet.catalystSummary)}`,
+      `- Deterministic invalidation: ${cleanReportText(packet.invalidation)}`,
+      `- Model invalidation (non-authoritative): ${cleanReportText(packet.modelInvalidation)}`,
       `- Balance sheet: ${balanceSheetDisplay(packet.sourceSnapshot?.fundamentals)}.`,
       `- Target & mispricing: ${targetAuditDisplay(packet.sourceSnapshot?.targetAndMispricing)}.`,
       `- Evidence against: ${normalizedEvidenceAgainst(packet).join("; ") || "unavailable"}.`,
@@ -1943,14 +2058,14 @@ function sectorEvidence(row) {
     fresh ? `fresh fundamentals ${fresh}` : null,
     freshWithoutGrowth ? `fresh fundamentals but reported revenue growth unavailable ${freshWithoutGrowth}` : null,
     stale ? `stale fundamentals excluded ${stale}` : null,
-    unknown ? `fundamental freshness unavailable ${unknown}` : null,
+    unknown ? `${unknown} fundamentals date unavailable` : null,
     `median valuation percentile ${percent(valuation)}`,
   ].filter(Boolean).join("; ");
 }
 
 function formatFundamentalEvidence(rows) {
   if (!rows?.length) return null;
-  return rows.map((row) => `${row.symbol} (as of ${row.asOf ?? "unavailable"})`).join(", ");
+  return rows.map((row) => row.asOf ? `${row.symbol} (as of ${row.asOf})` : row.symbol).join(", ");
 }
 
 function balanceSheetDisplay(fundamentals) {
@@ -2212,6 +2327,8 @@ export function validateReportCompleteness(markdown, symbols, compact = null) {
   for (const label of REQUIRED_EXECUTIVE_LABELS) {
     if (!new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(executive)) errors.push(`missing Executive Summary field: ${label}`);
   }
+  const eventLabels = EXECUTIVE_EVENT_LABELS.filter((label) => new RegExp(`\\*{0,2}${escapeRegExp(label)}\\*{0,2}\\s*:`, "i").test(executive));
+  if (eventLabels.length !== 1) errors.push(`Executive Summary must contain exactly one event field: ${EXECUTIVE_EVENT_LABELS.join(" or ")}`);
   const context = sectionBody(markdown, "Overnight and Market Context");
   for (const label of REQUIRED_CONTEXT_LABELS) {
     if (!new RegExp(`(?:\\*{0,2})${escapeRegExp(label)}(?:\\*{0,2})\\s*:`, "i").test(context)) {
