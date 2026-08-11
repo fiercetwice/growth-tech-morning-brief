@@ -11,7 +11,7 @@ const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
 const SERVICE_VERSION = "0.5.7";
-const BUILD_REVISION = "0.5.7-hf4";
+const BUILD_REVISION = "0.5.7-hf5";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -21,7 +21,7 @@ const REQUIRED_REPORT_SECTIONS = [
   "Sector Scorecard",
   "Watchlist",
 ];
-const REQUIRED_EXECUTIVE_LABELS = ["AI Cycle", "Key Catalyst", "Principal Risk", "Best Opportunity", "Avoid"];
+const REQUIRED_EXECUTIVE_LABELS = ["AI Cycle", "Key Catalyst", "Principal Risk", "Best Opportunity", "Research Exclusions"];
 const REQUIRED_CONTEXT_LABELS = ["As Of", "Global Markets", "Futures", "Rates", "Dollar", "Oil"];
 const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Sell", "Review position size", "Watch", "No action"];
 const REPORT_MODES = new Set(["standard", "verbose"]);
@@ -861,10 +861,14 @@ function buildDecisionFramework(rows) {
 
 function aggregateDecision(rows) {
   if (!rows.length) return { fundamentals: "Unavailable", valuation: "Unavailable", momentum: "Unavailable", stance: "Neutral", symbols: [] };
-  const growth = median(rows.map((row) => row.reportedGrowth?.revenueTtmYoY).filter(Number.isFinite));
+  const staleFundamentalRows = rows.filter((row) => row.fundamentalCacheStatus === "stale" && Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
+  const freshFundamentalRows = rows.filter((row) => row.fundamentalCacheStatus !== "stale" && Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
+  const growth = median(freshFundamentalRows.map((row) => row.reportedGrowth.revenueTtmYoY));
   const valuation = median(rows.map((row) => row.valuation?.selectedPercentile).filter(Number.isFinite));
   const momentum = median(rows.map(momentumScore).filter(Number.isFinite));
-  const fundamentalsLabel = growth === null ? "Unavailable" : growth >= 15 ? "Strong" : growth >= 5 ? "Moderate" : growth >= 0 ? "Stable" : "Weak";
+  const fundamentalsLabel = growth === null
+    ? staleFundamentalRows.length ? "Stale" : "Unavailable"
+    : growth >= 15 ? "Strong" : growth >= 5 ? "Moderate" : growth >= 0 ? "Stable" : "Weak";
   const valuationLabel = valuation === null ? "Unavailable" : valuation >= 80 ? "High" : valuation <= 30 ? "Low" : "Moderate";
   const momentumLabel = momentum > 0 ? "Positive" : momentum < 0 ? "Negative" : "Mixed";
   return {
@@ -873,7 +877,19 @@ function aggregateDecision(rows) {
     momentum: momentumLabel,
     stance: sectorStance(fundamentalsLabel, valuationLabel, momentumLabel),
     symbols: rows.map((row) => row.symbol),
-    metrics: { medianReportedRevenueTtmYoY: growth, medianHistoricalValuationPercentile: valuation },
+    metrics: {
+      medianReportedRevenueTtmYoY: growth,
+      medianHistoricalValuationPercentile: valuation,
+      freshFundamentals: freshFundamentalRows.map(fundamentalEvidence),
+      staleFundamentals: staleFundamentalRows.map(fundamentalEvidence),
+    },
+  };
+}
+
+function fundamentalEvidence(row) {
+  return {
+    symbol: row.symbol,
+    asOf: row.fundamentalAsOf ?? row.reportedGrowth?.asOf ?? null,
   };
 }
 
@@ -1270,7 +1286,7 @@ function candidateResearchPrompt(compact, candidates, options = {}) {
     "Use only the supplied evidence. Do not infer that a headline caused a move unless the linkage is direct.",
     `Analyze only these batch symbols: ${[...candidateSymbols].join(", ")}. Do not place any other equity ticker in candidate fields; non-candidate market facts are context only.`,
     "Discovery names cannot pass the action gate when valuation, fundamentals, liquidity context, or a verified fresh company catalyst is missing.",
-    "Price movement alone may support Watch, never Buy/Sell. An extremeTrim flag without portfolio holdings is a valuation-risk flag only: use Review position size; Trim is not an allowed action.",
+    "Price movement alone may support Watch, never Buy/Sell. Without supplied portfolio holdings and target weights, extremeTrim is a valuation-risk flag only: use Watch, never Review position size or Trim.",
     "Return {\"candidates\":[...]} with exactly one object per supplied symbol and these fields:",
     "symbol, catalystSummary, evidenceFor (array), evidenceAgainst (array), mispricingThesis, strategicPosition (Buy/Hold/Avoid), todayAction (Buy now/Buy on weakness/Sell/Review position size/Watch/No action), confidence (High/Medium/Low), entryExitCondition, riskReward, invalidation, missingEvidence (array), sourceQuality, gateResult (pass/fail), gateReason.",
     "Do not invent target, support, resistance, stop, or entry prices. A dollar-denominated price may appear in entryExitCondition, invalidation, riskReward, or mispricingThesis only when it exactly matches the supplied current price, 52-week low, or 52-week high.",
@@ -1329,12 +1345,16 @@ export function normalizeResearchPacket(packet, candidate) {
     ? candidate?.setup?.verifiedCatalyst
     : false;
   const gateResult = packet.gateResult === "pass" && recommendedAction && !discoveryBlocked ? "pass" : "fail";
-  const portfolioReview = ["Trim", "Review position size"].includes(packet.todayAction) && candidate?.setup?.extremeTrim;
+  const portfolioInput = candidate?.portfolio?.holding === true && Number.isFinite(candidate?.portfolio?.targetWeight);
+  const portfolioReview = ["Trim", "Review position size"].includes(packet.todayAction) && candidate?.setup?.extremeTrim && portfolioInput;
+  const unsupportedPortfolioAction = ["Trim", "Review position size"].includes(packet.todayAction) && !portfolioInput;
   const finalAction = gateResult === "pass"
     ? packet.todayAction
     : portfolioReview
       ? "Review position size"
-      : (["Review position size", "Watch", "No action"].includes(packet.todayAction) ? packet.todayAction : "Watch");
+      : unsupportedPortfolioAction
+        ? "Watch"
+        : (["Review position size", "Watch", "No action"].includes(packet.todayAction) ? packet.todayAction : "Watch");
   return {
     ...packet,
     status: "complete",
@@ -1342,7 +1362,7 @@ export function normalizeResearchPacket(packet, candidate) {
     gateResult,
     todayAction: finalAction,
     finalAction,
-    gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, portfolioReview ? "extreme valuation is a risk flag; no holdings or target allocation were supplied" : null, !recommendedAction && !portfolioReview ? "action lacks deterministic catalyst eligibility" : null].filter(Boolean).join("; "),
+    gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, unsupportedPortfolioAction ? "position-size action requires supplied holdings and target weights; valuation risk remains Watch-only" : null, !recommendedAction && !portfolioReview && !unsupportedPortfolioAction ? "action lacks deterministic catalyst eligibility" : null].filter(Boolean).join("; "),
     sourceSnapshot: {
       symbol: candidate.symbol,
       sourceType: candidate.sourceType,
@@ -1486,6 +1506,8 @@ export function synthesisContext(compact, research) {
       positionIn52WeekRange: row.positionIn52WeekRange,
       valuation: row.valuation,
       reportedGrowth: row.reportedGrowth,
+      fundamentalCacheStatus: row.fundamentalCacheStatus,
+      fundamentalAsOf: row.fundamentalAsOf,
       catalyst: row.catalyst,
       risk: row.risk,
       finalAction: !researchSet.has(row.symbol)
@@ -1505,10 +1527,15 @@ export function renderMorningBrief(compact, identity = {}) {
   const recommended = packets.filter((packet) => packet.status === "complete" && packet.gateResult === "pass");
   const gateQualified = packets.filter((packet) => packet.status === "complete" && packet.modelGateResult === "pass");
   const verified = packets.filter((packet) => packet.sourceSnapshot?.setup?.verifiedCatalyst);
-  const avoid = packets.filter((packet) => packet.status === "complete" && packet.strategicPosition === "Avoid");
+  const researchExclusions = packets.filter((packet) => packet.status === "complete" && packet.strategicPosition === "Avoid");
   const cycleRows = Object.entries(compact.decisionFramework?.aiCycle ?? {});
   const sectorRows = Object.entries(compact.decisionFramework?.sectorScorecard ?? {});
   const unavailableContext = Object.entries(compact.marketContext ?? {}).filter(([, group]) => group?.status !== "available").map(([name]) => name);
+  const staleFundamentals = (compact.watchlist ?? []).filter((row) => row.fundamentalCacheStatus === "stale").map((row) => row.symbol);
+  const principalRisks = [
+    unavailableContext.length ? `Market inputs stale or unavailable: ${unavailableContext.join(", ")}` : null,
+    staleFundamentals.length ? `expired SEC fundamentals excluded from sector ratings pending refresh: ${staleFundamentals.join(", ")}` : null,
+  ].filter(Boolean);
   const best = recommended[0];
   const catalyst = verified[0];
   const lines = [
@@ -1523,9 +1550,9 @@ export function renderMorningBrief(compact, identity = {}) {
     "# Executive Summary",
     `- **AI Cycle:** ${cycleRows.every(([, row]) => row.rating === "Insufficient Data") ? "Insufficient Data; direct CapEx, demand, utilization, and estimate-revision evidence is unavailable." : "Mixed; see the deterministic dashboard."}`,
     `- **Key Catalyst:** ${catalyst ? `${catalyst.symbol} — ${cleanReportText(catalyst.catalystSummary)}` : "No verified company-specific catalyst in today's researched universe."}`,
-    `- **Principal Risk:** ${unavailableContext.length ? `Market inputs stale or unavailable: ${unavailableContext.join(", ")}.` : "Forward estimates and direct AI-cycle indicators are not in the snapshot; trailing data limit conviction."}`,
+    `- **Principal Risk:** ${principalRisks.length ? `${principalRisks.join("; ")}.` : "Forward estimates and direct AI-cycle indicators are not in the snapshot; trailing data limit conviction."}`,
     `- **Best Opportunity:** ${best ? `${best.symbol} — ${best.todayAction}; ${cleanReportText(best.gateReason)}` : `None clears the deterministic action gate; ${gateQualified.length} gate-qualified research setup(s), ${recommended.length} recommended action(s).`}`,
-    `- **Avoid:** ${avoid.length ? `${avoid.map((packet) => packet.symbol).join(", ")} — research packets classify these as Avoid.` : "No research-backed Avoid call today; do not act on unverified price moves."}`,
+    `- **Research Exclusions:** ${researchExclusions.length ? `${researchExclusions.map((packet) => packet.symbol).join(", ")} — excluded by research screening; not final portfolio recommendations.` : "None; research screening exclusions are not final portfolio recommendations."}`,
     "",
     "# Overnight and Market Context",
     `- **As Of:** ${compact.generatedAt ?? generatedAt}; session=${compact.session ?? "unavailable"}.`,
@@ -1614,7 +1641,20 @@ function sectorEvidence(row) {
   const symbols = row?.symbols?.join(", ") || "no covered symbols";
   const growth = row?.metrics?.medianReportedRevenueTtmYoY;
   const valuation = row?.metrics?.medianHistoricalValuationPercentile;
-  return `${symbols}; median reported revenue growth ${percent(growth)}; median valuation percentile ${percent(valuation)}`;
+  const fresh = formatFundamentalEvidence(row?.metrics?.freshFundamentals);
+  const stale = formatFundamentalEvidence(row?.metrics?.staleFundamentals);
+  return [
+    symbols,
+    `median fresh reported revenue growth ${percent(growth)}`,
+    fresh ? `fresh fundamentals ${fresh}` : null,
+    stale ? `stale fundamentals excluded ${stale}` : null,
+    `median valuation percentile ${percent(valuation)}`,
+  ].filter(Boolean).join("; ");
+}
+
+function formatFundamentalEvidence(rows) {
+  if (!rows?.length) return null;
+  return rows.map((row) => `${row.symbol} (as of ${row.asOf ?? "unavailable"})`).join(", ");
 }
 
 function balanceSheetDisplay(fundamentals) {
@@ -1968,6 +2008,7 @@ function validateWatchlistTable(section, compact, errors) {
 
 function validatePortfolioAndBalanceSheetClaims(markdown, compact, errors) {
   if (!compact?.portfolio && /\btrim\b/i.test(markdown)) errors.push("Trim is forbidden without portfolio holdings and target weights");
+  if (!compact?.portfolio && /\breview position size\b/i.test(markdown)) errors.push("Review position size is forbidden without portfolio holdings and target weights");
   for (const packet of compact?.research?.packets ?? []) {
     const symbol = packet.symbol;
     const lines = markdown.split("\n").filter((line) => new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(line));
@@ -2481,6 +2522,7 @@ function compactRow(row) {
     reportedGrowth: row.reportedGrowth ?? null,
     fundamentalCacheStatus: row.fundamentals?.cacheStatus ?? null,
     fundamentalCachedAt: row.fundamentals?.cachedAt ?? null,
+    fundamentalAsOf: row.valuation?.fundamentalAsOf ?? row.reportedGrowth?.asOf ?? row.fundamentals?.asOf ?? null,
     missing: false,
   };
 }

@@ -55,7 +55,7 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "",
     "**Report Mode:** standard",
     "**Engine Version:** 0.5.7",
-    "**Build Revision:** 0.5.7-hf4",
+    "**Build Revision:** 0.5.7-hf5",
     "**Report ID:** 00000000-0000-4000-8000-000000000000",
     "**Generated At:** 2026-08-05T13:35:00.000Z",
     "",
@@ -64,7 +64,7 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     `- **Key Catalyst:** ${detail}`,
     "- **Principal Risk:** Missing forward estimates limit directional confidence.",
     `- **Best Opportunity:** None clears the action gate; ${symbolText} remains a researched near-miss.`,
-    "- **Avoid:** Avoid treating unverified price movement as a fundamental signal.",
+    "- **Research Exclusions:** None; research screening exclusions are not final portfolio recommendations.",
     "",
     "# Overnight and Market Context",
     "- **As Of:** 2026-08-05T13:35:00.000Z; regular trading session.",
@@ -111,7 +111,7 @@ test("verbose Morning Brief keeps research audit out of the five-section product
     reportMode: "verbose",
     engineVersion: "0.5.7",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
-    buildRevision: "0.5.7-hf4",
+    buildRevision: "0.5.7-hf5",
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
@@ -142,7 +142,7 @@ test("verbose validation applies section-aware research and context-only ticker 
   const compact = {
     reportMode: "verbose",
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf4",
+    buildRevision: "0.5.7-hf5",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
@@ -389,7 +389,7 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
   const stored = bucket.objects.get("reports/2026-08-05.md");
   assert.equal(stored, webhookMarkdown);
   assert.equal(bucket.objects.get("reports/latest.md"), stored);
-  assert.match(stored, /\*\*Build Revision:\*\* 0\.5\.7-hf4/);
+  assert.match(stored, /\*\*Build Revision:\*\* 0\.5\.7-hf5/);
   assert.doesNotMatch(stored, /Research Audit/);
   assert.ok(bucket.objects.has("research-audit/2026-08-05.md"));
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportDate, "2026-08-05");
@@ -508,7 +508,7 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
   assert.equal(body.report.reportEngineVersion, "0.5.7");
-  assert.equal(body.report.reportBuildRevision, "0.5.7-hf4");
+  assert.equal(body.report.reportBuildRevision, "0.5.7-hf5");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.7");
   assert.match(bucket.objects.get("reports/latest.md"), /# Executive Summary/);
@@ -558,6 +558,15 @@ test("strict schema rejects an Executive Summary without the required AI Cycle b
   const validation = validateReportCompleteness(markdown, ["NVDA"]);
   assert.equal(validation.ok, false);
   assert.match(validation.errors.join("; "), /missing Executive Summary field: AI Cycle/);
+});
+
+test("strict schema requires Research Exclusions instead of the legacy Avoid label", () => {
+  const legacy = completeReport().replace(
+    "- **Research Exclusions:** None; research screening exclusions are not final portfolio recommendations.",
+    "- **Avoid:** Avoid treating unverified price movement as a fundamental signal.",
+  );
+
+  assert.match(validateReportCompleteness(legacy, ["NVDA"]).errors.join("; "), /missing Executive Summary field: Research Exclusions/);
 });
 
 test("strict schema rejects a recap that only has the four section names", () => {
@@ -677,7 +686,7 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
   const compact = {
     schemaVersion: 7,
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf4",
+    buildRevision: "0.5.7-hf5",
     reportMode: "verbose",
     generatedAt: "2026-08-10T23:45:11.044Z",
     session: "after_hours",
@@ -723,6 +732,62 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
   assert.match(report, /Trailing valuation unavailable; Forward valuation unavailable/);
   assert.match(report, /\| NVDA .*\| Watch \| Researched \|/);
   assert.doesNotMatch(report, /\| NVDA .*\| Buy(?: now| on weakness)? \| Researched \|/);
+  assert.match(report, /\*\*Research Exclusions:\*\*/);
+  assert.doesNotMatch(report, /^- \*\*Avoid:\*\*/m);
+});
+
+test("renderer excludes expired SEC fundamentals and surfaces their symbols and as-of dates", () => {
+  const compact = {
+    schemaVersion: 7,
+    engineVersion: "0.5.7",
+    buildRevision: "0.5.7-hf5",
+    reportMode: "verbose",
+    generatedAt: "2026-08-11T05:54:44.315Z",
+    session: "closed",
+    marketContext: {},
+    calendars: null,
+    news: {},
+    decisionFramework: {
+      aiCycle: {},
+      sectorScorecard: {
+        GPU: {
+          fundamentals: "Stale", valuation: "High", momentum: "Mixed", stance: "Neutral", symbols: ["NVDA"],
+          metrics: {
+            medianReportedRevenueTtmYoY: null,
+            medianHistoricalValuationPercentile: 82.1,
+            freshFundamentals: [],
+            staleFundamentals: [{ symbol: "NVDA", asOf: "2026-05-28" }],
+          },
+        },
+      },
+    },
+    opportunityGate: { candidates: [] },
+    watchlist: [{
+      symbol: "NVDA", price: 217.55, changePercent: -2.86, positionIn52WeekRange: 74.58,
+      valuation: { selectedMetric: "trailingPE", trailingPE: 33.32, selectedPercentile: 82.1 },
+      reportedGrowth: { revenueTtmYoY: 32.29 }, fundamentalCacheStatus: "stale", fundamentalAsOf: "2026-05-28",
+      catalyst: "n/a — no company-specific catalyst in snapshot", risk: "expired cache",
+    }],
+  };
+  const research = {
+    funnel: { admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 },
+    packets: [{
+      symbol: "NVDA", status: "complete", modelGateResult: "fail", gateResult: "fail", strategicPosition: "Avoid",
+      todayAction: "Watch", finalAction: "Watch", sourceSnapshot: { setup: { verifiedCatalyst: false } },
+    }],
+    batches: [],
+  };
+
+  const report = renderMorningBrief(synthesisContext(compact, research), {
+    reportId: "00000000-0000-4000-8000-000000000000",
+    generatedAt: "2026-08-11T05:55:05.623Z",
+  });
+
+  assert.match(report, /Principal Risk:.*expired SEC fundamentals excluded from sector ratings pending refresh: NVDA/i);
+  assert.match(report, /\*\*Research Exclusions:\*\* NVDA — excluded by research screening; not final portfolio recommendations/);
+  assert.match(report, /\| GPU \| Stale \| High \| Mixed \| Neutral \|/);
+  assert.match(report, /stale fundamentals excluded NVDA \(as of 2026-05-28\)/);
+  assert.doesNotMatch(report, /\| GPU \| Strong \|/);
 });
 
 test("recommendedActions=0 rejects any Buy or Sell leaked into Watchlist Final Action", () => {
@@ -748,14 +813,21 @@ test("a gate-approved Buy now survives exact Final Action validation", () => {
   assert.deepEqual(validateReportCompleteness(completeReport(["NVDA"], undefined, "Buy now"), ["NVDA"], compact), { ok: true, errors: [] });
 });
 
-test("extreme valuation without holdings becomes a position-size review, not Trim", () => {
+test("extreme valuation without holdings remains Watch-only", () => {
   const normalized = normalizeResearchPacket({
     symbol: "ANET", gateResult: "pass", todayAction: "Trim", gateReason: "extreme valuation", strategicPosition: "Hold",
   }, { symbol: "ANET", sourceType: "core", setup: { verifiedCatalyst: false, dislocation: false, extremeTrim: true } });
   assert.equal(normalized.gateResult, "fail");
-  assert.equal(normalized.todayAction, "Review position size");
-  assert.equal(normalized.finalAction, "Review position size");
-  assert.match(normalized.gateReason, /no holdings or target allocation were supplied/);
+  assert.equal(normalized.todayAction, "Watch");
+  assert.equal(normalized.finalAction, "Watch");
+  assert.match(normalized.gateReason, /requires supplied holdings and target weights/);
+});
+
+test("final validation rejects position-size advice without portfolio input", () => {
+  const leaked = completeReport(["ANET"]).replace("| Watch | Researched |", "| Review position size | Researched |");
+  const errors = validateReportCompleteness(leaked, ["ANET"], { watchlist: [{ symbol: "ANET", finalAction: "Review position size" }] }).errors.join("; ");
+
+  assert.match(errors, /Review position size is forbidden without portfolio holdings and target weights/);
 });
 
 test("research packets reject unsourced support, resistance, target, and stop prices", () => {
@@ -778,7 +850,7 @@ test("research packets reject unsourced support, resistance, target, and stop pr
 
 test("separate research audit deterministically renders negative net debt as net cash", () => {
   const audit = renderResearchAudit({
-    engineVersion: "0.5.7", buildRevision: "0.5.7-hf4",
+    engineVersion: "0.5.7", buildRevision: "0.5.7-hf5",
     opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
     dataQuality: { discoveryFundamentals: { sourceFailures: 0 } },
     research: {
@@ -1068,7 +1140,7 @@ test("existing dated report prevents duplicate report generation but still evalu
   assert.deepEqual(result.report, {
     date: "2026-08-05",
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf4",
+    buildRevision: "0.5.7-hf5",
     generated: false,
     stored: true,
     storage: null,
