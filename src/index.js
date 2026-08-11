@@ -11,7 +11,7 @@ const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
 const SERVICE_VERSION = "0.5.7";
-const BUILD_REVISION = "0.5.7-hf5";
+const BUILD_REVISION = "0.5.7-hf5.1";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -105,7 +105,8 @@ export default {
         return json({ error: "delivery_failed", message: errorMessage(error) }, 502);
       }
     }
-    if ((path === "/run-report" || path === `/run-report/v${SERVICE_VERSION}`) && request.method === "POST") {
+    const buildSpecificReportPath = `/run-report/v${SERVICE_VERSION}/build/${BUILD_REVISION}`;
+    if ((path === "/run-report" || path === buildSpecificReportPath) && request.method === "POST") {
       if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
       try {
         const options = await request.json().catch(() => ({}));
