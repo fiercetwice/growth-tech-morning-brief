@@ -10,8 +10,8 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.8.1";
-const BUILD_REVISION = "0.5.8.1";
+const SERVICE_VERSION = "0.5.8.2";
+const BUILD_REVISION = "0.5.8.2";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -21,7 +21,13 @@ const REQUIRED_REPORT_SECTIONS = [
   "Sector Scorecard",
   "Watchlist",
 ];
-const REQUIRED_EXECUTIVE_LABELS = ["AI Cycle", "Key Catalyst", "Principal Risk", "Best Opportunity", "Areas to Avoid"];
+const REQUIRED_EXECUTIVE_LABELS = [
+  "AI Cycle and Sector Implications",
+  "Market Context",
+  "Key Scheduled Event",
+  "Highest-Ranked Recommendation",
+  "Primary Valuation Risk",
+];
 const REQUIRED_CONTEXT_LABELS = ["As Of", "Global Markets", "Futures", "Rates", "Dollar", "Oil"];
 const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Sell", "Review position size", "Watch", "No action"];
 const REPORT_MODES = new Set(["standard", "verbose"]);
@@ -1650,26 +1656,11 @@ export function renderMorningBrief(compact, identity = {}) {
   const packets = compact.research?.packets ?? [];
   const recommended = packets.filter((packet) => packet.status === "complete" && packet.gateResult === "pass");
   const gateQualified = packets.filter((packet) => packet.status === "complete" && packet.modelGateResult === "pass");
-  const verified = packets.filter((packet) => packet.sourceSnapshot?.setup?.verifiedCatalyst);
   const cycleRows = Object.entries(compact.decisionFramework?.aiCycle ?? {});
   const sectorRows = Object.entries(compact.decisionFramework?.sectorScorecard ?? {});
-  const cautiousSectors = sectorRows.filter(([, row]) => row.stance === "Cautious").map(([sector]) => sector);
-  const unavailableContext = Object.entries(compact.marketContext ?? {}).filter(([, group]) => group?.status !== "available").map(([name]) => name);
-  const researchSymbols = new Set(compact.researchSymbols ?? packets.map((packet) => packet.symbol));
-  const staleFundamentals = (compact.watchlist ?? []).filter((row) => row.fundamentalCacheStatus === "stale");
-  const researchedStaleFundamentals = staleFundamentals.filter((row) => researchSymbols.has(row.symbol)).map((row) => row.symbol);
-  const unresearchedStaleCount = staleFundamentals.length - researchedStaleFundamentals.length;
-  const staleFundamentalRisks = [
-    researchedStaleFundamentals.length ? `expired SEC fundamentals excluded from sector ratings pending refresh: ${researchedStaleFundamentals.join(", ")}` : null,
-    unresearchedStaleCount ? `${unresearchedStaleCount} unresearched watchlist ${unresearchedStaleCount === 1 ? "name also has" : "names also have"} expired SEC fundamentals pending refresh` : null,
-  ].filter(Boolean);
-  const principalRisks = [
-    unavailableContext.length ? `Market inputs stale or unavailable: ${unavailableContext.join(", ")}` : null,
-    staleFundamentalRisks.length ? staleFundamentalRisks.join("; ") : null,
-  ].filter(Boolean);
-  const best = recommended[0];
-  const catalyst = verified[0];
-  const cycleSummary = summarizeAiCycle(cycleRows);
+  const best = highestRankedRecommendation(recommended);
+  const scheduledEvent = keyScheduledEvent(compact);
+  const valuationRisk = primaryValuationRisk(compact.watchlist ?? [], sectorRows);
   const lines = [
     `# Growth Tech Morning Brief — ${generatedAt.slice(0, 10)}`,
     "",
@@ -1680,11 +1671,11 @@ export function renderMorningBrief(compact, identity = {}) {
     `**Generated At:** ${generatedAt}`,
     "",
     "# Executive Summary",
-    `- **AI Cycle:** ${cycleSummary}`,
-    `- **Key Catalyst:** ${catalyst ? `${catalyst.symbol} — ${cleanReportText(catalyst.catalystSummary)}` : "No verified company-specific catalyst in today's researched universe."}`,
-    `- **Principal Risk:** ${principalRisks.length ? `${principalRisks.join("; ")}.` : "Forward estimates remain unavailable; direct AI-cycle observations are point-in-time company disclosures and definitions differ."}`,
-    `- **Best Opportunity:** ${best ? `${best.symbol} — ${best.todayAction}; ${cleanReportText(best.gateReason)}` : `None clears the deterministic action gate; ${gateQualified.length} gate-qualified research setup(s), ${recommended.length} recommended action(s).`}`,
-    `- **Areas to Avoid:** ${cautiousSectors.length ? `${cautiousSectors.join(", ")} — deterministic sector stance is Cautious; see scorecard evidence.` : "No evidence-backed sector avoid call today."}`,
+    `- **AI Cycle and Sector Implications:** ${summarizeCycleAndSectors(cycleRows, sectorRows)}`,
+    `- **Market Context:** ${summarizeMarketContext(compact.marketContext)}`,
+    `- **Key Scheduled Event:** ${scheduledEvent}`,
+    `- **Highest-Ranked Recommendation:** ${best ? formatHighestRankedRecommendation(best) : `No gate-qualified recommendation; ${gateQualified.length} model-qualified research setup(s), ${recommended.length} deterministic recommendation(s).`}`,
+    `- **Primary Valuation Risk:** ${valuationRisk}`,
     "",
     "# Overnight and Market Context",
     `- **As Of:** ${compact.generatedAt ?? generatedAt}; session=${compact.session ?? "unavailable"}.`,
@@ -1710,6 +1701,92 @@ export function renderMorningBrief(compact, identity = {}) {
     ...(compact.watchlist ?? []).map((row) => renderWatchlistRow(row)),
   ];
   return lines.join("\n");
+}
+
+function summarizeCycleAndSectors(cycleRows, sectorRows) {
+  const cycle = summarizeAiCycle(cycleRows);
+  const favorable = sectorRows.filter(([, row]) => row.stance === "Favorable").map(([sector]) => sector);
+  const cautious = sectorRows.filter(([, row]) => row.stance === "Cautious").map(([sector]) => sector);
+  const highValuation = sectorRows.filter(([, row]) => row.valuation === "High").map(([sector]) => sector);
+  const implications = [
+    favorable.length ? `Favorable sector stance: ${favorable.join(", ")}` : null,
+    cautious.length ? `Cautious sector stance: ${cautious.join(", ")}` : null,
+    highValuation.length ? `high valuation: ${highValuation.join(", ")}` : null,
+  ].filter(Boolean);
+  return `${cycle}${implications.length ? ` ${implications.join("; ")}.` : " Sector stances are neutral."}`;
+}
+
+function summarizeMarketContext(context = {}) {
+  const observations = [];
+  const nasdaq = context.futures?.items?.find((item) => item.label === "Nasdaq 100");
+  const tenYear = context.rates?.items?.find((item) => item.label === "U.S. 10Y yield");
+  const dollar = context.usd?.items?.find((item) => item.label === "U.S. Dollar Index");
+  const oil = context.oil?.items?.find((item) => item.label === "WTI crude");
+  if (Number.isFinite(nasdaq?.changePercent)) observations.push(`Nasdaq 100 futures ${percent(nasdaq.changePercent, true)}`);
+  if (Number.isFinite(tenYear?.change)) observations.push(`U.S. 10Y yield ${tenYear.change >= 0 ? "+" : ""}${round(tenYear.change * 100)} bps`);
+  if (Number.isFinite(dollar?.changePercent)) observations.push(`U.S. Dollar Index ${percent(dollar.changePercent, true)}`);
+  if (Number.isFinite(oil?.changePercent)) observations.push(`WTI crude ${percent(oil.changePercent, true)}`);
+  const stale = Object.entries(context).filter(([, group]) => group?.status === "stale").map(([name]) => marketGroupLabel(name));
+  const unavailable = Object.entries(context).filter(([, group]) => group?.status === "unavailable").map(([name]) => marketGroupLabel(name));
+  const qualifications = [
+    stale.length ? `stale: ${stale.join(", ")}` : null,
+    unavailable.length ? `unavailable: ${unavailable.join(", ")}` : null,
+  ].filter(Boolean);
+  if (!observations.length) return `No current market-context observations available${qualifications.length ? `; ${qualifications.join("; ")}` : ""}.`;
+  return `${observations.join("; ")}${qualifications.length ? `; ${qualifications.join("; ")}` : ""}.`;
+}
+
+function marketGroupLabel(name) {
+  return ({ futures: "futures", rates: "rates", usd: "dollar", oil: "oil" })[name] ?? name;
+}
+
+function keyScheduledEvent(compact) {
+  const researchSymbols = new Set(compact.researchSymbols ?? (compact.research?.packets ?? []).map((packet) => packet.symbol));
+  const earnings = compact.calendars?.earnings;
+  const events = (earnings?.events ?? [])
+    .filter((event) => researchSymbols.has(event.symbol) && Object.hasOwn(CIKS, event.symbol))
+    .sort((a, b) => marketNumber(b.marketCap) - marketNumber(a.marketCap));
+  const event = events[0];
+  if (!event) return "No material scheduled event identified among researched core-watchlist names.";
+  const sectors = Object.entries(SECTOR_MEMBERS).filter(([, symbols]) => symbols.includes(event.symbol)).map(([sector]) => sector);
+  return `${event.symbol} earnings${event.time ? ` (${cleanReportText(event.time)})` : ""}${sectors.length ? `; relevant scorecard exposure: ${sectors.join(", ")}` : ""}.`;
+}
+
+function highestRankedRecommendation(packets) {
+  return [...packets].sort((a, b) => recommendationRank(b) - recommendationRank(a))[0] ?? null;
+}
+
+function recommendationRank(packet) {
+  const action = { "Buy now": 30, Sell: 30, "Buy on weakness": 20 }[packet.finalAction ?? packet.todayAction] ?? 0;
+  const confidence = { High: 3, Medium: 2, Low: 1 }[packet.confidence] ?? 0;
+  const setup = packet.sourceSnapshot?.setup?.score ?? 0;
+  const upside = Math.max(-100, Math.min(100, packet.sourceSnapshot?.targetAndMispricing?.baseUpsidePercent ?? 0));
+  return action * 10_000 + confidence * 1_000 + setup * 10 + upside;
+}
+
+function formatHighestRankedRecommendation(packet) {
+  const action = packet.finalAction ?? packet.todayAction;
+  const risk = cleanReportText(packet.invalidation || packet.evidenceAgainst?.[0] || "No thesis-specific invalidation supplied.");
+  return `${packet.symbol} — ${action}; ${cleanReportText(packet.gateReason)}; invalidation: ${risk}`;
+}
+
+function primaryValuationRisk(watchlist, sectorRows) {
+  const researched = watchlist.filter((row) => row.researchStatus !== "not_researched_today");
+  const ranked = researched.map((row) => {
+    const valuation = row.valuation?.selectedPercentile;
+    const range = row.positionIn52WeekRange;
+    const score = (Number.isFinite(valuation) ? valuation : -100) + (Number.isFinite(range) ? range : -100);
+    return { row, valuation, range, score };
+  }).filter(({ valuation, range }) => (valuation ?? -Infinity) >= 80 || (range ?? -Infinity) >= 90)
+    .sort((a, b) => b.score - a.score);
+  const selected = ranked[0];
+  if (!selected) return "No significant valuation-risk signal identified among researched names.";
+  const sectors = sectorRows.filter(([, sector]) => sector.symbols?.includes(selected.row.symbol)).map(([sector]) => sector);
+  const measures = [
+    Number.isFinite(selected.valuation) ? `historical valuation percentile ${percent(selected.valuation)}` : null,
+    Number.isFinite(selected.range) ? `52-week range position ${percent(selected.range)}` : null,
+  ].filter(Boolean);
+  return `${selected.row.symbol} — ${measures.join("; ")}${sectors.length ? `; sector exposure: ${sectors.join(", ")}` : ""}.`;
 }
 
 function summarizeAiCycle(rows) {

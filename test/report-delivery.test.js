@@ -54,17 +54,17 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "# Growth Tech Morning Brief",
     "",
     "**Report Mode:** standard",
-    "**Engine Version:** 0.5.8.1",
-    "**Build Revision:** 0.5.8.1",
+    "**Engine Version:** 0.5.8.2",
+    "**Build Revision:** 0.5.8.2",
     "**Report ID:** 00000000-0000-4000-8000-000000000000",
     "**Generated At:** 2026-08-05T13:35:00.000Z",
     "",
     "# Executive Summary",
-    "- **AI Cycle:** Insufficient Data; price action cannot establish the cycle.",
-    `- **Key Catalyst:** ${detail}`,
-    "- **Principal Risk:** Missing forward estimates limit directional confidence.",
-    `- **Best Opportunity:** None clears the action gate; ${symbolText} remains a researched near-miss.`,
-    "- **Areas to Avoid:** No evidence-backed sector avoid call today.",
+    "- **AI Cycle and Sector Implications:** Insufficient Data; price action cannot establish the cycle. Sector stances are neutral.",
+    "- **Market Context:** No current market-context observations available.",
+    `- **Key Scheduled Event:** ${detail}`,
+    `- **Highest-Ranked Recommendation:** No gate-qualified recommendation; ${symbolText} remains a researched near-miss.`,
+    "- **Primary Valuation Risk:** No significant valuation-risk signal identified among researched names.",
     "",
     "# Overnight and Market Context",
     "- **As Of:** 2026-08-05T13:35:00.000Z; regular trading session.",
@@ -109,9 +109,9 @@ function verboseNoTradeReport(symbols = ["NVDA"]) {
 test("verbose Morning Brief keeps research audit out of the five-section product", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.8.1",
+    engineVersion: "0.5.8.2",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
-    buildRevision: "0.5.8.1",
+    buildRevision: "0.5.8.2",
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
@@ -141,8 +141,8 @@ test("unavailable market context must be marked unavailable at category level", 
 test("verbose validation applies section-aware research and context-only ticker scopes", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.8.1",
-    buildRevision: "0.5.8.1",
+    engineVersion: "0.5.8.2",
+    buildRevision: "0.5.8.2",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
@@ -245,7 +245,7 @@ test("synthesis exposes a filtered two-level ticker universe while preserving so
   };
   const compact = {
     schemaVersion: 8,
-    engineVersion: "0.5.8.1",
+    engineVersion: "0.5.8.2",
     reportMode: "verbose",
     calendars: { earnings: { events: [{ symbol: "NVDA" }, { symbol: "MSFT" }, { symbol: "LITE" }], watchlistMatches: ["NVDA", "MSFT"] } },
     decisionFramework: { aiCycle: { GPU: { evidence: "NVDA +1%, MSFT -1%" } } },
@@ -509,10 +509,10 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiProvider, "deepseek");
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
-  assert.equal(body.report.reportEngineVersion, "0.5.8.1");
-  assert.equal(body.report.reportBuildRevision, "0.5.8.1");
+  assert.equal(body.report.reportEngineVersion, "0.5.8.2");
+  assert.equal(body.report.reportBuildRevision, "0.5.8.2");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.8.1");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.8.2");
   assert.match(bucket.objects.get("reports/latest.md"), /# Executive Summary/);
   assert.doesNotMatch(bucket.objects.get("reports/latest.md"), /Research Audit/);
   assert.ok(bucket.objects.has("research-audit/latest.md"));
@@ -555,20 +555,20 @@ test("openai-compatible route uses only the preconfigured HTTPS base URL", async
   assert.equal(result.report.aiModel, "research-model");
 });
 
-test("strict schema rejects an Executive Summary without the required AI Cycle bullet", () => {
-  const markdown = completeReport(["NVDA"]).replace("- **AI Cycle:** Insufficient Data; price action cannot establish the cycle.\n", "");
+test("strict schema rejects an Executive Summary without the required cycle-and-sector bullet", () => {
+  const markdown = completeReport(["NVDA"]).replace("- **AI Cycle and Sector Implications:** Insufficient Data; price action cannot establish the cycle. Sector stances are neutral.\n", "");
   const validation = validateReportCompleteness(markdown, ["NVDA"]);
   assert.equal(validation.ok, false);
-  assert.match(validation.errors.join("; "), /missing Executive Summary field: AI Cycle/);
+  assert.match(validation.errors.join("; "), /missing Executive Summary field: AI Cycle and Sector Implications/);
 });
 
-test("strict schema requires Areas to Avoid instead of research-pipeline exclusions", () => {
+test("strict schema requires the neutral Primary Valuation Risk label", () => {
   const legacy = completeReport().replace(
+    "- **Primary Valuation Risk:** No significant valuation-risk signal identified among researched names.",
     "- **Areas to Avoid:** No evidence-backed sector avoid call today.",
-    "- **Research Exclusions:** None; research screening exclusions are not final portfolio recommendations.",
   );
 
-  assert.match(validateReportCompleteness(legacy, ["NVDA"]).errors.join("; "), /missing Executive Summary field: Areas to Avoid/);
+  assert.match(validateReportCompleteness(legacy, ["NVDA"]).errors.join("; "), /missing Executive Summary field: Primary Valuation Risk/);
 });
 
 test("strict schema rejects a recap that only has the four section names", () => {
@@ -756,8 +756,8 @@ test("neutral 10-20% upside does not change a catalyst-backed Buy now", () => {
 test("renderer uses final action, sector stance, explicit valuation basis, and explicit Dollar change label", () => {
   const compact = {
     schemaVersion: 8,
-    engineVersion: "0.5.8.1",
-    buildRevision: "0.5.8.1",
+    engineVersion: "0.5.8.2",
+    buildRevision: "0.5.8.2",
     reportMode: "verbose",
     generatedAt: "2026-08-10T23:45:11.044Z",
     session: "after_hours",
@@ -810,7 +810,8 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
   assert.match(report, /Trailing valuation unavailable; Forward valuation unavailable/);
   assert.match(report, /\| NVDA .*\| Watch \| Researched \|/);
   assert.doesNotMatch(report, /\| NVDA .*\| Buy(?: now| on weakness)? \| Researched \|/);
-  assert.match(report, /\*\*Areas to Avoid:\*\*/);
+  assert.match(report, /\*\*Primary Valuation Risk:\*\*/);
+  assert.match(report, /\*\*AI Cycle and Sector Implications:\*\*/);
   assert.doesNotMatch(report, /^- \*\*Research Exclusions:\*\*/m);
   const tampered = report.replace("$190 / $260 / $310", "$190 / $280 / $310");
   assert.match(validateReportCompleteness(tampered, ["NVDA"], synthesis).errors.join("; "), /changed deterministic target value for NVDA: \$260/);
@@ -819,8 +820,8 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
 test("renderer excludes expired SEC fundamentals and surfaces their symbols and as-of dates", () => {
   const compact = {
     schemaVersion: 8,
-    engineVersion: "0.5.8.1",
-    buildRevision: "0.5.8.1",
+    engineVersion: "0.5.8.2",
+    buildRevision: "0.5.8.2",
     reportMode: "verbose",
     generatedAt: "2026-08-11T05:54:44.315Z",
     session: "closed",
@@ -873,16 +874,80 @@ test("renderer excludes expired SEC fundamentals and surfaces their symbols and 
     generatedAt: "2026-08-11T05:55:05.623Z",
   });
 
-  const principalRisk = report.split("\n").find((line) => line.startsWith("- **Principal Risk:**"));
-  assert.match(report, /Principal Risk:.*expired SEC fundamentals excluded from sector ratings pending refresh: NVDA/i);
-  assert.match(principalRisk, /1 unresearched watchlist name also has expired SEC fundamentals pending refresh/i);
-  assert.doesNotMatch(principalRisk, /\bTSM\b/);
-  assert.match(report, /\*\*Areas to Avoid:\*\* No evidence-backed sector avoid call today/);
+  assert.match(report, /\*\*Primary Valuation Risk:\*\* NVDA — historical valuation percentile 82\.1%; 52-week range position 74\.58%; sector exposure: GPU\./);
+  assert.doesNotMatch(report, /\*\*Principal Risk:\*\*/);
   assert.match(report, /\| GPU \| Stale \| High \| Mixed \| Neutral \|/);
   assert.match(report, /stale fundamentals excluded NVDA \(as of 2026-05-28\), TSM \(as of 2026-05-20\)/);
   assert.doesNotMatch(report, /\| GPU \| Strong \|/);
   const scopeErrors = validateReportCompleteness(report, ["NVDA"], synthesisContext(compact, research)).errors.join("; ");
   assert.doesNotMatch(scopeErrors, /ticker reference outside research universe in Executive Summary/);
+});
+
+test("Executive Summary prioritizes core scheduled events, gate-approved recommendations, and researched valuation risk", () => {
+  const compact = {
+    schemaVersion: 8,
+    engineVersion: "0.5.8.2",
+    buildRevision: "0.5.8.2",
+    reportMode: "verbose",
+    generatedAt: "2026-08-11T13:00:00.000Z",
+    session: "premarket",
+    marketContext: {
+      futures: { status: "available", items: [{ label: "Nasdaq 100", changePercent: -0.45 }] },
+      rates: { status: "available", items: [{ label: "U.S. 10Y yield", change: -0.01 }] },
+      usd: { status: "available", items: [{ label: "U.S. Dollar Index", changePercent: 0.12 }] },
+      oil: { status: "available", items: [{ label: "WTI crude", changePercent: 1.33 }] },
+    },
+    calendars: {
+      earnings: {
+        status: "available",
+        events: [
+          { symbol: "KOPN", time: "time-pre-market", marketCap: "$300,000,000" },
+          { symbol: "CRWV", time: "time-after-hours", marketCap: "$50,000,000,000" },
+        ],
+        watchlistMatches: ["CRWV"],
+      },
+    },
+    news: {},
+    decisionFramework: {
+      aiCycle: {
+        "GPU Demand": { rating: "Positive", trend: "Accelerating", evidence: "two official indicators", limitation: "definitions differ" },
+      },
+      sectorScorecard: {
+        "AI Cloud": { fundamentals: "Strong", valuation: "Low", momentum: "Positive", stance: "Favorable", symbols: ["AMZN"] },
+        "GPU Cloud": { fundamentals: "Strong", valuation: "Moderate", momentum: "Negative", stance: "Neutral", symbols: ["CRWV"] },
+        Networking: { fundamentals: "Strong", valuation: "High", momentum: "Positive", stance: "Neutral", symbols: ["ANET"] },
+      },
+    },
+    opportunityGate: { candidates: [] },
+    discovery: { candidates: [{ symbol: "KOPN" }] },
+    watchlist: [
+      { symbol: "AMZN", price: 278, changePercent: 1, positionIn52WeekRange: 70, valuation: { selectedMetric: "trailingPE", trailingPE: 22, selectedPercentile: 25 }, targetAndMispricing: { status: "available", confidence: "High", baseUpsidePercent: 30 }, catalyst: "n/a", risk: "execution risk" },
+      { symbol: "ANET", price: 191, changePercent: 1.5, positionIn52WeekRange: 98.8, valuation: { selectedMetric: "trailingPE", trailingPE: 60, selectedPercentile: 97.8 }, targetAndMispricing: { status: "available", confidence: "High", baseUpsidePercent: -20 }, catalyst: "n/a", risk: "valuation risk" },
+      { symbol: "CRWV", price: 88, changePercent: -2.7, positionIn52WeekRange: 31, valuation: { selectedMetric: "trailingPS", trailingPS: 7, selectedPercentile: 43 }, targetAndMispricing: { status: "unavailable", reason: "insufficient history" }, catalyst: "Earnings scheduled today", risk: "financing risk" },
+    ],
+  };
+  const research = {
+    funnel: { admitted: 4, researched: 4, incomplete: 0, gateQualified: 1, recommendedActions: 1, rejectedOrWatch: 3 },
+    packets: [
+      { symbol: "KOPN", status: "complete", modelGateResult: "fail", gateResult: "fail", finalAction: "Watch", catalystSummary: "CES product announcement", sourceSnapshot: { sourceType: "discovery", setup: { verifiedCatalyst: true } } },
+      { symbol: "CRWV", status: "complete", modelGateResult: "fail", gateResult: "fail", finalAction: "Watch", sourceSnapshot: { sourceType: "core", setup: { verifiedCatalyst: true } } },
+      { symbol: "AMZN", status: "complete", modelGateResult: "pass", gateResult: "pass", confidence: "High", todayAction: "Buy on weakness", finalAction: "Buy on weakness", gateReason: "qualified 1Q rerating path", invalidation: "Cloud growth falls below the supplied threshold.", sourceSnapshot: { sourceType: "core", setup: { score: 2 }, targetAndMispricing: { baseUpsidePercent: 30 } } },
+      { symbol: "ANET", status: "complete", modelGateResult: "fail", gateResult: "fail", finalAction: "Watch", sourceSnapshot: { sourceType: "core", setup: {} } },
+    ],
+    batches: [],
+  };
+
+  const report = renderMorningBrief(synthesisContext(compact, research), {
+    reportId: "00000000-0000-4000-8000-000000000000",
+    generatedAt: "2026-08-11T13:01:00.000Z",
+  });
+
+  assert.match(report, /\*\*AI Cycle and Sector Implications:\*\* Positive; 1 segment\(s\).*Favorable sector stance: AI Cloud; high valuation: Networking/);
+  assert.match(report, /\*\*Market Context:\*\* Nasdaq 100 futures -0\.45%; U\.S\. 10Y yield -1 bps; U\.S\. Dollar Index \+0\.12%; WTI crude \+1\.33%/);
+  assert.match(report, /\*\*Key Scheduled Event:\*\* CRWV earnings \(time-after-hours\); relevant scorecard exposure: GPU Cloud\./);
+  assert.doesNotMatch(report.split("# Overnight and Market Context")[0], /KOPN|CES product announcement/);
+  assert.match(report, /\*\*Highest-Ranked Recommendation:\*\* AMZN — Buy on weakness; qualified 1Q rerating path; invalidation: Cloud growth falls below the supplied threshold\./);
+  assert.match(report, /\*\*Primary Valuation Risk:\*\* ANET — historical valuation percentile 97\.8%; 52-week range position 98\.8%; sector exposure: Networking\./);
 });
 
 test("recommendedActions=0 rejects any Buy or Sell leaked into Watchlist Final Action", () => {
@@ -946,7 +1011,7 @@ test("research packets reject unsourced support, resistance, target, and stop pr
 
 test("separate research audit deterministically renders negative net debt as net cash", () => {
   const audit = renderResearchAudit({
-    engineVersion: "0.5.8.1", buildRevision: "0.5.8.1",
+    engineVersion: "0.5.8.2", buildRevision: "0.5.8.2",
     opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
     dataQuality: { discoveryFundamentals: { sourceFailures: 0 } },
     research: {
@@ -1004,7 +1069,7 @@ test("research-provider failures become incomplete packets without exposing the 
   assert.equal(result.report.aiProvider, "gemini");
   assert.equal(result.report.aiModel, "gemini-3.5-flash");
   assert.equal(result.report.reportMode, "standard");
-  assert.equal(result.report.reportEngineVersion, "0.5.8.1");
+  assert.equal(result.report.reportEngineVersion, "0.5.8.2");
   assert.equal(result.report.generation.validation, "passed");
   assert.equal(result.report.storage.stored, true);
 });
@@ -1235,8 +1300,8 @@ test("existing dated report prevents duplicate report generation but still evalu
 
   assert.deepEqual(result.report, {
     date: "2026-08-05",
-    engineVersion: "0.5.8.1",
-    buildRevision: "0.5.8.1",
+    engineVersion: "0.5.8.2",
+    buildRevision: "0.5.8.2",
     generated: false,
     stored: true,
     storage: null,
