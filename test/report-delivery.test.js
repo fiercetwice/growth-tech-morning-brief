@@ -54,8 +54,8 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "# Growth Tech Morning Brief",
     "",
     "**Report Mode:** standard",
-    "**Engine Version:** 0.5.8",
-    "**Build Revision:** 0.5.8",
+    "**Engine Version:** 0.5.8.1",
+    "**Build Revision:** 0.5.8.1",
     "**Report ID:** 00000000-0000-4000-8000-000000000000",
     "**Generated At:** 2026-08-05T13:35:00.000Z",
     "",
@@ -64,7 +64,7 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     `- **Key Catalyst:** ${detail}`,
     "- **Principal Risk:** Missing forward estimates limit directional confidence.",
     `- **Best Opportunity:** None clears the action gate; ${symbolText} remains a researched near-miss.`,
-    "- **Research Exclusions:** None; research screening exclusions are not final portfolio recommendations.",
+    "- **Areas to Avoid:** No evidence-backed sector avoid call today.",
     "",
     "# Overnight and Market Context",
     "- **As Of:** 2026-08-05T13:35:00.000Z; regular trading session.",
@@ -109,9 +109,9 @@ function verboseNoTradeReport(symbols = ["NVDA"]) {
 test("verbose Morning Brief keeps research audit out of the five-section product", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.8",
+    engineVersion: "0.5.8.1",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
-    buildRevision: "0.5.8",
+    buildRevision: "0.5.8.1",
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
@@ -141,8 +141,8 @@ test("unavailable market context must be marked unavailable at category level", 
 test("verbose validation applies section-aware research and context-only ticker scopes", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.8",
-    buildRevision: "0.5.8",
+    engineVersion: "0.5.8.1",
+    buildRevision: "0.5.8.1",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
@@ -245,7 +245,7 @@ test("synthesis exposes a filtered two-level ticker universe while preserving so
   };
   const compact = {
     schemaVersion: 8,
-    engineVersion: "0.5.8",
+    engineVersion: "0.5.8.1",
     reportMode: "verbose",
     calendars: { earnings: { events: [{ symbol: "NVDA" }, { symbol: "MSFT" }, { symbol: "LITE" }], watchlistMatches: ["NVDA", "MSFT"] } },
     decisionFramework: { aiCycle: { GPU: { evidence: "NVDA +1%, MSFT -1%" } } },
@@ -509,10 +509,10 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiProvider, "deepseek");
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
-  assert.equal(body.report.reportEngineVersion, "0.5.8");
-  assert.equal(body.report.reportBuildRevision, "0.5.8");
+  assert.equal(body.report.reportEngineVersion, "0.5.8.1");
+  assert.equal(body.report.reportBuildRevision, "0.5.8.1");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.8");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.8.1");
   assert.match(bucket.objects.get("reports/latest.md"), /# Executive Summary/);
   assert.doesNotMatch(bucket.objects.get("reports/latest.md"), /Research Audit/);
   assert.ok(bucket.objects.has("research-audit/latest.md"));
@@ -562,13 +562,13 @@ test("strict schema rejects an Executive Summary without the required AI Cycle b
   assert.match(validation.errors.join("; "), /missing Executive Summary field: AI Cycle/);
 });
 
-test("strict schema requires Research Exclusions instead of the legacy Avoid label", () => {
+test("strict schema requires Areas to Avoid instead of research-pipeline exclusions", () => {
   const legacy = completeReport().replace(
+    "- **Areas to Avoid:** No evidence-backed sector avoid call today.",
     "- **Research Exclusions:** None; research screening exclusions are not final portfolio recommendations.",
-    "- **Avoid:** Avoid treating unverified price movement as a fundamental signal.",
   );
 
-  assert.match(validateReportCompleteness(legacy, ["NVDA"]).errors.join("; "), /missing Executive Summary field: Research Exclusions/);
+  assert.match(validateReportCompleteness(legacy, ["NVDA"]).errors.join("; "), /missing Executive Summary field: Areas to Avoid/);
 });
 
 test("strict schema rejects a recap that only has the four section names", () => {
@@ -756,8 +756,8 @@ test("neutral 10-20% upside does not change a catalyst-backed Buy now", () => {
 test("renderer uses final action, sector stance, explicit valuation basis, and explicit Dollar change label", () => {
   const compact = {
     schemaVersion: 8,
-    engineVersion: "0.5.8",
-    buildRevision: "0.5.8",
+    engineVersion: "0.5.8.1",
+    buildRevision: "0.5.8.1",
     reportMode: "verbose",
     generatedAt: "2026-08-10T23:45:11.044Z",
     session: "after_hours",
@@ -810,8 +810,8 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
   assert.match(report, /Trailing valuation unavailable; Forward valuation unavailable/);
   assert.match(report, /\| NVDA .*\| Watch \| Researched \|/);
   assert.doesNotMatch(report, /\| NVDA .*\| Buy(?: now| on weakness)? \| Researched \|/);
-  assert.match(report, /\*\*Research Exclusions:\*\*/);
-  assert.doesNotMatch(report, /^- \*\*Avoid:\*\*/m);
+  assert.match(report, /\*\*Areas to Avoid:\*\*/);
+  assert.doesNotMatch(report, /^- \*\*Research Exclusions:\*\*/m);
   const tampered = report.replace("$190 / $260 / $310", "$190 / $280 / $310");
   assert.match(validateReportCompleteness(tampered, ["NVDA"], synthesis).errors.join("; "), /changed deterministic target value for NVDA: \$260/);
 });
@@ -819,8 +819,8 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
 test("renderer excludes expired SEC fundamentals and surfaces their symbols and as-of dates", () => {
   const compact = {
     schemaVersion: 8,
-    engineVersion: "0.5.8",
-    buildRevision: "0.5.8",
+    engineVersion: "0.5.8.1",
+    buildRevision: "0.5.8.1",
     reportMode: "verbose",
     generatedAt: "2026-08-11T05:54:44.315Z",
     session: "closed",
@@ -877,7 +877,7 @@ test("renderer excludes expired SEC fundamentals and surfaces their symbols and 
   assert.match(report, /Principal Risk:.*expired SEC fundamentals excluded from sector ratings pending refresh: NVDA/i);
   assert.match(principalRisk, /1 unresearched watchlist name also has expired SEC fundamentals pending refresh/i);
   assert.doesNotMatch(principalRisk, /\bTSM\b/);
-  assert.match(report, /\*\*Research Exclusions:\*\* NVDA — excluded by research screening; not final portfolio recommendations/);
+  assert.match(report, /\*\*Areas to Avoid:\*\* No evidence-backed sector avoid call today/);
   assert.match(report, /\| GPU \| Stale \| High \| Mixed \| Neutral \|/);
   assert.match(report, /stale fundamentals excluded NVDA \(as of 2026-05-28\), TSM \(as of 2026-05-20\)/);
   assert.doesNotMatch(report, /\| GPU \| Strong \|/);
@@ -946,7 +946,7 @@ test("research packets reject unsourced support, resistance, target, and stop pr
 
 test("separate research audit deterministically renders negative net debt as net cash", () => {
   const audit = renderResearchAudit({
-    engineVersion: "0.5.8", buildRevision: "0.5.8",
+    engineVersion: "0.5.8.1", buildRevision: "0.5.8.1",
     opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
     dataQuality: { discoveryFundamentals: { sourceFailures: 0 } },
     research: {
@@ -1004,7 +1004,7 @@ test("research-provider failures become incomplete packets without exposing the 
   assert.equal(result.report.aiProvider, "gemini");
   assert.equal(result.report.aiModel, "gemini-3.5-flash");
   assert.equal(result.report.reportMode, "standard");
-  assert.equal(result.report.reportEngineVersion, "0.5.8");
+  assert.equal(result.report.reportEngineVersion, "0.5.8.1");
   assert.equal(result.report.generation.validation, "passed");
   assert.equal(result.report.storage.stored, true);
 });
@@ -1235,8 +1235,8 @@ test("existing dated report prevents duplicate report generation but still evalu
 
   assert.deepEqual(result.report, {
     date: "2026-08-05",
-    engineVersion: "0.5.8",
-    buildRevision: "0.5.8",
+    engineVersion: "0.5.8.1",
+    buildRevision: "0.5.8.1",
     generated: false,
     stored: true,
     storage: null,

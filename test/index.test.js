@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildCalendarContext, buildDiscoveryContext, buildEventLedger, buildMarketContext, buildSnapshot, buildTargetAndMispricing, buildValuationHistory, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
+  buildCalendarContext, buildDiscoveryContext, buildEventLedger, buildMarketContext, buildSnapshot, buildTargetAndMispricing, buildValuationHistory, loadAiCycleObservations, normalizeAiCycleObservations, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
   normalizeNasdaqMacroCalendar, normalizeNasdaqStockUniverse, normalizeSecTickerMap, normalizeYahooNews, marketSession, normalizeYahooChart, percentile, quarterlyFacts,
   reportedGrowth, toBrief, zonedParts,
 } from "../src/index.js";
@@ -20,6 +20,17 @@ test("normalizes Yahoo chart history and current move", () => {
   assert.equal(chart.price, 110);
   assert.equal(chart.changePercent, 10);
   assert.equal(chart.history.length, 2);
+  assert.equal(chart.history[0].splitAdjustedClose, 99);
+  assert.equal(chart.history[0].adjustedClose, 100);
+});
+
+test("Yahoo normalization retains split events on an auditable ratio basis", () => {
+  const chart = normalizeYahooChart({
+    meta: { regularMarketPrice: 100, regularMarketPreviousClose: 99 },
+    timestamp: [1722470400], indicators: { quote: [{ close: [100] }] },
+    events: { splits: { 1722556800: { date: 1722556800, numerator: 10, denominator: 1, splitRatio: "10:1" } } },
+  });
+  assert.deepEqual(chart.splits, [{ date: "2024-08-02", ratio: 10 }]);
 });
 
 test("Yahoo normalization retains the quote as-of timestamp", () => {
@@ -293,6 +304,19 @@ test("valuation uses only filings available on the price date", () => {
   assert.equal(history[0].trailingPS, 2.5);
 });
 
+test("valuation normalizes pre-split SEC EPS and shares to Yahoo current-share basis", () => {
+  const quarters = [1, 2, 3, 4].map((q) => ({ end: `2024-0${q * 2}-28`, filed: `2024-0${q * 2 + 1}-15`, value: 10 }));
+  const history = buildValuationHistory([{ date: "2025-01-02", adjustedClose: 20 }], {
+    quarterlyRevenue: quarters.map((row) => ({ ...row, value: 1000 })), quarterlyEps: quarters,
+    quarterlyShares: [{ end: "2024-08-28", filed: "2024-09-15", value: 50 }],
+  }, [{ date: "2024-10-01", ratio: 10 }]);
+  assert.equal(history[0].trailingEpsPerShare, 4);
+  assert.equal(history[0].trailingPE, 5);
+  assert.equal(history[0].trailingRevenuePerShare, 8);
+  assert.equal(history[0].trailingPS, 2.5);
+  assert.equal(history[0].splitBasis, "current-share basis");
+});
+
 test("percentile ignores missing values", () => {
   assert.equal(percentile(3, [1, 2, 3, 4, null]), 75);
 });
@@ -315,14 +339,14 @@ test("target engine creates an auditable trailing P/E implied range", () => {
   const target = buildTargetAndMispricing({
     price: 100,
     priceAsOf: "2026-08-11T13:35:00.000Z",
-    valuation: { trailingPE: 20, trailingPS: 5, fundamentalAsOf: "2025-02-15" },
+    valuation: { trailingPE: 12.5, trailingPS: 5, fundamentalAsOf: "2025-02-15" },
     fundamentals: { cacheStatus: "fresh" },
     valuationHistory,
   });
 
   assert.equal(target.status, "available");
   assert.equal(target.metric, "trailingPE");
-  assert.equal(target.normalizedInput, 6.5);
+  assert.equal(target.normalizedInput, 8);
   assert.deepEqual(target.multiplePercentiles, { bear: 25, base: 50, bull: 75 });
   assert.equal(target.bearValue < target.baseValue, true);
   assert.equal(target.baseValue < target.bullValue, true);
@@ -347,7 +371,7 @@ test("target engine falls back to trailing P/S and applies the valuation score t
   });
   const target = buildTargetAndMispricing({
     price: 45,
-    valuation: { trailingPE: null, trailingPS: 5, fundamentalAsOf: "2025-02-15" },
+    valuation: { trailingPE: null, trailingPS: 3.75, fundamentalAsOf: "2025-02-15" },
     fundamentals: { cacheStatus: "fresh" },
     valuationHistory,
   });
@@ -370,6 +394,37 @@ test("target engine refuses stale or insufficient inputs", () => {
   assert.equal(insufficient.status, "unavailable");
   assert.match(insufficient.reason, /insufficient trailing history/);
 });
+
+test("target engine refuses unknown freshness and inconsistent current TTM input", () => {
+  const history = Array.from({ length: 300 }, (_, index) => ({
+    date: `2025-01-${String((index % 28) + 1).padStart(2, "0")}`, adjustedClose: 100, trailingPE: 20,
+    trailingEpsPerShare: 5, fundamentalAsOf: index < 150 ? "2025-02-15" : "2025-05-15", splitBasis: "current-share basis",
+  }));
+  const unknown = buildTargetAndMispricing({ price: 100, valuation: { trailingPE: 20 }, fundamentals: { cacheStatus: null }, valuationHistory: history });
+  const inconsistent = buildTargetAndMispricing({ price: 100, valuation: { trailingPE: 10 }, fundamentals: { cacheStatus: "fresh" }, valuationHistory: history });
+  assert.match(unknown.reason, /freshness is unavailable/);
+  assert.match(inconsistent.reason, /consistency check/);
+});
+
+for (const [symbol, ratio] of [["NVDA", 10], ["ANET", 4]]) {
+  test(`${symbol} ${ratio}:1 split retains a current-basis target input`, () => {
+    const latestEps = 40 / ratio;
+    const valuationHistory = Array.from({ length: 300 }, (_, index) => {
+      const vintage = Math.floor(index / 100);
+      const eps = latestEps * (0.8 + vintage * 0.1);
+      const multiple = 10 + (index % 11);
+      return { date: `202${vintage + 3}-01-${String((index % 28) + 1).padStart(2, "0")}`, adjustedClose: eps * multiple, trailingPE: multiple, trailingEpsPerShare: eps, fundamentalAsOf: `202${vintage + 3}-02-15`, splitBasis: "current-share basis" };
+    });
+    const target = buildTargetAndMispricing({
+      price: 20, priceAsOf: "2026-08-11T13:35:00Z", splits: [{ date: "2024-10-01", ratio }],
+      valuation: { trailingPE: 20 / latestEps, fundamentalAsOf: "2024-09-15" }, fundamentals: { cacheStatus: "fresh" }, valuationHistory,
+    });
+    assert.equal(target.status, "available");
+    assert.equal(target.normalizedInput, latestEps);
+    assert.equal(target.splitEventsApplied, 1);
+    assert.equal(target.currentInputDifferencePercent, 0);
+  });
+}
 
 test("brief excludes raw history and selects P/S for negative earners", () => {
   const brief = toBrief({
@@ -409,6 +464,7 @@ test("brief computes internal stock posture and non-transactional sector stance 
       positionIn52WeekRange: 83, missing: false,
       valuation: { trailingPE: 20, trailingPS: 10, trailingPEPercentile5Y: 50, trailingPSPercentile5Y: 70 },
       reportedGrowth: { revenueTtmYoY: 25, epsTtmYoY: 30, basis: "reported SEC filings; not analyst estimates" },
+      fundamentals: { cacheStatus: "fresh" },
     }],
   });
   assert.equal(brief.watchlist[0].action, "Buy");
@@ -417,6 +473,24 @@ test("brief computes internal stock posture and non-transactional sector stance 
   assert.equal(brief.decisionFramework.aiCycle["GPU Demand"].rating, "Insufficient Data");
   assert.equal(brief.opportunityGate.candidates.length, 1);
   assert.equal(brief.opportunityGate.candidates[0].admissionType, "auto_watchlist");
+});
+
+test("AI Cycle uses fresh official observations, requires two companies, and expires stale inputs", async () => {
+  const now = new Date("2026-08-11T13:35:00Z");
+  const rows = normalizeAiCycleObservations([
+    { segment: "GPU Demand", company: "NVDA", metric: "Data Center revenue growth", value: 92, unit: "% YoY", changePercent: 92, direction: "positive", periodEnd: "2026-04-26", publishedAt: "2026-05-20", sourceType: "company_earnings_release", sourceUrl: "https://investor.nvidia.com/release", freshnessDays: 120 },
+    { segment: "GPU Demand", company: "AVGO", metric: "AI revenue growth", value: 143, unit: "% YoY", changePercent: 143, direction: "positive", periodEnd: "2026-05-03", publishedAt: "2026-06-03", sourceType: "company_earnings_release", sourceUrl: "https://investors.broadcom.com/release", freshnessDays: 120 },
+    { segment: "Inference", company: "GOOGL", metric: "Tokens per minute", value: 22, unit: "bn", changePercent: 37.5, direction: "positive", periodEnd: "2026-06-30", publishedAt: "2026-07-23", sourceType: "company_earnings_release", sourceUrl: "https://abc.xyz/investor/release", freshnessDays: 120 },
+    { segment: "AI Cloud", company: "MSFT", metric: "Azure growth", value: 40, unit: "% YoY", changePercent: 40, direction: "positive", periodEnd: "2024-12-31", publishedAt: "2025-01-01", sourceType: "company_earnings_release", sourceUrl: "https://microsoft.com/investor/release", freshnessDays: 120 },
+    { segment: "GPU Demand", company: "NVDA", metric: "Untrusted duplicate", value: 999, unit: "%", changePercent: 999, direction: "positive", periodEnd: "2026-06-30", publishedAt: "2026-07-23", sourceType: "company_earnings_release", sourceUrl: "https://example.com/fake", freshnessDays: 120 },
+  ], now);
+  const loaded = await loadAiCycleObservations({ AI_CYCLE_OBSERVATIONS_JSON: JSON.stringify(rows) }, now);
+  const brief = toBrief({ generatedAt: now.toISOString(), session: "premarket", coverage: { requested: 0, succeeded: 0, failed: 0 }, watchlist: [], aiCycleObservations: loaded });
+  assert.equal(brief.decisionFramework.aiCycle["GPU Demand"].rating, "Positive");
+  assert.equal(brief.decisionFramework.aiCycle["GPU Demand"].trend, "Accelerating");
+  assert.equal(brief.decisionFramework.aiCycle.Inference.rating, "Partial Coverage");
+  assert.equal(brief.decisionFramework.aiCycle["AI Cloud"].rating, "Insufficient Data");
+  assert.equal(loaded.some((row) => row.metric === "Untrusted duplicate"), false);
 });
 
 test("brief excludes expired SEC growth from sector fundamentals ratings", () => {

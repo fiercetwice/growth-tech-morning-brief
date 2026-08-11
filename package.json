@@ -1,7 +1,7 @@
 {
   "name": "growth-tech-morning-brief",
-  "version": "0.5.8",
-  "buildRevision": "0.5.8",
+  "version": "0.5.8.1",
+  "buildRevision": "0.5.8.1",
   "private": true,
   "type": "module",
   "scripts": {

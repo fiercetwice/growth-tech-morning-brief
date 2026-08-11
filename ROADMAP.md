@@ -14,6 +14,15 @@
 
 Implemented in the v0.5.8 release. Forward/consensus branches remain unavailable until a fresh sourced provider is configured; the shipped fallback is explicitly trailing-implied.
 
+### v0.5.8.1 hardening and AI-cycle coverage
+
+- Normalize Yahoo split events and SEC per-share/share facts to the current-share basis.
+- Use the latest valid TTM input; use filing vintages for consistency and confidence checks.
+- Reject unknown freshness, split-basis gaps, excessive vintage dispersion, and inconsistent quoted multiples.
+- Add structured official-disclosure observations for AI CapEx, GPU demand, AI Cloud, Enterprise AI, and inference.
+- Require two independent fresh company sources for a full AI-cycle rating and preserve partial/stale coverage.
+- Restore Executive Summary `Areas to Avoid`; keep post-research model avoids in Research Audit.
+
 Build an auditable valuation decision layer that answers both whether a company is attractive and whether its current price offers enough upside.
 
 ### Target hierarchy
