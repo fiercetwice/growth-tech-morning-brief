@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildCalendarContext, buildDiscoveryContext, buildEventLedger, buildMarketContext, buildSnapshot, buildValuationHistory, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
+  buildCalendarContext, buildDiscoveryContext, buildEventLedger, buildMarketContext, buildSnapshot, buildTargetAndMispricing, buildValuationHistory, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
   normalizeNasdaqMacroCalendar, normalizeNasdaqStockUniverse, normalizeSecTickerMap, normalizeYahooNews, marketSession, normalizeYahooChart, percentile, quarterlyFacts,
   reportedGrowth, toBrief, zonedParts,
 } from "../src/index.js";
@@ -297,6 +297,80 @@ test("percentile ignores missing values", () => {
   assert.equal(percentile(3, [1, 2, 3, 4, null]), 75);
 });
 
+test("target engine creates an auditable trailing P/E implied range", () => {
+  const valuationHistory = [];
+  for (let vintage = 0; vintage < 4; vintage += 1) {
+    const eps = 5 + vintage;
+    for (let day = 0; day < 100; day += 1) {
+      const multiple = 10 + (day % 21);
+      valuationHistory.push({
+        date: `202${vintage + 2}-01-${String((day % 28) + 1).padStart(2, "0")}`,
+        adjustedClose: eps * multiple,
+        trailingPE: multiple,
+        trailingPS: multiple / 2,
+        fundamentalAsOf: `202${vintage + 2}-02-15`,
+      });
+    }
+  }
+  const target = buildTargetAndMispricing({
+    price: 100,
+    priceAsOf: "2026-08-11T13:35:00.000Z",
+    valuation: { trailingPE: 20, trailingPS: 5, fundamentalAsOf: "2025-02-15" },
+    fundamentals: { cacheStatus: "fresh" },
+    valuationHistory,
+  });
+
+  assert.equal(target.status, "available");
+  assert.equal(target.metric, "trailingPE");
+  assert.equal(target.normalizedInput, 6.5);
+  assert.deepEqual(target.multiplePercentiles, { bear: 25, base: 50, bull: 75 });
+  assert.equal(target.bearValue < target.baseValue, true);
+  assert.equal(target.baseValue < target.bullValue, true);
+  assert.equal(target.preferredEntryPrice, Math.round((target.baseValue / 1.2) * 100) / 100);
+  assert.match(target.formula, /normalized TTM EPS\/share × historical trailing P\/E/);
+  assert.deepEqual(target.consensusCrossCheck, { status: "unavailable", reason: "no fresh analyst-consensus target source configured" });
+  assert.equal(target.confidence, "Medium");
+});
+
+test("target engine falls back to trailing P/S and applies the valuation score thresholds", () => {
+  const valuationHistory = Array.from({ length: 300 }, (_, index) => {
+    const vintage = Math.floor(index / 100);
+    const salesPerShare = 10 + vintage;
+    const multiple = 4 + (index % 5);
+    return {
+      date: `202${vintage + 3}-01-${String((index % 28) + 1).padStart(2, "0")}`,
+      adjustedClose: salesPerShare * multiple,
+      trailingPE: null,
+      trailingPS: multiple,
+      fundamentalAsOf: `202${vintage + 3}-02-15`,
+    };
+  });
+  const target = buildTargetAndMispricing({
+    price: 45,
+    valuation: { trailingPE: null, trailingPS: 5, fundamentalAsOf: "2025-02-15" },
+    fundamentals: { cacheStatus: "fresh" },
+    valuationHistory,
+  });
+  assert.equal(target.metric, "trailingPS");
+  assert.match(target.formula, /normalized TTM revenue\/share × historical trailing P\/S/);
+  assert.equal(target.valuationAdjustment, target.baseUpsidePercent >= 30 ? 2 : target.baseUpsidePercent >= 20 ? 1 : target.baseUpsidePercent >= 10 ? 0 : target.baseUpsidePercent >= 5 ? -1 : -2);
+});
+
+test("target engine refuses stale or insufficient inputs", () => {
+  const history = Array.from({ length: 300 }, (_, index) => ({
+    date: `2025-01-${String((index % 28) + 1).padStart(2, "0")}`,
+    adjustedClose: 100,
+    trailingPE: 20,
+    fundamentalAsOf: index < 150 ? "2025-02-15" : "2025-05-15",
+  }));
+  const stale = buildTargetAndMispricing({ price: 100, valuation: { trailingPE: 20 }, fundamentals: { cacheStatus: "stale" }, valuationHistory: history });
+  const insufficient = buildTargetAndMispricing({ price: 100, valuation: { trailingPE: 20 }, fundamentals: { cacheStatus: "fresh" }, valuationHistory: history.slice(0, 50) });
+  assert.equal(stale.status, "unavailable");
+  assert.match(stale.reason, /expired/);
+  assert.equal(insufficient.status, "unavailable");
+  assert.match(insufficient.reason, /insufficient trailing history/);
+});
+
 test("brief excludes raw history and selects P/S for negative earners", () => {
   const brief = toBrief({
     generatedAt: "2026-08-04T13:35:00.000Z", session: "regular_open_plus_5m",
@@ -387,6 +461,23 @@ test("mixed-freshness sectors calculate fundamentals only from fresh members", (
   assert.equal(gpu.metrics.medianReportedRevenueTtmYoY, 10);
   assert.deepEqual(gpu.metrics.freshFundamentals, [{ symbol: "AVGO", asOf: "2026-08-01" }]);
   assert.deepEqual(gpu.metrics.staleFundamentals, [{ symbol: "NVDA", asOf: "2026-05-28" }]);
+});
+
+test("sector evidence classifies stale members even when growth is missing and separates fresh growth gaps", () => {
+  const row = (symbol, cacheStatus, fundamentalAsOf) => ({
+    symbol, price: 100, changePercent: 0, yearLow: 50, yearHigh: 150, positionIn52WeekRange: 50, missing: false,
+    valuation: { trailingPE: 20, trailingPS: 10, trailingPEPercentile5Y: 50, trailingPSPercentile5Y: 70, fundamentalAsOf },
+    reportedGrowth: null,
+    fundamentals: { cacheStatus, asOf: fundamentalAsOf },
+  });
+  const brief = toBrief({
+    generatedAt: "2026-08-11T13:35:00.000Z", session: "regular_trading",
+    coverage: { requested: 2, succeeded: 2, failed: 0 },
+    watchlist: [row("NVDA", "fresh", "2026-08-01"), row("AVGO", "stale", "2026-06-09")],
+  });
+  const gpu = brief.decisionFramework.sectorScorecard.GPU;
+  assert.deepEqual(gpu.metrics.freshFundamentalsWithoutGrowth, [{ symbol: "NVDA", asOf: "2026-08-01" }]);
+  assert.deepEqual(gpu.metrics.staleFundamentals, [{ symbol: "AVGO", asOf: "2026-06-09" }]);
 });
 
 test("brief admits a liquid discovery name with a material event outside the core watchlist", () => {

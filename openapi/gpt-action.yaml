@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Growth Tech Morning Brief API
   description: Read the latest saved Growth Tech morning brief or explicitly refresh its market snapshot.
-  version: 0.5.4
+  version: 0.5.8
 servers:
   - url: https://growth-tech-morning-brief.ck-market-tools.workers.dev
 paths:
@@ -72,13 +72,15 @@ components:
   schemas:
     HealthResponse:
       type: object
-      required: [ok, service, version]
+      required: [ok, service, version, buildRevision]
       properties:
         ok:
           type: boolean
         service:
           type: string
         version:
+          type: string
+        buildRevision:
           type: string
     Coverage:
       type: object
@@ -130,6 +132,29 @@ components:
           enum: [trailingPE, trailingPS]
         selectedPercentile: { type: [number, "null"] }
         fundamentalAsOf: { type: [string, "null"] }
+    TargetAndMispricing:
+      type: object
+      required: [status, currentPrice, confidence, valuationAdjustment, valuationLabel, consensusCrossCheck]
+      properties:
+        status: { type: string, enum: [available, unavailable] }
+        currentPrice: { type: [number, "null"] }
+        priceAsOf: { type: [string, "null"] }
+        inputAsOf: { type: [string, "null"] }
+        bearValue: { type: number }
+        baseValue: { type: number }
+        bullValue: { type: number }
+        baseUpsidePercent: { type: number }
+        downsideToBearPercent: { type: number }
+        riskRewardRatio: { type: [number, "null"] }
+        preferredEntryPrice: { type: number }
+        method: { type: string }
+        formula: { type: string }
+        assumptions: { type: string }
+        confidence: { type: string, enum: [High, Medium, Low, Unavailable] }
+        valuationAdjustment: { type: integer, minimum: -2, maximum: 2 }
+        valuationLabel: { type: string, enum: [Opportunity Bonus, Opportunity Penalty, Neutral] }
+        reason: { type: string }
+        consensusCrossCheck: { type: object }
     WatchlistRow:
       type: object
       required: [symbol, missing]
@@ -143,6 +168,8 @@ components:
         positionIn52WeekRange: { type: [number, "null"] }
         valuation:
           $ref: "#/components/schemas/Valuation"
+        targetAndMispricing:
+          $ref: "#/components/schemas/TargetAndMispricing"
         missing: { type: boolean }
         error: { type: string }
     Brief:
@@ -151,7 +178,7 @@ components:
       properties:
         schemaVersion:
           type: integer
-          enum: [7]
+          enum: [8]
         generatedAt:
           type: string
           format: date-time

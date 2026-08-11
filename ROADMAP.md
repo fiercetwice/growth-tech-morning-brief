@@ -12,6 +12,8 @@
 
 ## v0.5.8 — Target & Mispricing Engine
 
+Implemented in the v0.5.8 release. Forward/consensus branches remain unavailable until a fresh sourced provider is configured; the shipped fallback is explicitly trailing-implied.
+
 Build an auditable valuation decision layer that answers both whether a company is attractive and whether its current price offers enough upside.
 
 ### Target hierarchy

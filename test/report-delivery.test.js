@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { compactSnapshotForReport, normalizeResearchPacket, renderMorningBrief, renderResearchAudit, runScheduledBrief, selectResearchCandidates, sendReportEmail, sendReportWebhook, synthesisContext, validateReportCompleteness, validateResearchBatch, validateResearchConsistency } from "../src/index.js";
+import worker, { buildTargetAndMispricing, compactSnapshotForReport, normalizeResearchPacket, renderMorningBrief, renderResearchAudit, runScheduledBrief, selectResearchCandidates, sendReportEmail, sendReportWebhook, synthesisContext, validateReportCompleteness, validateResearchBatch, validateResearchConsistency } from "../src/index.js";
 
 function r2(initial = {}) {
   const objects = new Map(Object.entries(initial));
@@ -54,8 +54,8 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "# Growth Tech Morning Brief",
     "",
     "**Report Mode:** standard",
-    "**Engine Version:** 0.5.7",
-    "**Build Revision:** 0.5.7-hf5.2",
+    "**Engine Version:** 0.5.8",
+    "**Build Revision:** 0.5.8",
     "**Report ID:** 00000000-0000-4000-8000-000000000000",
     "**Generated At:** 2026-08-05T13:35:00.000Z",
     "",
@@ -96,9 +96,9 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     sectorRow("Cloud Software", ["MSFT", "AMZN", "GOOGL", "META", "ORCL"]),
     "",
     "# Watchlist",
-    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Catalyst | Risk | Final Action | Research Status |",
-    "|---|---:|---:|---:|---|---|---|---|---|---|",
-    ...symbols.map((symbol) => `| ${symbol} | $110 | +10% | 50% | Unavailable | Unavailable | No verified catalyst | Evidence gap | ${watchlistAction} | Researched |`),
+    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Implied Value (Bear/Base/Bull) | Base Upside / Bear Downside | Preferred Entry | Valuation Signal | Catalyst | Risk | Final Action | Research Status |",
+    "|---|---:|---:|---:|---|---|---|---|---|---|---|---|---|---|",
+    ...symbols.map((symbol) => `| ${symbol} | $110 | +10% | 50% | Unavailable | Unavailable | Target unavailable | unavailable | unavailable | Unavailable; consensus unavailable | No verified catalyst | Evidence gap | ${watchlistAction} | Researched |`),
   ].join("\n");
 }
 
@@ -109,9 +109,9 @@ function verboseNoTradeReport(symbols = ["NVDA"]) {
 test("verbose Morning Brief keeps research audit out of the five-section product", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.7",
+    engineVersion: "0.5.8",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
-    buildRevision: "0.5.7-hf5.2",
+    buildRevision: "0.5.8",
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
@@ -141,8 +141,8 @@ test("unavailable market context must be marked unavailable at category level", 
 test("verbose validation applies section-aware research and context-only ticker scopes", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5.2",
+    engineVersion: "0.5.8",
+    buildRevision: "0.5.8",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
@@ -244,8 +244,8 @@ test("synthesis exposes a filtered two-level ticker universe while preserving so
     delta: { new: ["nvda", "msft", "lite"], unchanged: [], resolved: [] },
   };
   const compact = {
-    schemaVersion: 7,
-    engineVersion: "0.5.7",
+    schemaVersion: 8,
+    engineVersion: "0.5.8",
     reportMode: "verbose",
     calendars: { earnings: { events: [{ symbol: "NVDA" }, { symbol: "MSFT" }, { symbol: "LITE" }], watchlistMatches: ["NVDA", "MSFT"] } },
     decisionFramework: { aiCycle: { GPU: { evidence: "NVDA +1%, MSFT -1%" } } },
@@ -310,6 +310,8 @@ function researchFixtureResponse(url, init) {
     entryExitCondition: "Wait for verified evidence and a defined price level.",
     riskReward: "Not asymmetric on supplied evidence.",
     invalidation: "A verified fundamental catalyst would require reassessment.",
+    reratingPath: "No qualified rerating path in the supplied fixture.",
+    reratingHorizon: "Unavailable",
     missingEvidence: ["forward estimates"],
     sourceQuality: "mixed",
     gateResult: "fail",
@@ -389,7 +391,7 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
   const stored = bucket.objects.get("reports/2026-08-05.md");
   assert.equal(stored, webhookMarkdown);
   assert.equal(bucket.objects.get("reports/latest.md"), stored);
-  assert.match(stored, /\*\*Build Revision:\*\* 0\.5\.7-hf5/);
+  assert.match(stored, /\*\*Build Revision:\*\* 0\.5\.8/);
   assert.doesNotMatch(stored, /Research Audit/);
   assert.ok(bucket.objects.has("research-audit/2026-08-05.md"));
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportDate, "2026-08-05");
@@ -507,10 +509,10 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiProvider, "deepseek");
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
-  assert.equal(body.report.reportEngineVersion, "0.5.7");
-  assert.equal(body.report.reportBuildRevision, "0.5.7-hf5.2");
+  assert.equal(body.report.reportEngineVersion, "0.5.8");
+  assert.equal(body.report.reportBuildRevision, "0.5.8");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.7");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.8");
   assert.match(bucket.objects.get("reports/latest.md"), /# Executive Summary/);
   assert.doesNotMatch(bucket.objects.get("reports/latest.md"), /Research Audit/);
   assert.ok(bucket.objects.has("research-audit/latest.md"));
@@ -669,24 +671,93 @@ test("structured research blocks Buy now without a verified catalyst", () => {
   assert.equal(normalized.gateResult, "fail");
   assert.equal(normalized.todayAction, "Watch");
   assert.equal(normalized.finalAction, "Watch");
-  assert.match(normalized.gateReason, /lacks deterministic catalyst eligibility/);
+  assert.match(normalized.gateReason, /lacks deterministic catalyst or qualified 1Q\/2Q rerating-path eligibility/);
 });
 
 test("verified trade recommendation becomes the packet's single final action", () => {
   const normalized = normalizeResearchPacket({
-    symbol: "NVDA", gateResult: "pass", todayAction: "Buy now", gateReason: "verified earnings catalyst", strategicPosition: "Buy",
-  }, { symbol: "NVDA", sourceType: "core", setup: { verifiedCatalyst: true, dislocation: true, extremeTrim: false } });
+    symbol: "NVDA", gateResult: "pass", todayAction: "Buy now", gateReason: "verified earnings catalyst", strategicPosition: "Buy", reratingPath: "Unavailable", reratingHorizon: "Unavailable",
+  }, {
+    symbol: "NVDA", sourceType: "core", valuation: { trailingPE: 20 }, reportedGrowth: { revenueTtmYoY: 20 },
+    targetAndMispricing: { status: "available", confidence: "Medium", baseUpsidePercent: 30 },
+    setup: { verifiedCatalyst: true, dislocation: true, extremeTrim: false },
+  });
 
   assert.equal(normalized.gateResult, "pass");
   assert.equal(normalized.finalAction, "Buy now");
   assert.equal(normalized.todayAction, normalized.finalAction);
 });
 
+test("qualified 1Q rerating path can support a core value call without same-day news", () => {
+  const normalized = normalizeResearchPacket({
+    symbol: "NVDA", gateResult: "pass", todayAction: "Buy now", gateReason: "underappreciated value", strategicPosition: "Buy",
+    reratingPath: "Quarterly product revenue must reaccelerate and management must raise next-quarter guidance.", reratingHorizon: "1Q",
+  }, {
+    symbol: "NVDA", sourceType: "core", valuation: { trailingPE: 20 }, reportedGrowth: { revenueTtmYoY: 25 },
+    targetAndMispricing: { status: "available", confidence: "Medium", baseUpsidePercent: 32 },
+    setup: { verifiedCatalyst: false, dislocation: false, extremeTrim: false },
+  });
+  assert.equal(normalized.gateResult, "pass");
+  assert.equal(normalized.finalAction, "Buy now");
+});
+
+test("rerating path cannot bypass discovery catalyst requirements", () => {
+  const normalized = normalizeResearchPacket({
+    symbol: "LITE", gateResult: "pass", todayAction: "Buy now", gateReason: "rerating", strategicPosition: "Buy",
+    reratingPath: "Quarterly product revenue must reaccelerate and management must raise next-quarter guidance.", reratingHorizon: "1Q",
+  }, {
+    symbol: "LITE", sourceType: "discovery", valuation: { trailingPE: 20 }, reportedGrowth: { revenueTtmYoY: 25 },
+    fundamentalCoverage: { status: "available" }, marketCap: 5_000_000_000, dollarVolume: 50_000_000,
+    targetAndMispricing: { status: "available", confidence: "High", baseUpsidePercent: 40 },
+    setup: { verifiedCatalyst: false, dislocation: true, extremeTrim: false },
+  });
+  assert.equal(normalized.gateResult, "fail");
+  assert.equal(normalized.finalAction, "Watch");
+  assert.match(normalized.gateReason, /discovery evidence gate incomplete/);
+});
+
+test("research validation rejects a vague rerating path", () => {
+  const packet = {
+    symbol: "NVDA", catalystSummary: "No same-day event.", evidenceFor: [], evidenceAgainst: [], missingEvidence: [],
+    mispricingThesis: "Potential value.", strategicPosition: "Buy", todayAction: "Buy now", confidence: "Medium",
+    entryExitCondition: "Wait for evidence.", riskReward: "Potentially favorable.", invalidation: "Thesis fails without progress.",
+    reratingPath: "The stock might rerate higher soon.", reratingHorizon: "1Q", sourceQuality: "mixed", gateResult: "pass", gateReason: "value",
+  };
+  const validation = validateResearchBatch({ candidates: [packet] }, [{ symbol: "NVDA", price: 100, yearLow: 70, yearHigh: 120 }]);
+  assert.match(validation.errors.join("; "), /reratingPath is not testable/);
+});
+
+test("valuation penalty deterministically downgrades Buy now", () => {
+  const normalized = normalizeResearchPacket({
+    symbol: "NVDA", gateResult: "pass", todayAction: "Buy now", gateReason: "verified catalyst", strategicPosition: "Buy",
+    reratingPath: "Unavailable", reratingHorizon: "Unavailable",
+  }, {
+    symbol: "NVDA", sourceType: "core", valuation: { trailingPE: 20 }, reportedGrowth: { revenueTtmYoY: 25 },
+    targetAndMispricing: { status: "available", confidence: "Medium", baseUpsidePercent: 8, valuationAdjustment: -1 },
+    setup: { verifiedCatalyst: true, dislocation: true, extremeTrim: false },
+  });
+  assert.equal(normalized.gateResult, "pass");
+  assert.equal(normalized.finalAction, "Buy on weakness");
+});
+
+test("neutral 10-20% upside does not change a catalyst-backed Buy now", () => {
+  const normalized = normalizeResearchPacket({
+    symbol: "NVDA", gateResult: "pass", todayAction: "Buy now", gateReason: "verified catalyst", strategicPosition: "Buy",
+    reratingPath: "Unavailable", reratingHorizon: "Unavailable",
+  }, {
+    symbol: "NVDA", sourceType: "core", valuation: { trailingPE: 20 }, reportedGrowth: { revenueTtmYoY: 25 },
+    targetAndMispricing: { status: "available", confidence: "Medium", baseUpsidePercent: 15, valuationAdjustment: 0 },
+    setup: { verifiedCatalyst: true, dislocation: true, extremeTrim: false },
+  });
+  assert.equal(normalized.gateResult, "pass");
+  assert.equal(normalized.finalAction, "Buy now");
+});
+
 test("renderer uses final action, sector stance, explicit valuation basis, and explicit Dollar change label", () => {
   const compact = {
-    schemaVersion: 7,
-    engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5.2",
+    schemaVersion: 8,
+    engineVersion: "0.5.8",
+    buildRevision: "0.5.8",
     reportMode: "verbose",
     generatedAt: "2026-08-10T23:45:11.044Z",
     session: "after_hours",
@@ -707,6 +778,12 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
       {
         symbol: "NVDA", price: 217.55, changePercent: -2.86, positionIn52WeekRange: 74.58,
         valuation: { selectedMetric: "trailingPE", trailingPE: 33.32, selectedPercentile: 82.1 },
+        targetAndMispricing: {
+          status: "available", bearValue: 190, baseValue: 260, bullValue: 310, baseUpsidePercent: 19.51,
+          downsideToBearPercent: 12.66, riskRewardRatio: 1.55, preferredEntryPrice: 216.67,
+          valuationAdjustment: 0, valuationLabel: "Neutral", confidence: "Medium", method: "trailing-data implied fair-value range",
+          formula: "normalized TTM EPS/share × historical trailing P/E P25/P50/P75",
+        },
         catalyst: "n/a — no company-specific catalyst in snapshot", risk: "valuation risk",
       },
       {
@@ -729,18 +806,21 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
   assert.match(report, /\| GPU \| Strong \| Moderate \| Positive \| Favorable \|/);
   assert.match(report, /U\.S\. Dollar Index 99\.8 \(daily change unavailable\)/);
   assert.match(report, /Trailing P\/E 33\.32; Forward P\/E unavailable/);
+  assert.match(report, /\$190 \/ \$260 \/ \$310; trailing-implied/);
   assert.match(report, /Trailing valuation unavailable; Forward valuation unavailable/);
   assert.match(report, /\| NVDA .*\| Watch \| Researched \|/);
   assert.doesNotMatch(report, /\| NVDA .*\| Buy(?: now| on weakness)? \| Researched \|/);
   assert.match(report, /\*\*Research Exclusions:\*\*/);
   assert.doesNotMatch(report, /^- \*\*Avoid:\*\*/m);
+  const tampered = report.replace("$190 / $260 / $310", "$190 / $280 / $310");
+  assert.match(validateReportCompleteness(tampered, ["NVDA"], synthesis).errors.join("; "), /changed deterministic target value for NVDA: \$260/);
 });
 
 test("renderer excludes expired SEC fundamentals and surfaces their symbols and as-of dates", () => {
   const compact = {
-    schemaVersion: 7,
-    engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5.2",
+    schemaVersion: 8,
+    engineVersion: "0.5.8",
+    buildRevision: "0.5.8",
     reportMode: "verbose",
     generatedAt: "2026-08-11T05:54:44.315Z",
     session: "closed",
@@ -855,6 +935,7 @@ test("research packets reject unsourced support, resistance, target, and stop pr
     strategicPosition: "Hold", todayAction: "Watch", confidence: "Medium",
     entryExitCondition: "Wait for support near $30.",
     riskReward: "Not asymmetric.", invalidation: "Reassess on new evidence.",
+    reratingPath: "No qualified rerating path in the supplied evidence.", reratingHorizon: "Unavailable",
     sourceQuality: "primary filing", gateResult: "fail", gateReason: "Threshold not cleared.",
   };
   const invalid = validateResearchBatch({ candidates: [packet] }, [candidate]);
@@ -865,7 +946,7 @@ test("research packets reject unsourced support, resistance, target, and stop pr
 
 test("separate research audit deterministically renders negative net debt as net cash", () => {
   const audit = renderResearchAudit({
-    engineVersion: "0.5.7", buildRevision: "0.5.7-hf5.2",
+    engineVersion: "0.5.8", buildRevision: "0.5.8",
     opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
     dataQuality: { discoveryFundamentals: { sourceFailures: 0 } },
     research: {
@@ -923,7 +1004,7 @@ test("research-provider failures become incomplete packets without exposing the 
   assert.equal(result.report.aiProvider, "gemini");
   assert.equal(result.report.aiModel, "gemini-3.5-flash");
   assert.equal(result.report.reportMode, "standard");
-  assert.equal(result.report.reportEngineVersion, "0.5.7");
+  assert.equal(result.report.reportEngineVersion, "0.5.8");
   assert.equal(result.report.generation.validation, "passed");
   assert.equal(result.report.storage.stored, true);
 });
@@ -1154,8 +1235,8 @@ test("existing dated report prevents duplicate report generation but still evalu
 
   assert.deepEqual(result.report, {
     date: "2026-08-05",
-    engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5.2",
+    engineVersion: "0.5.8",
+    buildRevision: "0.5.8",
     generated: false,
     stored: true,
     storage: null,
