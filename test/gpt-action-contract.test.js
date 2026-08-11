@@ -40,28 +40,34 @@ test("Worker accepts a trailing slash on the GPT read route", async () => {
 test("health exposes the deployed release for propagation-safe smoke tests", async () => {
   const response = await worker.fetch(new Request("https://example.test/health"), {});
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.7", buildRevision: "0.5.7-hf5" });
+  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.7", buildRevision: "0.5.7-hf5.1" });
 });
 
-test("release-specific report route rejects old isolates without starting generation", async () => {
-  const current = await worker.fetch(new Request("https://example.test/run-report/v0.5.7", {
+test("build-specific report route rejects same-engine old builds without starting generation", async () => {
+  const current = await worker.fetch(new Request("https://example.test/run-report/v0.5.7/build/0.5.7-hf5.1", {
     method: "POST",
   }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
   assert.equal(current.status, 401);
 
-  const stale = await worker.fetch(new Request("https://example.test/run-report/v0.5.6", {
+  const staleBuild = await worker.fetch(new Request("https://example.test/run-report/v0.5.7/build/0.5.7-hf5", {
     method: "POST",
   }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
-  assert.equal(stale.status, 404);
-  assert.deepEqual(await stale.json(), { error: "not_found" });
+  assert.equal(staleBuild.status, 404);
+  assert.deepEqual(await staleBuild.json(), { error: "not_found" });
+
+  const engineOnly = await worker.fetch(new Request("https://example.test/run-report/v0.5.7", {
+    method: "POST",
+  }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
+  assert.equal(engineOnly.status, 404);
+  assert.deepEqual(await engineOnly.json(), { error: "not_found" });
 });
 
-test("post-deploy smoke test retries only the versioned route while an old isolate returns 404", () => {
-  assert.match(deployWorkflow, /report_url="\$WORKER_URL\/run-report\/v\$expected_version"/);
+test("post-deploy smoke test retries only the build-specific route while an old isolate returns 404", () => {
+  assert.match(deployWorkflow, /report_url="\$WORKER_URL\/run-report\/v\$expected_version\/build\/\$expected_build_revision"/);
   assert.match(deployWorkflow, /deployed_build_revision/);
   assert.match(deployWorkflow, /Report identity mismatch across generation, R2, and Discord/);
   assert.match(deployWorkflow, /if \[ "\$http_status" = "404" \] && \[ "\$attempt" != "24" \]/);
-  assert.doesNotMatch(deployWorkflow, /--url "\$WORKER_URL\/run-report"/);
+  assert.doesNotMatch(deployWorkflow, /report_url="\$WORKER_URL\/run-report\/v\$expected_version"\s*$/m);
 });
 
 test("post-deploy failures print actionable diagnostics before exiting", () => {

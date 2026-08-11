@@ -88,7 +88,7 @@ jobs:
 
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          report_url="$WORKER_URL/run-report/v$expected_version"
+          report_url="$WORKER_URL/run-report/v$expected_version/build/$expected_build_revision"
           http_status=""
           for attempt in $(seq 1 24); do
             if ! http_status="$(curl --silent --show-error \
@@ -107,7 +107,7 @@ jobs:
                 "model": "deepseek-v4-flash",
                 "reportMode": "verbose"
               }')"; then
-              echo "::error::The versioned /run-report request failed before receiving an HTTP response."
+              echo "::error::The build-specific /run-report request failed before receiving an HTTP response."
               exit 1
             fi
             if [ "$http_status" = "404" ] && [ "$attempt" != "24" ]; then
@@ -118,7 +118,7 @@ jobs:
           done
 
           if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
-            echo "::error::The versioned /run-report request failed (HTTP ${http_status:-unknown})."
+            echo "::error::The build-specific /run-report request failed (HTTP ${http_status:-unknown})."
             if jq -e . "$response_file" > /dev/null 2>&1; then
               jq '{ error, message, reportError: .report.error, webhook: .report.webhook }' "$response_file"
             else
@@ -128,7 +128,7 @@ jobs:
           fi
 
           if ! jq -e . "$response_file" > /dev/null 2>&1; then
-            echo "::error::The versioned /run-report request returned invalid JSON (HTTP $http_status, $(wc -c < "$response_file") bytes)."
+            echo "::error::The build-specific /run-report request returned invalid JSON (HTTP $http_status, $(wc -c < "$response_file") bytes)."
             exit 1
           fi
           response="$(< "$response_file")"

@@ -96,7 +96,7 @@ curl "https://growth-tech-morning-brief.ck-market-tools.workers.dev/latest" \
 
 ## GitHub Actions deployment
 
-The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets. Before the post-deploy report test, the workflow waits until `/health` reports the exact release version. It then calls the release-specific `/run-report/v0.5.7` endpoint and retries only a 404 response, so a still-propagating older Worker cannot generate or overwrite the new snapshot contract.
+The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets. Before the post-deploy report test, the workflow waits until `/health` reports the exact engine version and build revision. It then calls the build-specific `/run-report/v0.5.7/build/0.5.7-hf5.1` endpoint and retries only a 404 response, so a still-propagating older Worker cannot generate or overwrite the new report artifact.
 
 
 ## AI provider router, report generation, and delivery

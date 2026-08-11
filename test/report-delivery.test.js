@@ -55,7 +55,7 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "",
     "**Report Mode:** standard",
     "**Engine Version:** 0.5.7",
-    "**Build Revision:** 0.5.7-hf5",
+    "**Build Revision:** 0.5.7-hf5.1",
     "**Report ID:** 00000000-0000-4000-8000-000000000000",
     "**Generated At:** 2026-08-05T13:35:00.000Z",
     "",
@@ -111,7 +111,7 @@ test("verbose Morning Brief keeps research audit out of the five-section product
     reportMode: "verbose",
     engineVersion: "0.5.7",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
-    buildRevision: "0.5.7-hf5",
+    buildRevision: "0.5.7-hf5.1",
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
@@ -142,7 +142,7 @@ test("verbose validation applies section-aware research and context-only ticker 
   const compact = {
     reportMode: "verbose",
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5",
+    buildRevision: "0.5.7-hf5.1",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
@@ -508,7 +508,7 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
   assert.equal(body.report.reportEngineVersion, "0.5.7");
-  assert.equal(body.report.reportBuildRevision, "0.5.7-hf5");
+  assert.equal(body.report.reportBuildRevision, "0.5.7-hf5.1");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.7");
   assert.match(bucket.objects.get("reports/latest.md"), /# Executive Summary/);
@@ -686,7 +686,7 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
   const compact = {
     schemaVersion: 7,
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5",
+    buildRevision: "0.5.7-hf5.1",
     reportMode: "verbose",
     generatedAt: "2026-08-10T23:45:11.044Z",
     session: "after_hours",
@@ -740,7 +740,7 @@ test("renderer excludes expired SEC fundamentals and surfaces their symbols and 
   const compact = {
     schemaVersion: 7,
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5",
+    buildRevision: "0.5.7-hf5.1",
     reportMode: "verbose",
     generatedAt: "2026-08-11T05:54:44.315Z",
     session: "closed",
@@ -850,7 +850,7 @@ test("research packets reject unsourced support, resistance, target, and stop pr
 
 test("separate research audit deterministically renders negative net debt as net cash", () => {
   const audit = renderResearchAudit({
-    engineVersion: "0.5.7", buildRevision: "0.5.7-hf5",
+    engineVersion: "0.5.7", buildRevision: "0.5.7-hf5.1",
     opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
     dataQuality: { discoveryFundamentals: { sourceFailures: 0 } },
     research: {
@@ -1140,7 +1140,7 @@ test("existing dated report prevents duplicate report generation but still evalu
   assert.deepEqual(result.report, {
     date: "2026-08-05",
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5",
+    buildRevision: "0.5.7-hf5.1",
     generated: false,
     stored: true,
     storage: null,
