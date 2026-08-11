@@ -43,19 +43,19 @@ function currentNewYorkDate() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 }
 
-function completeReport(symbols = ["NVDA"], detail = "Balanced action is to monitor positioning and catalyst timing.", watchlistAction = "Hold") {
+function completeReport(symbols = ["NVDA"], detail = "Balanced action is to monitor positioning and catalyst timing.", watchlistAction = "Watch") {
   const symbolText = symbols.join(", ");
   const covered = new Set(symbols);
   const sectorRow = (sector, members) => {
     const hasMember = members.some((symbol) => covered.has(symbol));
-    return `| ${sector} | Unavailable | Unavailable | ${hasMember ? "Positive" : "Unavailable"} | ${hasMember ? "Hold" : "Wait"} | ${hasMember ? "Covered price data only" : "No covered symbols"} |`;
+    return `| ${sector} | Unavailable | Unavailable | ${hasMember ? "Positive" : "Unavailable"} | Neutral | ${hasMember ? "Covered price data only" : "No covered symbols"} |`;
   };
   return [
     "# Growth Tech Morning Brief",
     "",
     "**Report Mode:** standard",
     "**Engine Version:** 0.5.7",
-    "**Build Revision:** 0.5.7-hf3",
+    "**Build Revision:** 0.5.7-hf4",
     "**Report ID:** 00000000-0000-4000-8000-000000000000",
     "**Generated At:** 2026-08-05T13:35:00.000Z",
     "",
@@ -84,7 +84,7 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "| Inference | Insufficient Data | Unclear | No utilization evidence | Coverage unavailable |",
     "",
     "# Sector Scorecard",
-    "| Sector | Fundamentals | Valuation | Momentum | Action | Evidence |",
+    "| Sector | Fundamentals | Valuation | Momentum | Sector Stance | Evidence |",
     "|---|---|---|---|---|---|",
     sectorRow("GPU", ["NVDA", "TSM", "AVGO"]),
     sectorRow("AI Cloud", ["AMZN", "MSFT", "GOOGL", "ORCL"]),
@@ -96,7 +96,7 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     sectorRow("Cloud Software", ["MSFT", "AMZN", "GOOGL", "META", "ORCL"]),
     "",
     "# Watchlist",
-    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Historical Percentile | Catalyst | Risk | Action | Research Status |",
+    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Catalyst | Risk | Final Action | Research Status |",
     "|---|---:|---:|---:|---|---|---|---|---|---|",
     ...symbols.map((symbol) => `| ${symbol} | $110 | +10% | 50% | Unavailable | Unavailable | No verified catalyst | Evidence gap | ${watchlistAction} | Researched |`),
   ].join("\n");
@@ -111,7 +111,7 @@ test("verbose Morning Brief keeps research audit out of the five-section product
     reportMode: "verbose",
     engineVersion: "0.5.7",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
-    buildRevision: "0.5.7-hf3",
+    buildRevision: "0.5.7-hf4",
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
@@ -125,7 +125,7 @@ test("available market context permits an unavailable child change metric", () =
   const compact = { marketContext: { usd: { status: "available" } } };
   const report = completeReport().replace(
     "- **Dollar:** Available in the supplied snapshot.",
-    "- **Dollar:** available as of 2026-08-05T13:35:00.000Z: U.S. Dollar Index 98.5 (change unavailable).",
+    "- **Dollar:** available as of 2026-08-05T13:35:00.000Z: U.S. Dollar Index 98.5 (daily change unavailable).",
   );
 
   assert.deepEqual(validateReportCompleteness(report, ["NVDA"], compact), { ok: true, errors: [] });
@@ -142,7 +142,7 @@ test("verbose validation applies section-aware research and context-only ticker 
   const compact = {
     reportMode: "verbose",
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf3",
+    buildRevision: "0.5.7-hf4",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
@@ -274,6 +274,17 @@ test("research consistency rejects duplicate, missing, and inconsistent packets"
   assert.match(result.errors.join("; "), /admitted 3 != packets 2/);
 });
 
+test("research consistency binds recommended count to gate-approved final actions", () => {
+  const candidates = [{ symbol: "NVDA" }];
+  const leaked = validateResearchConsistency({
+    packets: [{ symbol: "NVDA", status: "complete", gateResult: "fail", finalAction: "Buy now" }],
+    funnel: { admitted: 1, researched: 1, incomplete: 0, gateQualified: 1, recommendedActions: 0, rejectedOrWatch: 1 },
+  }, candidates);
+
+  assert.equal(leaked.ok, false);
+  assert.match(leaked.errors.join("; "), /trade finalAction requires a passed deterministic gate: NVDA/);
+});
+
 function geminiReport(text, finishReason = "STOP", usageMetadata = {}, parts = null) {
   return {
     candidates: [{ finishReason, content: { parts: parts ?? [{ text }] } }],
@@ -354,7 +365,9 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
       assert.equal(init.headers["idempotency-key"], "growth-tech-morning-brief-2026-08-05");
       const body = JSON.parse(init.body);
       assert.equal(body.to[0], "pm@example.com");
-      assert.match(body.html, /<h1>Growth Tech Morning Brief — 2026-08-10<\/h1>/);
+      const generatedDate = body.text.match(/\*\*Generated At:\*\* (\d{4}-\d{2}-\d{2})/)?.[1];
+      assert.ok(generatedDate);
+      assert.match(body.html, new RegExp(`<h1>Growth Tech Morning Brief — ${generatedDate}<\\/h1>`));
       assert.match(body.text, /# Executive Summary/);
       assert.doesNotMatch(body.text, /# Today's Verdict/);
       return responseJson({ id: "email_123" });
@@ -376,7 +389,7 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
   const stored = bucket.objects.get("reports/2026-08-05.md");
   assert.equal(stored, webhookMarkdown);
   assert.equal(bucket.objects.get("reports/latest.md"), stored);
-  assert.match(stored, /\*\*Build Revision:\*\* 0\.5\.7-hf3/);
+  assert.match(stored, /\*\*Build Revision:\*\* 0\.5\.7-hf4/);
   assert.doesNotMatch(stored, /Research Audit/);
   assert.ok(bucket.objects.has("research-audit/2026-08-05.md"));
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportDate, "2026-08-05");
@@ -495,7 +508,7 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
   assert.equal(body.report.reportEngineVersion, "0.5.7");
-  assert.equal(body.report.reportBuildRevision, "0.5.7-hf3");
+  assert.equal(body.report.reportBuildRevision, "0.5.7-hf4");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.7");
   assert.match(bucket.objects.get("reports/latest.md"), /# Executive Summary/);
@@ -646,7 +659,93 @@ test("structured research blocks Buy now without a verified catalyst", () => {
   }, { symbol: "NVDA", sourceType: "core", setup: { verifiedCatalyst: false, dislocation: true, extremeTrim: false } });
   assert.equal(normalized.gateResult, "fail");
   assert.equal(normalized.todayAction, "Watch");
+  assert.equal(normalized.finalAction, "Watch");
   assert.match(normalized.gateReason, /lacks deterministic catalyst eligibility/);
+});
+
+test("verified trade recommendation becomes the packet's single final action", () => {
+  const normalized = normalizeResearchPacket({
+    symbol: "NVDA", gateResult: "pass", todayAction: "Buy now", gateReason: "verified earnings catalyst", strategicPosition: "Buy",
+  }, { symbol: "NVDA", sourceType: "core", setup: { verifiedCatalyst: true, dislocation: true, extremeTrim: false } });
+
+  assert.equal(normalized.gateResult, "pass");
+  assert.equal(normalized.finalAction, "Buy now");
+  assert.equal(normalized.todayAction, normalized.finalAction);
+});
+
+test("renderer uses final action, sector stance, explicit valuation basis, and explicit Dollar change label", () => {
+  const compact = {
+    schemaVersion: 7,
+    engineVersion: "0.5.7",
+    buildRevision: "0.5.7-hf4",
+    reportMode: "verbose",
+    generatedAt: "2026-08-10T23:45:11.044Z",
+    session: "after_hours",
+    marketContext: {
+      futures: { status: "unavailable", reason: "not in fixture" },
+      rates: { status: "unavailable", reason: "not in fixture" },
+      usd: { status: "available", asOf: "2026-08-10T23:30:38.000Z", items: [{ label: "U.S. Dollar Index", value: 99.8, changePercent: null }] },
+      oil: { status: "unavailable", reason: "not in fixture" },
+    },
+    calendars: null,
+    news: {},
+    decisionFramework: {
+      aiCycle: {},
+      sectorScorecard: { GPU: { fundamentals: "Strong", valuation: "Moderate", momentum: "Positive", stance: "Favorable", symbols: ["NVDA"], metrics: {} } },
+    },
+    opportunityGate: { candidates: [] },
+    watchlist: [
+      {
+        symbol: "NVDA", price: 217.55, changePercent: -2.86, positionIn52WeekRange: 74.58,
+        valuation: { selectedMetric: "trailingPE", trailingPE: 33.32, selectedPercentile: 82.1 },
+        catalyst: "n/a — no company-specific catalyst in snapshot", risk: "valuation risk",
+      },
+      {
+        symbol: "TSM", price: 418.47, changePercent: -0.37, positionIn52WeekRange: 76.62,
+        valuation: null, catalyst: "n/a — no company-specific catalyst in snapshot", risk: "no quantified risk flag",
+      },
+    ],
+  };
+  const research = {
+    funnel: { admitted: 1, researched: 1, incomplete: 0, gateQualified: 1, recommendedActions: 0, rejectedOrWatch: 1 },
+    packets: [{ symbol: "NVDA", status: "complete", modelGateResult: "pass", gateResult: "fail", strategicPosition: "Buy", todayAction: "Watch", finalAction: "Watch", sourceSnapshot: { setup: { verifiedCatalyst: false } } }],
+    batches: [],
+  };
+
+  const synthesis = synthesisContext(compact, research);
+  const report = renderMorningBrief(synthesis, { reportId: "00000000-0000-4000-8000-000000000000", generatedAt: "2026-08-10T23:45:43.501Z" });
+
+  assert.equal(synthesis.watchlist[0].finalAction, "Watch");
+  assert.match(report, /\| Sector Stance \|/);
+  assert.match(report, /\| GPU \| Strong \| Moderate \| Positive \| Favorable \|/);
+  assert.match(report, /U\.S\. Dollar Index 99\.8 \(daily change unavailable\)/);
+  assert.match(report, /Trailing P\/E 33\.32; Forward P\/E unavailable/);
+  assert.match(report, /Trailing valuation unavailable; Forward valuation unavailable/);
+  assert.match(report, /\| NVDA .*\| Watch \| Researched \|/);
+  assert.doesNotMatch(report, /\| NVDA .*\| Buy(?: now| on weakness)? \| Researched \|/);
+});
+
+test("recommendedActions=0 rejects any Buy or Sell leaked into Watchlist Final Action", () => {
+  const compact = {
+    researchSymbols: ["NVDA"],
+    research: { funnel: { recommendedActions: 0 }, packets: [{ symbol: "NVDA" }] },
+    watchlist: [{ symbol: "NVDA", finalAction: "Watch" }],
+  };
+  const leaked = completeReport(["NVDA"]).replace("| Watch | Researched |", "| Buy now | Researched |");
+  const errors = validateReportCompleteness(leaked, ["NVDA"], compact).errors.join("; ");
+
+  assert.match(errors, /Final Action changed deterministic gate result: NVDA/);
+  assert.match(errors, /recommendedActions=0 forbids Buy\/Sell/);
+});
+
+test("a gate-approved Buy now survives exact Final Action validation", () => {
+  const compact = {
+    researchSymbols: ["NVDA"],
+    research: { funnel: { recommendedActions: 1 }, packets: [{ symbol: "NVDA" }] },
+    watchlist: [{ symbol: "NVDA", finalAction: "Buy now" }],
+  };
+
+  assert.deepEqual(validateReportCompleteness(completeReport(["NVDA"], undefined, "Buy now"), ["NVDA"], compact), { ok: true, errors: [] });
 });
 
 test("extreme valuation without holdings becomes a position-size review, not Trim", () => {
@@ -655,6 +754,7 @@ test("extreme valuation without holdings becomes a position-size review, not Tri
   }, { symbol: "ANET", sourceType: "core", setup: { verifiedCatalyst: false, dislocation: false, extremeTrim: true } });
   assert.equal(normalized.gateResult, "fail");
   assert.equal(normalized.todayAction, "Review position size");
+  assert.equal(normalized.finalAction, "Review position size");
   assert.match(normalized.gateReason, /no holdings or target allocation were supplied/);
 });
 
@@ -678,7 +778,7 @@ test("research packets reject unsourced support, resistance, target, and stop pr
 
 test("separate research audit deterministically renders negative net debt as net cash", () => {
   const audit = renderResearchAudit({
-    engineVersion: "0.5.7", buildRevision: "0.5.7-hf3",
+    engineVersion: "0.5.7", buildRevision: "0.5.7-hf4",
     opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
     dataQuality: { discoveryFundamentals: { sourceFailures: 0 } },
     research: {
@@ -968,7 +1068,7 @@ test("existing dated report prevents duplicate report generation but still evalu
   assert.deepEqual(result.report, {
     date: "2026-08-05",
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf3",
+    buildRevision: "0.5.7-hf4",
     generated: false,
     stored: true,
     storage: null,

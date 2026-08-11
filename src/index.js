@@ -11,7 +11,7 @@ const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
 const SERVICE_VERSION = "0.5.7";
-const BUILD_REVISION = "0.5.7-hf3";
+const BUILD_REVISION = "0.5.7-hf4";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -860,7 +860,7 @@ function buildDecisionFramework(rows) {
 }
 
 function aggregateDecision(rows) {
-  if (!rows.length) return { fundamentals: "Unavailable", valuation: "Unavailable", momentum: "Unavailable", action: "Wait", symbols: [] };
+  if (!rows.length) return { fundamentals: "Unavailable", valuation: "Unavailable", momentum: "Unavailable", stance: "Neutral", symbols: [] };
   const growth = median(rows.map((row) => row.reportedGrowth?.revenueTtmYoY).filter(Number.isFinite));
   const valuation = median(rows.map((row) => row.valuation?.selectedPercentile).filter(Number.isFinite));
   const momentum = median(rows.map(momentumScore).filter(Number.isFinite));
@@ -871,10 +871,16 @@ function aggregateDecision(rows) {
     fundamentals: fundamentalsLabel,
     valuation: valuationLabel,
     momentum: momentumLabel,
-    action: decisionAction(fundamentalsLabel, valuationLabel, momentumLabel),
+    stance: sectorStance(fundamentalsLabel, valuationLabel, momentumLabel),
     symbols: rows.map((row) => row.symbol),
     metrics: { medianReportedRevenueTtmYoY: growth, medianHistoricalValuationPercentile: valuation },
   };
+}
+
+function sectorStance(fundamentals, valuation, momentum) {
+  if (fundamentals === "Weak" || (valuation === "High" && momentum === "Negative")) return "Cautious";
+  if (fundamentals === "Strong" && valuation !== "High" && momentum === "Positive") return "Favorable";
+  return "Neutral";
 }
 
 function stockAction(row) {
@@ -1193,6 +1199,7 @@ async function researchCandidates(env, route, compact) {
 
 export function validateResearchConsistency(research, candidates) {
   const errors = [];
+  const tradeActions = new Set(["Buy now", "Buy on weakness", "Sell"]);
   const expected = candidates.slice(0, MAX_RESEARCH_CANDIDATES).map((row) => row.symbol);
   const actual = research.packets.map((packet) => packet.symbol);
   if (new Set(actual).size !== actual.length) errors.push("duplicate research packet symbol");
@@ -1202,6 +1209,13 @@ export function validateResearchConsistency(research, candidates) {
   if (research.funnel.researched + research.funnel.incomplete !== research.funnel.admitted) errors.push("researched + incomplete != admitted");
   if (research.funnel.recommendedActions + research.funnel.rejectedOrWatch !== research.funnel.admitted) errors.push("recommendedActions + rejectedOrWatch != admitted");
   if (research.funnel.gateQualified < research.funnel.recommendedActions) errors.push("gateQualified cannot be lower than recommendedActions");
+  const recommendedPackets = research.packets.filter((packet) => packet.gateResult === "pass" && tradeActions.has(packet.finalAction ?? packet.todayAction));
+  if (recommendedPackets.length !== research.funnel.recommendedActions) errors.push("recommendedActions does not match gate-approved final actions");
+  for (const packet of research.packets) {
+    if (packet.gateResult !== "pass" && tradeActions.has(packet.finalAction ?? packet.todayAction)) {
+      errors.push(`trade finalAction requires a passed deterministic gate: ${packet.symbol}`);
+    }
+  }
   return { ok: errors.length === 0, errors };
 }
 
@@ -1316,12 +1330,18 @@ export function normalizeResearchPacket(packet, candidate) {
     : false;
   const gateResult = packet.gateResult === "pass" && recommendedAction && !discoveryBlocked ? "pass" : "fail";
   const portfolioReview = ["Trim", "Review position size"].includes(packet.todayAction) && candidate?.setup?.extremeTrim;
+  const finalAction = gateResult === "pass"
+    ? packet.todayAction
+    : portfolioReview
+      ? "Review position size"
+      : (["Review position size", "Watch", "No action"].includes(packet.todayAction) ? packet.todayAction : "Watch");
   return {
     ...packet,
     status: "complete",
     modelGateResult: packet.gateResult,
     gateResult,
-    todayAction: gateResult === "pass" ? packet.todayAction : portfolioReview ? "Review position size" : (["Review position size", "Watch", "No action"].includes(packet.todayAction) ? packet.todayAction : "Watch"),
+    todayAction: finalAction,
+    finalAction,
     gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, portfolioReview ? "extreme valuation is a risk flag; no holdings or target allocation were supplied" : null, !recommendedAction && !portfolioReview ? "action lacks deterministic catalyst eligibility" : null].filter(Boolean).join("; "),
     sourceSnapshot: {
       symbol: candidate.symbol,
@@ -1369,6 +1389,7 @@ function incompleteResearchPacket(candidate, failure) {
     modelGateResult: "fail",
     gateResult: "fail",
     todayAction: "No action",
+    finalAction: "No action",
     confidence: "Low",
     catalystSummary: "Research incomplete",
     evidenceFor: [],
@@ -1467,12 +1488,11 @@ export function synthesisContext(compact, research) {
       reportedGrowth: row.reportedGrowth,
       catalyst: row.catalyst,
       risk: row.risk,
-      deterministicAction: row.action,
-      expectedAction: !researchSet.has(row.symbol)
+      finalAction: !researchSet.has(row.symbol)
         ? "Wait"
         : packetBySymbol.get(row.symbol)?.status !== "complete"
           ? "Wait"
-          : packetBySymbol.get(row.symbol)?.strategicPosition ?? "Wait",
+          : packetBySymbol.get(row.symbol)?.finalAction ?? packetBySymbol.get(row.symbol)?.todayAction ?? "Wait",
       researchStatus: researchSet.has(row.symbol) ? "researched" : "not_researched_today",
     })),
   };
@@ -1521,12 +1541,12 @@ export function renderMorningBrief(compact, identity = {}) {
     ...cycleRows.map(([segment, row]) => `| ${tableCell(segment)} | ${tableCell(row.rating)} | ${tableCell(row.trend)} | ${tableCell(row.evidence)} | ${tableCell(row.limitation)} |`),
     "",
     "# Sector Scorecard",
-    "| Sector | Fundamentals | Valuation | Momentum | Action | Evidence |",
+    "| Sector | Fundamentals | Valuation | Momentum | Sector Stance | Evidence |",
     "|---|---|---|---|---|---|",
-    ...sectorRows.map(([sector, row]) => `| ${tableCell(sector)} | ${tableCell(row.fundamentals)} | ${tableCell(row.valuation)} | ${tableCell(row.momentum)} | ${tableCell(row.action)} | ${tableCell(sectorEvidence(row))} |`),
+    ...sectorRows.map(([sector, row]) => `| ${tableCell(sector)} | ${tableCell(row.fundamentals)} | ${tableCell(row.valuation)} | ${tableCell(row.momentum)} | ${tableCell(row.stance)} | ${tableCell(sectorEvidence(row))} |`),
     "",
     "# Watchlist",
-    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Historical Percentile | Catalyst | Risk | Action | Research Status |",
+    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Catalyst | Risk | Final Action | Research Status |",
     "|---|---:|---:|---:|---|---:|---|---|---|---|",
     ...(compact.watchlist ?? []).map((row) => renderWatchlistRow(row)),
   ];
@@ -1571,10 +1591,12 @@ export function renderResearchAudit(compact, identity = {}) {
 
 function renderWatchlistRow(row) {
   const valuation = row.valuation;
-  const selected = valuation?.selectedMetric === "trailingPE" ? valuation.trailingPE : valuation?.trailingPS;
-  const metric = valuation?.selectedMetric === "trailingPE" ? "P/E" : "P/S";
-  const packetAction = ["Buy", "Hold", "Wait", "Avoid"].includes(row.expectedAction) ? row.expectedAction : "Wait";
-  return `| ${tableCell(row.symbol)} | ${money(row.price)} | ${percent(row.changePercent, true)} | ${percent(row.positionIn52WeekRange)} | ${Number.isFinite(selected) ? `${metric} ${round(selected)}` : "unavailable"} | ${percent(valuation?.selectedPercentile)} | ${tableCell(row.catalyst)} | ${tableCell(row.risk)} | ${packetAction} | ${row.researchStatus === "not_researched_today" ? "Not researched today" : "Researched"} |`;
+  const metric = valuation?.selectedMetric === "trailingPE" ? "P/E" : valuation?.selectedMetric === "trailingPS" ? "P/S" : null;
+  const selected = metric === "P/E" ? valuation?.trailingPE : metric === "P/S" ? valuation?.trailingPS : null;
+  const trailing = metric && Number.isFinite(selected) ? `Trailing ${metric} ${round(selected)}` : "Trailing valuation unavailable";
+  const forward = metric ? `Forward ${metric} unavailable` : "Forward valuation unavailable";
+  const finalAction = [...TODAY_ACTIONS, "Wait"].includes(row.finalAction) ? row.finalAction : "Wait";
+  return `| ${tableCell(row.symbol)} | ${money(row.price)} | ${percent(row.changePercent, true)} | ${percent(row.positionIn52WeekRange)} | ${trailing}; ${forward} | ${percent(valuation?.selectedPercentile)} | ${tableCell(row.catalyst)} | ${tableCell(row.risk)} | ${finalAction} | ${row.researchStatus === "not_researched_today" ? "Not researched today" : "Researched"} |`;
 }
 
 function formatMarketGroup(group, category) {
@@ -1582,7 +1604,8 @@ function formatMarketGroup(group, category) {
   const items = (group.items ?? []).map((item) => {
     if (category === "rates") return `${item.label} ${fmt(item.value)}${item.unit ?? "%"} (${Number.isFinite(item.change) ? `${item.change >= 0 ? "+" : ""}${round(item.change * 100)} bps` : "change unavailable"})`;
     const unit = category === "oil" && item.unit === "USD" ? "$" : "";
-    return `${item.label} ${unit}${fmt(item.value)} (${percent(item.changePercent, true)})`;
+    const change = Number.isFinite(item.changePercent) ? percent(item.changePercent, true) : "daily change unavailable";
+    return `${item.label} ${unit}${fmt(item.value)} (${change})`;
   });
   return `${group.status}${group.asOf ? ` as of ${group.asOf}` : ""}: ${items.join(", ") || "no instruments"}.`;
 }
@@ -1891,9 +1914,10 @@ function validateDashboardTable(section, requiredRows, label, expected, errors) 
       errors.push(`${label} missing row: ${rowLabel}`);
       continue;
     }
-    const fields = label === "AI Cycle Dashboard" ? ["rating", "trend"] : ["fundamentals", "valuation", "momentum", "action"];
+    const fields = label === "AI Cycle Dashboard" ? ["rating", "trend"] : ["fundamentals", "valuation", "momentum", "stance"];
     for (const field of fields) {
-      const index = headers.indexOf(normalizeCell(field));
+      const header = field === "stance" ? "Sector Stance" : field;
+      const index = headers.indexOf(normalizeCell(header));
       if (expected?.[rowLabel]?.[field] !== undefined && normalizeCell(row[index]) !== normalizeCell(expected[rowLabel][field])) {
         errors.push(`${label} ${rowLabel} changed deterministic ${field}`);
       }
@@ -1911,12 +1935,12 @@ function parseMarkdownTable(section) {
 }
 
 function validateWatchlistTable(section, compact, errors) {
-  const expectedHeaders = ["Symbol", "Price", "Daily Change", "52-Week Position", "Valuation", "Historical Percentile", "Catalyst", "Risk", "Action", "Research Status"];
+  const expectedHeaders = ["Symbol", "Price", "Daily Change", "52-Week Position", "Valuation", "Trailing 5Y Percentile", "Catalyst", "Risk", "Final Action", "Research Status"];
   const table = parseMarkdownTable(section);
   const normalizedHeaders = table.headers.map(normalizeCell);
   for (const header of expectedHeaders) if (!normalizedHeaders.includes(normalizeCell(header))) errors.push(`Watchlist missing column: ${header}`);
   const symbolIndex = normalizedHeaders.indexOf(normalizeCell("Symbol"));
-  const actionIndex = normalizedHeaders.indexOf(normalizeCell("Action"));
+  const actionIndex = normalizedHeaders.indexOf(normalizeCell("Final Action"));
   const statusIndex = normalizedHeaders.indexOf(normalizeCell("Research Status"));
   const researchSymbols = new Set(compact?.researchSymbols ?? (compact?.research?.packets ?? []).map((packet) => packet.symbol));
   for (const expected of compact?.watchlist ?? []) {
@@ -1925,14 +1949,20 @@ function validateWatchlistTable(section, compact, errors) {
       errors.push(`Watchlist missing core symbol: ${expected.symbol}`);
       continue;
     }
-    const action = String(row[actionIndex] ?? "").replace(/[\s*`_]/g, "");
-    if (!/^(Buy|Hold|Wait|Avoid)$/i.test(action)) errors.push(`Watchlist invalid Action for ${expected.symbol}`);
+    const actionText = String(row[actionIndex] ?? "").replace(/[*`_]/g, "").trim();
+    const action = actionText.replace(/\s/g, "");
+    if (!/^(Buynow|Buyonweakness|Sell|Reviewpositionsize|Watch|Noaction|Wait)$/i.test(action)) errors.push(`Watchlist invalid Final Action for ${expected.symbol}`);
     if (!researchSymbols.has(expected.symbol)) {
       if (!/^Wait$/i.test(action)) errors.push(`unresearched watchlist symbol must be Wait: ${expected.symbol}`);
       if (!/not\s+researched/i.test(row[statusIndex] ?? "")) errors.push(`unresearched watchlist symbol must disclose research status: ${expected.symbol}`);
-    } else if (expected.expectedAction && normalizeCell(action) !== normalizeCell(expected.expectedAction)) {
-      errors.push(`Watchlist Action changed researched packet position: ${expected.symbol}`);
+    } else if (expected.finalAction && normalizeCell(actionText) !== normalizeCell(expected.finalAction)) {
+      errors.push(`Watchlist Final Action changed deterministic gate result: ${expected.symbol}`);
     }
+  }
+  const recommendedActions = compact?.research?.funnel?.recommendedActions;
+  if (recommendedActions === 0) {
+    const tradeActions = table.rows.filter((row) => /^(Buynow|Buyonweakness|Sell)$/i.test(String(row[actionIndex] ?? "").replace(/[\s*`_]/g, "")));
+    if (tradeActions.length) errors.push("recommendedActions=0 forbids Buy/Sell in Watchlist Final Action");
   }
 }
 
