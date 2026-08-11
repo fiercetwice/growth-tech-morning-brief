@@ -326,7 +326,7 @@ test("brief renders missing valuation percentile as n/a", () => {
   assert.equal(brief.watchlist[0].valuation, null);
 });
 
-test("brief computes deterministic stock and sector actions from supplied metrics", () => {
+test("brief computes internal stock posture and non-transactional sector stance from supplied metrics", () => {
   const brief = toBrief({
     generatedAt: "2026-08-05T15:00:00.000Z", session: "regular_trading",
     coverage: { requested: 1, succeeded: 1, failed: 0 },
@@ -338,7 +338,8 @@ test("brief computes deterministic stock and sector actions from supplied metric
     }],
   });
   assert.equal(brief.watchlist[0].action, "Buy");
-  assert.equal(brief.decisionFramework.sectorScorecard.GPU.action, "Buy");
+  assert.equal(brief.decisionFramework.sectorScorecard.GPU.stance, "Favorable");
+  assert.equal("action" in brief.decisionFramework.sectorScorecard.GPU, false);
   assert.equal(brief.decisionFramework.aiCycle["GPU Demand"].rating, "Insufficient Data");
   assert.equal(brief.opportunityGate.candidates.length, 1);
   assert.equal(brief.opportunityGate.candidates[0].admissionType, "auto_watchlist");
