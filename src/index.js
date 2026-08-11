@@ -11,7 +11,7 @@ const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
 const SERVICE_VERSION = "0.5.7";
-const BUILD_REVISION = "0.5.7-hf5.1";
+const BUILD_REVISION = "0.5.7-hf5.2";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -1532,10 +1532,17 @@ export function renderMorningBrief(compact, identity = {}) {
   const cycleRows = Object.entries(compact.decisionFramework?.aiCycle ?? {});
   const sectorRows = Object.entries(compact.decisionFramework?.sectorScorecard ?? {});
   const unavailableContext = Object.entries(compact.marketContext ?? {}).filter(([, group]) => group?.status !== "available").map(([name]) => name);
-  const staleFundamentals = (compact.watchlist ?? []).filter((row) => row.fundamentalCacheStatus === "stale").map((row) => row.symbol);
+  const researchSymbols = new Set(compact.researchSymbols ?? packets.map((packet) => packet.symbol));
+  const staleFundamentals = (compact.watchlist ?? []).filter((row) => row.fundamentalCacheStatus === "stale");
+  const researchedStaleFundamentals = staleFundamentals.filter((row) => researchSymbols.has(row.symbol)).map((row) => row.symbol);
+  const unresearchedStaleCount = staleFundamentals.length - researchedStaleFundamentals.length;
+  const staleFundamentalRisks = [
+    researchedStaleFundamentals.length ? `expired SEC fundamentals excluded from sector ratings pending refresh: ${researchedStaleFundamentals.join(", ")}` : null,
+    unresearchedStaleCount ? `${unresearchedStaleCount} unresearched watchlist ${unresearchedStaleCount === 1 ? "name also has" : "names also have"} expired SEC fundamentals pending refresh` : null,
+  ].filter(Boolean);
   const principalRisks = [
     unavailableContext.length ? `Market inputs stale or unavailable: ${unavailableContext.join(", ")}` : null,
-    staleFundamentals.length ? `expired SEC fundamentals excluded from sector ratings pending refresh: ${staleFundamentals.join(", ")}` : null,
+    staleFundamentalRisks.length ? staleFundamentalRisks.join("; ") : null,
   ].filter(Boolean);
   const best = recommended[0];
   const catalyst = verified[0];

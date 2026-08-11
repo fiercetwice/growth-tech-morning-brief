@@ -55,7 +55,7 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "",
     "**Report Mode:** standard",
     "**Engine Version:** 0.5.7",
-    "**Build Revision:** 0.5.7-hf5.1",
+    "**Build Revision:** 0.5.7-hf5.2",
     "**Report ID:** 00000000-0000-4000-8000-000000000000",
     "**Generated At:** 2026-08-05T13:35:00.000Z",
     "",
@@ -111,7 +111,7 @@ test("verbose Morning Brief keeps research audit out of the five-section product
     reportMode: "verbose",
     engineVersion: "0.5.7",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
-    buildRevision: "0.5.7-hf5.1",
+    buildRevision: "0.5.7-hf5.2",
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
@@ -142,7 +142,7 @@ test("verbose validation applies section-aware research and context-only ticker 
   const compact = {
     reportMode: "verbose",
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5.1",
+    buildRevision: "0.5.7-hf5.2",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
@@ -508,7 +508,7 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
   assert.equal(body.report.reportEngineVersion, "0.5.7");
-  assert.equal(body.report.reportBuildRevision, "0.5.7-hf5.1");
+  assert.equal(body.report.reportBuildRevision, "0.5.7-hf5.2");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.7");
   assert.match(bucket.objects.get("reports/latest.md"), /# Executive Summary/);
@@ -686,7 +686,7 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
   const compact = {
     schemaVersion: 7,
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5.1",
+    buildRevision: "0.5.7-hf5.2",
     reportMode: "verbose",
     generatedAt: "2026-08-10T23:45:11.044Z",
     session: "after_hours",
@@ -740,7 +740,7 @@ test("renderer excludes expired SEC fundamentals and surfaces their symbols and 
   const compact = {
     schemaVersion: 7,
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5.1",
+    buildRevision: "0.5.7-hf5.2",
     reportMode: "verbose",
     generatedAt: "2026-08-11T05:54:44.315Z",
     session: "closed",
@@ -751,23 +751,33 @@ test("renderer excludes expired SEC fundamentals and surfaces their symbols and 
       aiCycle: {},
       sectorScorecard: {
         GPU: {
-          fundamentals: "Stale", valuation: "High", momentum: "Mixed", stance: "Neutral", symbols: ["NVDA"],
+          fundamentals: "Stale", valuation: "High", momentum: "Mixed", stance: "Neutral", symbols: ["NVDA", "TSM"],
           metrics: {
             medianReportedRevenueTtmYoY: null,
             medianHistoricalValuationPercentile: 82.1,
             freshFundamentals: [],
-            staleFundamentals: [{ symbol: "NVDA", asOf: "2026-05-28" }],
+            staleFundamentals: [
+              { symbol: "NVDA", asOf: "2026-05-28" },
+              { symbol: "TSM", asOf: "2026-05-20" },
+            ],
           },
         },
       },
     },
     opportunityGate: { candidates: [] },
-    watchlist: [{
-      symbol: "NVDA", price: 217.55, changePercent: -2.86, positionIn52WeekRange: 74.58,
-      valuation: { selectedMetric: "trailingPE", trailingPE: 33.32, selectedPercentile: 82.1 },
-      reportedGrowth: { revenueTtmYoY: 32.29 }, fundamentalCacheStatus: "stale", fundamentalAsOf: "2026-05-28",
-      catalyst: "n/a — no company-specific catalyst in snapshot", risk: "expired cache",
-    }],
+    watchlist: [
+      {
+        symbol: "NVDA", price: 217.55, changePercent: -2.86, positionIn52WeekRange: 74.58,
+        valuation: { selectedMetric: "trailingPE", trailingPE: 33.32, selectedPercentile: 82.1 },
+        reportedGrowth: { revenueTtmYoY: 32.29 }, fundamentalCacheStatus: "stale", fundamentalAsOf: "2026-05-28",
+        catalyst: "n/a — no company-specific catalyst in snapshot", risk: "expired cache",
+      },
+      {
+        symbol: "TSM", price: 418.47, changePercent: -0.37, positionIn52WeekRange: 76.62,
+        valuation: null, reportedGrowth: null, fundamentalCacheStatus: "stale", fundamentalAsOf: "2026-05-20",
+        catalyst: "n/a — no company-specific catalyst in snapshot", risk: "expired cache",
+      },
+    ],
   };
   const research = {
     funnel: { admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 },
@@ -783,11 +793,16 @@ test("renderer excludes expired SEC fundamentals and surfaces their symbols and 
     generatedAt: "2026-08-11T05:55:05.623Z",
   });
 
+  const principalRisk = report.split("\n").find((line) => line.startsWith("- **Principal Risk:**"));
   assert.match(report, /Principal Risk:.*expired SEC fundamentals excluded from sector ratings pending refresh: NVDA/i);
+  assert.match(principalRisk, /1 unresearched watchlist name also has expired SEC fundamentals pending refresh/i);
+  assert.doesNotMatch(principalRisk, /\bTSM\b/);
   assert.match(report, /\*\*Research Exclusions:\*\* NVDA — excluded by research screening; not final portfolio recommendations/);
   assert.match(report, /\| GPU \| Stale \| High \| Mixed \| Neutral \|/);
-  assert.match(report, /stale fundamentals excluded NVDA \(as of 2026-05-28\)/);
+  assert.match(report, /stale fundamentals excluded NVDA \(as of 2026-05-28\), TSM \(as of 2026-05-20\)/);
   assert.doesNotMatch(report, /\| GPU \| Strong \|/);
+  const scopeErrors = validateReportCompleteness(report, ["NVDA"], synthesisContext(compact, research)).errors.join("; ");
+  assert.doesNotMatch(scopeErrors, /ticker reference outside research universe in Executive Summary/);
 });
 
 test("recommendedActions=0 rejects any Buy or Sell leaked into Watchlist Final Action", () => {
@@ -850,7 +865,7 @@ test("research packets reject unsourced support, resistance, target, and stop pr
 
 test("separate research audit deterministically renders negative net debt as net cash", () => {
   const audit = renderResearchAudit({
-    engineVersion: "0.5.7", buildRevision: "0.5.7-hf5.1",
+    engineVersion: "0.5.7", buildRevision: "0.5.7-hf5.2",
     opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
     dataQuality: { discoveryFundamentals: { sourceFailures: 0 } },
     research: {
@@ -1140,7 +1155,7 @@ test("existing dated report prevents duplicate report generation but still evalu
   assert.deepEqual(result.report, {
     date: "2026-08-05",
     engineVersion: "0.5.7",
-    buildRevision: "0.5.7-hf5.1",
+    buildRevision: "0.5.7-hf5.2",
     generated: false,
     stored: true,
     storage: null,
