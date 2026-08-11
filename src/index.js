@@ -10,8 +10,8 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.8.2";
-const BUILD_REVISION = "0.5.8.2";
+const SERVICE_VERSION = "0.5.8.3";
+const BUILD_REVISION = "0.5.8.3";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -82,7 +82,6 @@ const BUILTIN_AI_CYCLE_OBSERVATIONS = [
   { segment: "AI Cloud", company: "MSFT", metric: "Azure and other cloud services revenue growth", value: 40, unit: "% YoY", changePercent: 40, direction: "positive", periodEnd: "2026-03-31", publishedAt: "2026-04-29", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://www.microsoft.com/en-us/Investor/earnings/FY-2026-Q3/press-release-webcast" },
   { segment: "AI Cloud", company: "GOOGL", metric: "Google Cloud revenue growth", value: 82, unit: "% YoY", changePercent: 82, direction: "positive", periodEnd: "2026-06-30", publishedAt: "2026-07-23", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://abc.xyz/investor/events/event-details/2026/2026-Q2-Earnings-Call-2026-GgTAq7Is0z/default.aspx" },
   { segment: "Enterprise AI", company: "MSFT", metric: "AI business annual revenue run-rate growth", value: 123, unit: "% YoY", changePercent: 123, direction: "positive", periodEnd: "2026-03-31", publishedAt: "2026-04-29", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://www.microsoft.com/en-us/Investor/earnings/FY-2026-Q3/press-release-webcast" },
-  { segment: "Enterprise AI", company: "GOOGL", metric: "Google Cloud backlog", value: 514, unit: "USD bn", changePercent: null, direction: "positive", periodEnd: "2026-06-30", publishedAt: "2026-07-23", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://abc.xyz/investor/events/event-details/2026/2026-Q2-Earnings-Call-2026-GgTAq7Is0z/default.aspx" },
   { segment: "Inference", company: "GOOGL", metric: "Model API tokens processed per minute", value: 22, unit: "bn tokens/min", changePercent: 37.5, direction: "positive", periodEnd: "2026-06-30", publishedAt: "2026-07-23", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://abc.xyz/investor/events/event-details/2026/2026-Q2-Earnings-Call-2026-GgTAq7Is0z/default.aspx" },
 ];
 
@@ -893,12 +892,14 @@ export async function loadAiCycleObservations(env, now = new Date()) {
 export function normalizeAiCycleObservations(rows, now = new Date()) {
   return rows.map((row) => {
     const published = Date.parse(row?.publishedAt);
+    const periodEnd = Date.parse(row?.periodEnd);
     const freshnessDays = row?.freshnessDays !== null && row?.freshnessDays !== undefined && Number.isFinite(Number(row.freshnessDays)) ? Number(row.freshnessDays) : 120;
     const ageDays = Number.isFinite(published) ? Math.max(0, (now.getTime() - published) / 86400_000) : null;
     const valid = Object.hasOwn(AI_CYCLE_SEGMENTS, row?.segment)
       && /^[A-Z][A-Z0-9.-]{0,9}$/.test(row?.company ?? "")
       && cleanText(row?.metric) && Number.isFinite(Number(row?.value)) && cleanText(row?.unit)
-      && /^\d{4}-\d{2}-\d{2}$/.test(row?.periodEnd ?? "")
+      && /^\d{4}-\d{2}-\d{2}$/.test(row?.periodEnd ?? "") && Number.isFinite(periodEnd)
+      && periodEnd <= published
       && Number.isFinite(published) && published <= now.getTime() + 86400_000 && officialAiCycleUrl(row?.company, row?.sourceUrl)
       && row?.sourceType === "company_earnings_release";
     return valid ? {
@@ -924,7 +925,7 @@ function aggregateAiCycle(segment, observations) {
   const all = observations.filter((row) => row.segment === segment);
   const fresh = all.filter((row) => row.freshness === "available");
   const companies = new Set(fresh.map((row) => row.company));
-  const evidence = fresh.map((row) => `${row.company} ${row.metric} ${fmt(row.value)} ${row.unit}${Number.isFinite(row.changePercent) ? ` (${signed(round(row.changePercent))}%)` : ""} as of ${row.publishedAt}`).join("; ");
+  const evidence = fresh.map((row) => `${row.company} ${row.metric} ${fmt(row.value)} ${row.unit}${Number.isFinite(row.changePercent) ? ` (${signed(round(row.changePercent))}%)` : ""}; period ended ${row.periodEnd}; published ${row.publishedAt}`).join("; ");
   if (companies.size < 2) return {
     rating: fresh.length ? "Partial Coverage" : "Insufficient Data",
     trend: fresh.length ? aiCycleTrend(fresh) : "Unclear",
@@ -957,10 +958,15 @@ function aiCycleTrend(rows) {
 
 function aggregateDecision(rows) {
   if (!rows.length) return { fundamentals: "Unavailable", valuation: "Unavailable", momentum: "Unavailable", stance: "Neutral", symbols: [] };
-  const staleFundamentalRows = rows.filter((row) => row.fundamentalCacheStatus === "stale");
-  const freshFundamentalRows = rows.filter((row) => ["fresh", "refreshed"].includes(row.fundamentalCacheStatus) && Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
-  const freshWithoutGrowthRows = rows.filter((row) => ["fresh", "refreshed"].includes(row.fundamentalCacheStatus) && !Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
-  const unknownFundamentalRows = rows.filter((row) => !["fresh", "refreshed", "stale"].includes(row.fundamentalCacheStatus));
+  const hasDatedFundamentals = (row) => {
+    const asOf = row.fundamentalAsOf ?? row.reportedGrowth?.asOf ?? "";
+    return /^\d{4}-\d{2}-\d{2}$/.test(asOf) && Number.isFinite(Date.parse(asOf));
+  };
+  const staleFundamentalRows = rows.filter((row) => row.fundamentalCacheStatus === "stale" && hasDatedFundamentals(row));
+  const freshFundamentalRows = rows.filter((row) => ["fresh", "refreshed"].includes(row.fundamentalCacheStatus) && hasDatedFundamentals(row) && Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
+  const freshWithoutGrowthRows = rows.filter((row) => ["fresh", "refreshed"].includes(row.fundamentalCacheStatus) && hasDatedFundamentals(row) && !Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
+  const knownFundamentalRows = new Set([...staleFundamentalRows, ...freshFundamentalRows, ...freshWithoutGrowthRows]);
+  const unknownFundamentalRows = rows.filter((row) => !knownFundamentalRows.has(row));
   const growth = median(freshFundamentalRows.map((row) => row.reportedGrowth.revenueTtmYoY));
   const valuation = median(rows.map((row) => row.valuation?.selectedPercentile).filter(Number.isFinite));
   const momentum = median(rows.map(momentumScore).filter(Number.isFinite));
@@ -1645,9 +1651,24 @@ export function synthesisContext(compact, research) {
         : packetBySymbol.get(row.symbol)?.status !== "complete"
           ? "Wait"
           : packetBySymbol.get(row.symbol)?.finalAction ?? packetBySymbol.get(row.symbol)?.todayAction ?? "Wait",
+      recommendationGateResult: recommendationGateResult(packetBySymbol.get(row.symbol), researchSet.has(row.symbol)),
       researchStatus: researchSet.has(row.symbol) ? "researched" : "not_researched_today",
     })),
   };
+}
+
+function recommendationGateResult(packet, researched) {
+  if (!researched) return "Not evaluated — not researched today";
+  if (!packet || packet.status !== "complete") return `Unavailable — ${cleanReportText(packet?.gateReason || "research incomplete")}`;
+  const action = packet.finalAction ?? packet.todayAction ?? "No action";
+  if (packet.gateResult === "pass") return `Passed — ${action}; ${cleanReportText(packet.gateReason)}`;
+  const reasons = [
+    packet.modelGateResult !== "pass" ? "model research gate failed" : null,
+    packet.strategicPosition ? `strategic position ${packet.strategicPosition}` : null,
+    `final action ${action}`,
+    cleanReportText(packet.gateReason),
+  ].filter(Boolean);
+  return `Rejected — ${[...new Set(reasons)].join("; ")}`;
 }
 
 export function renderMorningBrief(compact, identity = {}) {
@@ -1674,7 +1695,7 @@ export function renderMorningBrief(compact, identity = {}) {
     `- **AI Cycle and Sector Implications:** ${summarizeCycleAndSectors(cycleRows, sectorRows)}`,
     `- **Market Context:** ${summarizeMarketContext(compact.marketContext)}`,
     `- **Key Scheduled Event:** ${scheduledEvent}`,
-    `- **Highest-Ranked Recommendation:** ${best ? formatHighestRankedRecommendation(best) : `No gate-qualified recommendation; ${gateQualified.length} model-qualified research setup(s), ${recommended.length} deterministic recommendation(s).`}`,
+    `- **Highest-Ranked Recommendation:** ${best ? formatHighestRankedRecommendation(best) : formatRecommendationAbsence(packets, gateQualified.length, recommended.length)}`,
     `- **Primary Valuation Risk:** ${valuationRisk}`,
     "",
     "# Overnight and Market Context",
@@ -1696,8 +1717,8 @@ export function renderMorningBrief(compact, identity = {}) {
     ...sectorRows.map(([sector, row]) => `| ${tableCell(sector)} | ${tableCell(row.fundamentals)} | ${tableCell(row.valuation)} | ${tableCell(row.momentum)} | ${tableCell(row.stance)} | ${tableCell(sectorEvidence(row))} |`),
     "",
     "# Watchlist",
-    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Implied Value (Bear/Base/Bull) | Base Upside / Bear Downside | Preferred Entry | Valuation Signal | Catalyst | Risk | Final Action | Research Status |",
-    "|---|---:|---:|---:|---|---:|---|---|---:|---|---|---|---|---|",
+    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Implied Value (Bear/Base/Bull) | Base Upside / Bear-Case Return | Preferred Entry | Valuation Signal | Catalyst | Risk | Final Action | Recommendation Gate Result | Research Status |",
+    "|---|---:|---:|---:|---|---:|---|---|---|---|---|---|---|---|---|",
     ...(compact.watchlist ?? []).map((row) => renderWatchlistRow(row)),
   ];
   return lines.join("\n");
@@ -1768,6 +1789,24 @@ function formatHighestRankedRecommendation(packet) {
   const action = packet.finalAction ?? packet.todayAction;
   const risk = cleanReportText(packet.invalidation || packet.evidenceAgainst?.[0] || "No thesis-specific invalidation supplied.");
   return `${packet.symbol} — ${action}; ${cleanReportText(packet.gateReason)}; invalidation: ${risk}`;
+}
+
+function formatRecommendationAbsence(packets, modelQualifiedCount, recommendedCount) {
+  const rejected = [...packets]
+    .filter((packet) => packet.status === "complete" && packet.gateResult !== "pass")
+    .sort((a, b) => recommendationNearMissRank(b) - recommendationNearMissRank(a))
+    .slice(0, 3)
+    .map((packet) => `${packet.symbol} rejected: ${cleanReportText(packet.gateReason || "deterministic gate not passed")}`);
+  const audit = rejected.length ? ` Leading researched setups: ${rejected.join("; ")}.` : "";
+  return `No gate-qualified recommendation; ${modelQualifiedCount} model-qualified research setup(s), ${recommendedCount} deterministic recommendation(s).${audit}`;
+}
+
+function recommendationNearMissRank(packet) {
+  const target = packet.sourceSnapshot?.targetAndMispricing;
+  const upside = Number.isFinite(target?.baseUpsidePercent) ? target.baseUpsidePercent : -100;
+  const confidence = { High: 3, Medium: 2, Low: 1 }[packet.confidence] ?? 0;
+  const core = packet.sourceSnapshot?.sourceType === "core" ? 1 : 0;
+  return core * 1_000_000 + confidence * 10_000 + Math.max(-100, Math.min(500, upside));
 }
 
 function primaryValuationRisk(watchlist, sectorRows) {
@@ -1847,14 +1886,36 @@ function renderWatchlistRow(row) {
   const target = row.targetAndMispricing;
   const availableTarget = target?.status === "available";
   const values = availableTarget ? `${money(target.bearValue)} / ${money(target.baseValue)} / ${money(target.bullValue)}; trailing-implied` : `Target unavailable — ${target?.reason ?? "insufficient inputs"}`;
-  const upsideRisk = availableTarget ? `${percent(target.baseUpsidePercent, true)} / ${percent(target.downsideToBearPercent)}; R/R ${Number.isFinite(target.riskRewardRatio) ? round(target.riskRewardRatio) : "n/m"}` : "unavailable";
+  const upsideRisk = availableTarget ? `${percent(target.baseUpsidePercent, true)} / ${percent(bearCaseReturnPercent(target), true)}; ${riskRewardDisplay(target)}` : "unavailable";
+  const preferredEntry = availableTarget ? preferredEntryDisplay(row, target) : "unavailable";
   const signal = availableTarget ? `${target.valuationAdjustment >= 0 ? "+" : ""}${target.valuationAdjustment} ${target.valuationLabel}; ${target.confidence}; consensus unavailable` : `${target?.confidence ?? "Unavailable"}; consensus unavailable`;
-  return `| ${tableCell(row.symbol)} | ${money(row.price)} | ${percent(row.changePercent, true)} | ${percent(row.positionIn52WeekRange)} | ${trailing}; ${forward} | ${percent(valuation?.selectedPercentile)} | ${tableCell(values)} | ${tableCell(upsideRisk)} | ${availableTarget ? money(target.preferredEntryPrice) : "unavailable"} | ${tableCell(signal)} | ${tableCell(row.catalyst)} | ${tableCell(row.risk)} | ${finalAction} | ${row.researchStatus === "not_researched_today" ? "Not researched today" : "Researched"} |`;
+  return `| ${tableCell(row.symbol)} | ${money(row.price)} | ${percent(row.changePercent, true)} | ${percent(row.positionIn52WeekRange)} | ${trailing}; ${forward} | ${percent(valuation?.selectedPercentile)} | ${tableCell(values)} | ${tableCell(upsideRisk)} | ${tableCell(preferredEntry)} | ${tableCell(signal)} | ${tableCell(row.catalyst)} | ${tableCell(row.risk)} | ${finalAction} | ${tableCell(row.recommendationGateResult)} | ${row.researchStatus === "not_researched_today" ? "Not researched today" : "Researched"} |`;
 }
 
 function targetAuditDisplay(target) {
   if (target?.status !== "available") return `Target unavailable — ${target?.reason ?? "insufficient inputs"}`;
-  return `current ${money(target.currentPrice)} (price as of ${target.priceAsOf ?? "unavailable"}; inputs as of ${target.inputAsOf ?? "unavailable"}); ${money(target.bearValue)} bear / ${money(target.baseValue)} base / ${money(target.bullValue)} bull; ${percent(target.baseUpsidePercent, true)} base upside; ${percent(target.downsideToBearPercent)} downside to bear; R/R ${Number.isFinite(target.riskRewardRatio) ? round(target.riskRewardRatio) : "not meaningful"}; preferred entry at or below ${money(target.preferredEntryPrice)}; method ${target.method}; formula ${target.formula}; split basis ${target.splitBasis ?? "unavailable"} with ${target.splitEventsApplied ?? 0} event(s); current-input difference ${percent(target.currentInputDifferencePercent)}; vintage dispersion ${percent(target.vintageDispersionPercent)}; assumptions ${target.assumptions}; confidence ${target.confidence}; consensus cross-check unavailable`;
+  return `current ${money(target.currentPrice)} (price as of ${target.priceAsOf ?? "unavailable"}; inputs as of ${target.inputAsOf ?? "unavailable"}); ${money(target.bearValue)} bear / ${money(target.baseValue)} base / ${money(target.bullValue)} bull; ${percent(target.baseUpsidePercent, true)} base upside; ${percent(bearCaseReturnPercent(target), true)} bear-case return; ${riskRewardDisplay(target)}; ${preferredEntryDisplay({ price: target.currentPrice }, target)}; method ${target.method}; formula ${target.formula}; split basis ${target.splitBasis ?? "unavailable"} with ${target.splitEventsApplied ?? 0} event(s); current-input difference ${percent(target.currentInputDifferencePercent)}; vintage dispersion ${percent(target.vintageDispersionPercent)}; assumptions ${target.assumptions}; confidence ${target.confidence}; consensus cross-check unavailable`;
+}
+
+function bearCaseReturnPercent(target) {
+  if (Number.isFinite(target?.currentPrice) && target.currentPrice !== 0 && Number.isFinite(target?.bearValue)) {
+    return round(((target.bearValue - target.currentPrice) / target.currentPrice) * 100);
+  }
+  return Number.isFinite(target?.downsideToBearPercent) ? round(-target.downsideToBearPercent) : null;
+}
+
+function riskRewardDisplay(target) {
+  if (Number.isFinite(target?.riskRewardRatio)) return `R/R ${round(target.riskRewardRatio)}`;
+  const bearReturn = bearCaseReturnPercent(target);
+  return Number.isFinite(bearReturn) && bearReturn >= 0 ? "No modeled downside to Bear value" : "R/R not meaningful";
+}
+
+function preferredEntryDisplay(row, target) {
+  if (!Number.isFinite(target?.preferredEntryPrice)) return "Preferred entry unavailable";
+  const currentPrice = Number.isFinite(row?.price) ? row.price : target.currentPrice;
+  return Number.isFinite(currentPrice) && currentPrice <= target.preferredEntryPrice
+    ? `Current price already below entry threshold (${money(target.preferredEntryPrice)})`
+    : `At or below ${money(target.preferredEntryPrice)}`;
 }
 
 function formatMarketGroup(group, category) {
@@ -2210,7 +2271,7 @@ function parseMarkdownTable(section) {
 }
 
 function validateWatchlistTable(section, compact, errors) {
-  const expectedHeaders = ["Symbol", "Price", "Daily Change", "52-Week Position", "Valuation", "Trailing 5Y Percentile", "Implied Value (Bear/Base/Bull)", "Base Upside / Bear Downside", "Preferred Entry", "Valuation Signal", "Catalyst", "Risk", "Final Action", "Research Status"];
+  const expectedHeaders = ["Symbol", "Price", "Daily Change", "52-Week Position", "Valuation", "Trailing 5Y Percentile", "Implied Value (Bear/Base/Bull)", "Base Upside / Bear-Case Return", "Preferred Entry", "Valuation Signal", "Catalyst", "Risk", "Final Action", "Recommendation Gate Result", "Research Status"];
   const table = parseMarkdownTable(section);
   const normalizedHeaders = table.headers.map(normalizeCell);
   for (const header of expectedHeaders) if (!normalizedHeaders.includes(normalizeCell(header))) errors.push(`Watchlist missing column: ${header}`);
@@ -2235,6 +2296,9 @@ function validateWatchlistTable(section, compact, errors) {
     } else if (expected.finalAction && normalizeCell(actionText) !== normalizeCell(expected.finalAction)) {
       errors.push(`Watchlist Final Action changed deterministic gate result: ${expected.symbol}`);
     }
+    if (expected.recommendationGateResult && normalizeCell(row[normalizedHeaders.indexOf(normalizeCell("Recommendation Gate Result"))]) !== normalizeCell(expected.recommendationGateResult)) {
+      errors.push(`Watchlist changed Recommendation Gate Result: ${expected.symbol}`);
+    }
     validateRenderedTarget(row, normalizedHeaders, expected, errors);
   }
   const recommendedActions = compact?.research?.funnel?.recommendedActions;
@@ -2253,11 +2317,10 @@ function validateRenderedTarget(row, headers, expected, errors) {
   }
   const expectedValues = [target.bearValue, target.baseValue, target.bullValue].map(money);
   for (const value of expectedValues) if (!cell("Implied Value (Bear/Base/Bull)").includes(value)) errors.push(`Watchlist changed deterministic target value for ${expected.symbol}: ${value}`);
-  if (!cell("Base Upside / Bear Downside").includes(percent(target.baseUpsidePercent, true))) errors.push(`Watchlist changed deterministic base upside: ${expected.symbol}`);
-  if (!cell("Base Upside / Bear Downside").includes(percent(target.downsideToBearPercent))) errors.push(`Watchlist changed deterministic bear downside: ${expected.symbol}`);
-  const riskReward = Number.isFinite(target.riskRewardRatio) ? String(round(target.riskRewardRatio)) : "n/m";
-  if (!cell("Base Upside / Bear Downside").includes(`R/R ${riskReward}`)) errors.push(`Watchlist changed deterministic risk/reward: ${expected.symbol}`);
-  if (!cell("Preferred Entry").includes(money(target.preferredEntryPrice))) errors.push(`Watchlist changed deterministic preferred entry: ${expected.symbol}`);
+  if (!cell("Base Upside / Bear-Case Return").includes(percent(target.baseUpsidePercent, true))) errors.push(`Watchlist changed deterministic base upside: ${expected.symbol}`);
+  if (!cell("Base Upside / Bear-Case Return").includes(percent(bearCaseReturnPercent(target), true))) errors.push(`Watchlist changed deterministic bear-case return: ${expected.symbol}`);
+  if (!cell("Base Upside / Bear-Case Return").includes(riskRewardDisplay(target))) errors.push(`Watchlist changed deterministic risk/reward: ${expected.symbol}`);
+  if (!cell("Preferred Entry").includes(preferredEntryDisplay(expected, target))) errors.push(`Watchlist changed deterministic preferred entry: ${expected.symbol}`);
   if (!cell("Valuation Signal").includes(String(target.valuationAdjustment))) errors.push(`Watchlist changed deterministic valuation adjustment: ${expected.symbol}`);
   if (!cell("Valuation Signal").includes(target.confidence)) errors.push(`Watchlist changed deterministic target confidence: ${expected.symbol}`);
 }

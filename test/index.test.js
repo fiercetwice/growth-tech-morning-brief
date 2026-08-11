@@ -463,8 +463,8 @@ test("brief computes internal stock posture and non-transactional sector stance 
       symbol: "NVDA", price: 100, changePercent: 2, yearLow: 50, yearHigh: 110,
       positionIn52WeekRange: 83, missing: false,
       valuation: { trailingPE: 20, trailingPS: 10, trailingPEPercentile5Y: 50, trailingPSPercentile5Y: 70 },
-      reportedGrowth: { revenueTtmYoY: 25, epsTtmYoY: 30, basis: "reported SEC filings; not analyst estimates" },
-      fundamentals: { cacheStatus: "fresh" },
+      reportedGrowth: { revenueTtmYoY: 25, epsTtmYoY: 30, asOf: "2026-08-01", basis: "reported SEC filings; not analyst estimates" },
+      fundamentals: { cacheStatus: "fresh", asOf: "2026-08-01" },
     }],
   });
   assert.equal(brief.watchlist[0].action, "Buy");
@@ -491,6 +491,37 @@ test("AI Cycle uses fresh official observations, requires two companies, and exp
   assert.equal(brief.decisionFramework.aiCycle.Inference.rating, "Partial Coverage");
   assert.equal(brief.decisionFramework.aiCycle["AI Cloud"].rating, "Insufficient Data");
   assert.equal(loaded.some((row) => row.metric === "Untrusted duplicate"), false);
+});
+
+test("AI Cycle separates period end from publication date and keeps Enterprise AI adoption conservative", async () => {
+  const now = new Date("2026-08-11T13:35:00Z");
+  const observations = await loadAiCycleObservations({}, now);
+  const brief = toBrief({ generatedAt: now.toISOString(), session: "premarket", coverage: { requested: 0, succeeded: 0, failed: 0 }, watchlist: [], aiCycleObservations: observations });
+  const gpu = brief.decisionFramework.aiCycle["GPU Demand"];
+  const enterprise = brief.decisionFramework.aiCycle["Enterprise AI"];
+
+  assert.match(gpu.evidence, /period ended 2026-04-26; published 2026-05-20/);
+  assert.doesNotMatch(gpu.evidence, / as of /);
+  assert.equal(enterprise.rating, "Partial Coverage");
+  assert.doesNotMatch(enterprise.evidence, /Google Cloud backlog/);
+});
+
+test("fresh fundamentals without an as-of date are classified as unknown", () => {
+  const brief = toBrief({
+    generatedAt: "2026-08-11T13:35:00.000Z", session: "regular_trading",
+    coverage: { requested: 1, succeeded: 1, failed: 0 },
+    watchlist: [{
+      symbol: "TSM", price: 100, changePercent: 1, yearLow: 80, yearHigh: 120,
+      positionIn52WeekRange: 50, missing: false,
+      valuation: { trailingPE: 20, trailingPEPercentile5Y: 50 },
+      reportedGrowth: null, fundamentals: { cacheStatus: "fresh" },
+    }],
+  });
+  const gpu = brief.decisionFramework.sectorScorecard.GPU;
+
+  assert.deepEqual(gpu.metrics.freshFundamentalsWithoutGrowth, []);
+  assert.deepEqual(gpu.metrics.unknownFundamentals, [{ symbol: "TSM", asOf: null }]);
+  assert.equal(gpu.fundamentals, "Unavailable");
 });
 
 test("brief excludes expired SEC growth from sector fundamentals ratings", () => {
