@@ -10,8 +10,8 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.8";
-const BUILD_REVISION = "0.5.8";
+const SERVICE_VERSION = "0.5.8.1";
+const BUILD_REVISION = "0.5.8.1";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -21,7 +21,7 @@ const REQUIRED_REPORT_SECTIONS = [
   "Sector Scorecard",
   "Watchlist",
 ];
-const REQUIRED_EXECUTIVE_LABELS = ["AI Cycle", "Key Catalyst", "Principal Risk", "Best Opportunity", "Research Exclusions"];
+const REQUIRED_EXECUTIVE_LABELS = ["AI Cycle", "Key Catalyst", "Principal Risk", "Best Opportunity", "Areas to Avoid"];
 const REQUIRED_CONTEXT_LABELS = ["As Of", "Global Markets", "Futures", "Rates", "Dollar", "Oil"];
 const TODAY_ACTIONS = ["Buy now", "Buy on weakness", "Sell", "Review position size", "Watch", "No action"];
 const REPORT_MODES = new Set(["standard", "verbose"]);
@@ -63,6 +63,22 @@ const AI_CYCLE_SEGMENTS = {
   "Enterprise AI": ["MSFT", "ORCL"],
   Inference: ["NVDA", "ANET", "AVGO"],
 };
+const AI_CYCLE_OFFICIAL_HOSTS = {
+  MSFT: ["microsoft.com"], GOOGL: ["abc.xyz"], NVDA: ["nvidia.com"], AVGO: ["broadcom.com"],
+  AMZN: ["amazon.com", "aboutamazon.com"], META: ["investor.fb.com", "meta.com"], ORCL: ["oracle.com"], TSM: ["tsmc.com"], CRWV: ["coreweave.com"], ANET: ["arista.com"],
+};
+
+const BUILTIN_AI_CYCLE_OBSERVATIONS = [
+  { segment: "Hyperscaler AI CapEx", company: "MSFT", metric: "Quarterly property and equipment additions", value: 30.876, unit: "USD bn", changePercent: 84.39, direction: "positive", periodEnd: "2026-03-31", publishedAt: "2026-04-29", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://www.microsoft.com/en-us/Investor/earnings/FY-2026-Q3/press-release-webcast" },
+  { segment: "Hyperscaler AI CapEx", company: "GOOGL", metric: "Quarterly CapEx, primarily AI infrastructure", value: 44.9, unit: "USD bn", changePercent: null, direction: "positive", periodEnd: "2026-06-30", publishedAt: "2026-07-23", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://abc.xyz/investor/events/event-details/2026/2026-Q2-Earnings-Call-2026-GgTAq7Is0z/default.aspx" },
+  { segment: "GPU Demand", company: "NVDA", metric: "Data Center revenue growth", value: 92, unit: "% YoY", changePercent: 92, direction: "positive", periodEnd: "2026-04-26", publishedAt: "2026-05-20", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://investor.nvidia.com/news/press-release-details/2026/NVIDIA-Announces-Financial-Results-for-First-Quarter-Fiscal-2027/default.aspx" },
+  { segment: "GPU Demand", company: "AVGO", metric: "AI semiconductor revenue growth", value: 143, unit: "% YoY", changePercent: 143, direction: "positive", periodEnd: "2026-05-03", publishedAt: "2026-06-03", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://investors.broadcom.com/news-releases/news-release-details/broadcom-inc-announces-second-quarter-fiscal-year-2026-financial" },
+  { segment: "AI Cloud", company: "MSFT", metric: "Azure and other cloud services revenue growth", value: 40, unit: "% YoY", changePercent: 40, direction: "positive", periodEnd: "2026-03-31", publishedAt: "2026-04-29", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://www.microsoft.com/en-us/Investor/earnings/FY-2026-Q3/press-release-webcast" },
+  { segment: "AI Cloud", company: "GOOGL", metric: "Google Cloud revenue growth", value: 82, unit: "% YoY", changePercent: 82, direction: "positive", periodEnd: "2026-06-30", publishedAt: "2026-07-23", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://abc.xyz/investor/events/event-details/2026/2026-Q2-Earnings-Call-2026-GgTAq7Is0z/default.aspx" },
+  { segment: "Enterprise AI", company: "MSFT", metric: "AI business annual revenue run-rate growth", value: 123, unit: "% YoY", changePercent: 123, direction: "positive", periodEnd: "2026-03-31", publishedAt: "2026-04-29", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://www.microsoft.com/en-us/Investor/earnings/FY-2026-Q3/press-release-webcast" },
+  { segment: "Enterprise AI", company: "GOOGL", metric: "Google Cloud backlog", value: 514, unit: "USD bn", changePercent: null, direction: "positive", periodEnd: "2026-06-30", publishedAt: "2026-07-23", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://abc.xyz/investor/events/event-details/2026/2026-Q2-Earnings-Call-2026-GgTAq7Is0z/default.aspx" },
+  { segment: "Inference", company: "GOOGL", metric: "Model API tokens processed per minute", value: 22, unit: "bn tokens/min", changePercent: 37.5, direction: "positive", periodEnd: "2026-06-30", publishedAt: "2026-07-23", freshnessDays: 120, sourceType: "company_earnings_release", sourceUrl: "https://abc.xyz/investor/events/event-details/2026/2026-Q2-Earnings-Call-2026-GgTAq7Is0z/default.aspx" },
+];
 
 const CIKS = {
   NVDA: "0001045810", AMZN: "0001018724", MSFT: "0000789019",
@@ -232,7 +248,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
 
   const symbols = parseSymbols(env.WATCHLIST);
   const secNetworkBudget = { remaining: Math.min(10, Math.round(nonNegativeNumber(env.SEC_REFRESH_LIMIT, DEFAULT_SEC_REFRESH_LIMIT))) };
-  const [results, marketContext, calendars, discovery] = await Promise.all([
+  const [results, marketContext, calendars, discovery, aiCycleObservations] = await Promise.all([
     Promise.allSettled(symbols.map(async (symbol) => {
     const chart = await fetchYahooChart(symbol, now, env);
     const fundamentals = await fetchSecFundamentals(symbol, env, now, { networkBudget: secNetworkBudget }).catch((error) => ({
@@ -243,6 +259,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
     buildMarketContext(env, now),
     buildCalendarContext(env, now, symbols),
     buildDiscoveryContext(env, now, symbols),
+    loadAiCycleObservations(env, now),
   ]);
 
   const watchlist = results.map((result, index) => result.status === "fulfilled"
@@ -282,6 +299,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
       calendars: "Nasdaq public calendar endpoints (unofficial)",
       monetaryPolicyNews: "Federal Reserve monetary policy RSS (official)",
       companyNews: "Yahoo Finance search news (unofficial)",
+      aiCycle: "Official company disclosures; structured point-in-time observations",
       discovery: "Nasdaq full-market stock screener (unofficial public endpoint)",
       methodology: "Point-in-time TTM multiples use only filings available by each price date",
     },
@@ -290,6 +308,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
     calendars,
     news,
     discovery: { ...discovery, symbols: discoverySymbols },
+    aiCycleObservations,
     watchlist,
   };
 
@@ -839,20 +858,12 @@ export function marketSession(now = new Date()) {
   return "closed";
 }
 
-function buildDecisionFramework(rows) {
+function buildDecisionFramework(rows, aiCycleObservations = []) {
   const sectorScorecard = Object.fromEntries(Object.entries(SECTOR_MEMBERS).map(([sector, symbols]) => {
     const members = rows.filter((row) => symbols.includes(row.symbol));
     return [sector, aggregateDecision(members)];
   }));
-  const aiCycle = Object.fromEntries(Object.entries(AI_CYCLE_SEGMENTS).map(([segment, symbols]) => {
-    const members = rows.filter((row) => symbols.includes(row.symbol));
-    return [segment, {
-      rating: "Insufficient Data",
-      trend: "Unclear",
-      evidence: members.map((row) => `${row.symbol} ${signed(row.changePercent)}%`).join(", ") || "No covered symbols",
-      limitation: "Price, reported financials, and trailing valuation do not measure demand, backlog, CapEx guidance, or estimate revisions.",
-    }];
-  }));
+  const aiCycle = Object.fromEntries(Object.keys(AI_CYCLE_SEGMENTS).map((segment) => [segment, aggregateAiCycle(segment, aiCycleObservations)]));
   return {
     methodology: "Deterministic rules; the AI explains but must not change supplied ratings or actions.",
     aiCycle,
@@ -860,11 +871,90 @@ function buildDecisionFramework(rows) {
   };
 }
 
+export async function loadAiCycleObservations(env, now = new Date()) {
+  let supplied = null;
+  if (env.AI_CYCLE_OBSERVATIONS_JSON) {
+    try { supplied = JSON.parse(env.AI_CYCLE_OBSERVATIONS_JSON); } catch { supplied = null; }
+  }
+  if (!supplied && env.BRIEF_BUCKET?.get) {
+    const object = await env.BRIEF_BUCKET.get("ai-cycle/latest.json").catch(() => null);
+    if (object) supplied = await object.json().catch(() => null);
+  }
+  const rows = Array.isArray(supplied) ? supplied : Array.isArray(supplied?.observations) ? supplied.observations : BUILTIN_AI_CYCLE_OBSERVATIONS;
+  return normalizeAiCycleObservations(rows, now);
+}
+
+export function normalizeAiCycleObservations(rows, now = new Date()) {
+  return rows.map((row) => {
+    const published = Date.parse(row?.publishedAt);
+    const freshnessDays = row?.freshnessDays !== null && row?.freshnessDays !== undefined && Number.isFinite(Number(row.freshnessDays)) ? Number(row.freshnessDays) : 120;
+    const ageDays = Number.isFinite(published) ? Math.max(0, (now.getTime() - published) / 86400_000) : null;
+    const valid = Object.hasOwn(AI_CYCLE_SEGMENTS, row?.segment)
+      && /^[A-Z][A-Z0-9.-]{0,9}$/.test(row?.company ?? "")
+      && cleanText(row?.metric) && Number.isFinite(Number(row?.value)) && cleanText(row?.unit)
+      && /^\d{4}-\d{2}-\d{2}$/.test(row?.periodEnd ?? "")
+      && Number.isFinite(published) && published <= now.getTime() + 86400_000 && officialAiCycleUrl(row?.company, row?.sourceUrl)
+      && row?.sourceType === "company_earnings_release";
+    return valid ? {
+      segment: row.segment, company: row.company, metric: cleanText(row.metric), value: Number(row.value), unit: cleanText(row.unit),
+      changePercent: row.changePercent !== null && row.changePercent !== undefined && Number.isFinite(Number(row.changePercent)) ? Number(row.changePercent) : null,
+      direction: ["positive", "stable", "negative"].includes(row.direction) ? row.direction : null,
+      periodEnd: row.periodEnd ?? null, publishedAt: new Date(published).toISOString().slice(0, 10), freshnessDays,
+      freshness: ageDays <= freshnessDays ? "available" : "stale", sourceType: row.sourceType, sourceUrl: row.sourceUrl,
+    } : null;
+  }).filter(Boolean);
+}
+
+function officialAiCycleUrl(company, sourceUrl) {
+  try {
+    const hostname = new URL(sourceUrl).hostname.toLowerCase();
+    return (AI_CYCLE_OFFICIAL_HOSTS[company] ?? []).some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+  } catch {
+    return false;
+  }
+}
+
+function aggregateAiCycle(segment, observations) {
+  const all = observations.filter((row) => row.segment === segment);
+  const fresh = all.filter((row) => row.freshness === "available");
+  const companies = new Set(fresh.map((row) => row.company));
+  const evidence = fresh.map((row) => `${row.company} ${row.metric} ${fmt(row.value)} ${row.unit}${Number.isFinite(row.changePercent) ? ` (${signed(round(row.changePercent))}%)` : ""} as of ${row.publishedAt}`).join("; ");
+  if (companies.size < 2) return {
+    rating: fresh.length ? "Partial Coverage" : "Insufficient Data",
+    trend: fresh.length ? aiCycleTrend(fresh) : "Unclear",
+    evidence: evidence || "No fresh direct indicators",
+    limitation: fresh.length ? `Only ${companies.size} independent company source; two are required for a full rating.` : all.length ? "Direct indicators are stale." : "Direct CapEx, demand, utilization, or adoption indicators are unavailable.",
+    coverage: { fresh: fresh.length, stale: all.length - fresh.length, independentCompanies: companies.size },
+  };
+  return {
+    rating: aiCycleRating(fresh), trend: aiCycleTrend(fresh), evidence,
+    limitation: "Company definitions differ; indicators are evaluated directionally and are not summed.",
+    coverage: { fresh: fresh.length, stale: all.length - fresh.length, independentCompanies: companies.size },
+  };
+}
+
+function aiCycleDirection(row) {
+  if (row.direction === "positive" || row.changePercent >= 15) return 1;
+  if (row.direction === "negative" || row.changePercent <= -5) return -1;
+  return 0;
+}
+
+function aiCycleRating(rows) {
+  const score = median(rows.map(aiCycleDirection));
+  return score > 0 ? "Positive" : score < 0 ? "Negative" : "Stable";
+}
+
+function aiCycleTrend(rows) {
+  const score = median(rows.map(aiCycleDirection));
+  return score > 0 ? "Accelerating" : score < 0 ? "Deteriorating" : "Stable";
+}
+
 function aggregateDecision(rows) {
   if (!rows.length) return { fundamentals: "Unavailable", valuation: "Unavailable", momentum: "Unavailable", stance: "Neutral", symbols: [] };
   const staleFundamentalRows = rows.filter((row) => row.fundamentalCacheStatus === "stale");
-  const freshFundamentalRows = rows.filter((row) => row.fundamentalCacheStatus !== "stale" && Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
-  const freshWithoutGrowthRows = rows.filter((row) => row.fundamentalCacheStatus !== "stale" && !Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
+  const freshFundamentalRows = rows.filter((row) => ["fresh", "refreshed"].includes(row.fundamentalCacheStatus) && Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
+  const freshWithoutGrowthRows = rows.filter((row) => ["fresh", "refreshed"].includes(row.fundamentalCacheStatus) && !Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
+  const unknownFundamentalRows = rows.filter((row) => !["fresh", "refreshed", "stale"].includes(row.fundamentalCacheStatus));
   const growth = median(freshFundamentalRows.map((row) => row.reportedGrowth.revenueTtmYoY));
   const valuation = median(rows.map((row) => row.valuation?.selectedPercentile).filter(Number.isFinite));
   const momentum = median(rows.map(momentumScore).filter(Number.isFinite));
@@ -885,6 +975,7 @@ function aggregateDecision(rows) {
       freshFundamentals: freshFundamentalRows.map(fundamentalEvidence),
       freshFundamentalsWithoutGrowth: freshWithoutGrowthRows.map(fundamentalEvidence),
       staleFundamentals: staleFundamentalRows.map(fundamentalEvidence),
+      unknownFundamentals: unknownFundamentalRows.map(fundamentalEvidence),
     },
   };
 }
@@ -991,7 +1082,7 @@ export function toBrief(snapshot) {
       monetaryPolicy: unavailableNews("Federal Reserve monetary policy RSS (official)", "not in snapshot"),
       company: unavailableNews("Yahoo Finance search news (unofficial)", "not in snapshot"),
     },
-    decisionFramework: buildDecisionFramework(valid),
+    decisionFramework: buildDecisionFramework(valid, snapshot.aiCycleObservations ?? []),
     discovery: {
       status: snapshot.discovery?.status ?? "unavailable",
       source: snapshot.discovery?.source ?? "Nasdaq full-market stock screener (unofficial public endpoint)",
@@ -1560,9 +1651,9 @@ export function renderMorningBrief(compact, identity = {}) {
   const recommended = packets.filter((packet) => packet.status === "complete" && packet.gateResult === "pass");
   const gateQualified = packets.filter((packet) => packet.status === "complete" && packet.modelGateResult === "pass");
   const verified = packets.filter((packet) => packet.sourceSnapshot?.setup?.verifiedCatalyst);
-  const researchExclusions = packets.filter((packet) => packet.status === "complete" && packet.strategicPosition === "Avoid");
   const cycleRows = Object.entries(compact.decisionFramework?.aiCycle ?? {});
   const sectorRows = Object.entries(compact.decisionFramework?.sectorScorecard ?? {});
+  const cautiousSectors = sectorRows.filter(([, row]) => row.stance === "Cautious").map(([sector]) => sector);
   const unavailableContext = Object.entries(compact.marketContext ?? {}).filter(([, group]) => group?.status !== "available").map(([name]) => name);
   const researchSymbols = new Set(compact.researchSymbols ?? packets.map((packet) => packet.symbol));
   const staleFundamentals = (compact.watchlist ?? []).filter((row) => row.fundamentalCacheStatus === "stale");
@@ -1578,6 +1669,7 @@ export function renderMorningBrief(compact, identity = {}) {
   ].filter(Boolean);
   const best = recommended[0];
   const catalyst = verified[0];
+  const cycleSummary = summarizeAiCycle(cycleRows);
   const lines = [
     `# Growth Tech Morning Brief — ${generatedAt.slice(0, 10)}`,
     "",
@@ -1588,11 +1680,11 @@ export function renderMorningBrief(compact, identity = {}) {
     `**Generated At:** ${generatedAt}`,
     "",
     "# Executive Summary",
-    `- **AI Cycle:** ${cycleRows.every(([, row]) => row.rating === "Insufficient Data") ? "Insufficient Data; direct CapEx, demand, utilization, and estimate-revision evidence is unavailable." : "Mixed; see the deterministic dashboard."}`,
+    `- **AI Cycle:** ${cycleSummary}`,
     `- **Key Catalyst:** ${catalyst ? `${catalyst.symbol} — ${cleanReportText(catalyst.catalystSummary)}` : "No verified company-specific catalyst in today's researched universe."}`,
-    `- **Principal Risk:** ${principalRisks.length ? `${principalRisks.join("; ")}.` : "Forward estimates and direct AI-cycle indicators are not in the snapshot; trailing data limit conviction."}`,
+    `- **Principal Risk:** ${principalRisks.length ? `${principalRisks.join("; ")}.` : "Forward estimates remain unavailable; direct AI-cycle observations are point-in-time company disclosures and definitions differ."}`,
     `- **Best Opportunity:** ${best ? `${best.symbol} — ${best.todayAction}; ${cleanReportText(best.gateReason)}` : `None clears the deterministic action gate; ${gateQualified.length} gate-qualified research setup(s), ${recommended.length} recommended action(s).`}`,
-    `- **Research Exclusions:** ${researchExclusions.length ? `${researchExclusions.map((packet) => packet.symbol).join(", ")} — excluded by research screening; not final portfolio recommendations.` : "None; research screening exclusions are not final portfolio recommendations."}`,
+    `- **Areas to Avoid:** ${cautiousSectors.length ? `${cautiousSectors.join(", ")} — deterministic sector stance is Cautious; see scorecard evidence.` : "No evidence-backed sector avoid call today."}`,
     "",
     "# Overnight and Market Context",
     `- **As Of:** ${compact.generatedAt ?? generatedAt}; session=${compact.session ?? "unavailable"}.`,
@@ -1620,6 +1712,16 @@ export function renderMorningBrief(compact, identity = {}) {
   return lines.join("\n");
 }
 
+function summarizeAiCycle(rows) {
+  if (!rows.length || rows.every(([, row]) => row.rating === "Insufficient Data")) return "Insufficient Data; direct-indicator coverage unavailable.";
+  const positive = rows.filter(([, row]) => row.rating === "Positive").map(([segment]) => segment);
+  const negative = rows.filter(([, row]) => row.rating === "Negative").map(([segment]) => segment);
+  const partial = rows.filter(([, row]) => row.rating === "Partial Coverage").map(([segment]) => segment);
+  if (negative.length) return `Mixed; negative direct indicators in ${negative.join(", ")}; ${positive.length} positive segment(s), ${partial.length} partial-coverage segment(s).`;
+  if (positive.length) return `Positive; ${positive.length} segment(s) supported by fresh direct indicators${partial.length ? `; partial coverage in ${partial.join(", ")}` : ""}.`;
+  return `Stable; no negative direct-indicator segment${partial.length ? `; partial coverage in ${partial.join(", ")}` : ""}.`;
+}
+
 export function renderResearchAudit(compact, identity = {}) {
   const funnel = compact.research?.funnel ?? {};
   const packets = compact.research?.packets ?? [];
@@ -1639,6 +1741,7 @@ export function renderResearchAudit(compact, identity = {}) {
     `**Field Completeness:** ${fieldCompletenessSummary(packets)}`,
     `**Material Missing Fields:** ${missing.length ? missing.join("; ") : "None in the deterministic required-field set."}`,
     `**Source Failures:** discovery fundamentals=${sourceFailures}; extraction gaps remain separate from provider failures.`,
+    `**Research Avoids:** ${packets.filter((packet) => packet.status === "complete" && packet.strategicPosition === "Avoid").map((packet) => packet.symbol).join(", ") || "None"}; these are post-research model positions, not screening exclusions or portfolio recommendations.`,
     "",
     "## Research Packets",
   ];
@@ -1674,7 +1777,7 @@ function renderWatchlistRow(row) {
 
 function targetAuditDisplay(target) {
   if (target?.status !== "available") return `Target unavailable — ${target?.reason ?? "insufficient inputs"}`;
-  return `current ${money(target.currentPrice)} (price as of ${target.priceAsOf ?? "unavailable"}; inputs as of ${target.inputAsOf ?? "unavailable"}); ${money(target.bearValue)} bear / ${money(target.baseValue)} base / ${money(target.bullValue)} bull; ${percent(target.baseUpsidePercent, true)} base upside; ${percent(target.downsideToBearPercent)} downside to bear; R/R ${Number.isFinite(target.riskRewardRatio) ? round(target.riskRewardRatio) : "not meaningful"}; preferred entry at or below ${money(target.preferredEntryPrice)}; method ${target.method}; formula ${target.formula}; assumptions ${target.assumptions}; confidence ${target.confidence}; consensus cross-check unavailable`;
+  return `current ${money(target.currentPrice)} (price as of ${target.priceAsOf ?? "unavailable"}; inputs as of ${target.inputAsOf ?? "unavailable"}); ${money(target.bearValue)} bear / ${money(target.baseValue)} base / ${money(target.bullValue)} bull; ${percent(target.baseUpsidePercent, true)} base upside; ${percent(target.downsideToBearPercent)} downside to bear; R/R ${Number.isFinite(target.riskRewardRatio) ? round(target.riskRewardRatio) : "not meaningful"}; preferred entry at or below ${money(target.preferredEntryPrice)}; method ${target.method}; formula ${target.formula}; split basis ${target.splitBasis ?? "unavailable"} with ${target.splitEventsApplied ?? 0} event(s); current-input difference ${percent(target.currentInputDifferencePercent)}; vintage dispersion ${percent(target.vintageDispersionPercent)}; assumptions ${target.assumptions}; confidence ${target.confidence}; consensus cross-check unavailable`;
 }
 
 function formatMarketGroup(group, category) {
@@ -1695,12 +1798,14 @@ function sectorEvidence(row) {
   const fresh = formatFundamentalEvidence(row?.metrics?.freshFundamentals);
   const freshWithoutGrowth = formatFundamentalEvidence(row?.metrics?.freshFundamentalsWithoutGrowth);
   const stale = formatFundamentalEvidence(row?.metrics?.staleFundamentals);
+  const unknown = formatFundamentalEvidence(row?.metrics?.unknownFundamentals);
   return [
     symbols,
     `median fresh reported revenue growth ${percent(growth)}`,
     fresh ? `fresh fundamentals ${fresh}` : null,
     freshWithoutGrowth ? `fresh fundamentals but reported revenue growth unavailable ${freshWithoutGrowth}` : null,
     stale ? `stale fundamentals excluded ${stale}` : null,
+    unknown ? `fundamental freshness unavailable ${unknown}` : null,
     `median valuation percentile ${percent(valuation)}`,
   ].filter(Boolean).join("; ");
 }
@@ -2007,7 +2112,7 @@ function validateDashboardTable(section, requiredRows, label, expected, errors) 
       errors.push(`${label} missing row: ${rowLabel}`);
       continue;
     }
-    const fields = label === "AI Cycle Dashboard" ? ["rating", "trend"] : ["fundamentals", "valuation", "momentum", "stance"];
+    const fields = label === "AI Cycle Dashboard" ? ["rating", "trend", "evidence", "limitation"] : ["fundamentals", "valuation", "momentum", "stance"];
     for (const field of fields) {
       const header = field === "stance" ? "Sector Stance" : field;
       const index = headers.indexOf(normalizeCell(header));
@@ -2649,9 +2754,16 @@ export function normalizeYahooChart(result) {
     date: new Date(timestamp * 1000).toISOString().slice(0, 10),
     close: number(quote.close?.[index]),
     adjustedClose: number(adjusted[index]),
+    splitAdjustedClose: number(quote.close?.[index]) ?? number(adjusted[index]),
     volume: number(quote.volume?.[index]),
   })).filter((row) => row.adjustedClose !== null);
   const meta = result.meta ?? {};
+  const splits = Object.values(result.events?.splits ?? {}).map((event) => ({
+    date: new Date(Number(event.date) * 1000).toISOString().slice(0, 10),
+    ratio: Number(event.numerator) > 0 && Number(event.denominator) > 0
+      ? Number(event.numerator) / Number(event.denominator)
+      : Number(String(event.splitRatio ?? "").split(":")[0]) / Number(String(event.splitRatio ?? "").split(":")[1]),
+  })).filter((event) => event.date && Number.isFinite(event.ratio) && event.ratio > 0).sort((a, b) => a.date.localeCompare(b.date));
   const closes = history.map((row) => row.adjustedClose);
   const latest = number(meta.regularMarketPrice) ?? closes.at(-1) ?? null;
   // For multi-year chart requests, chartPreviousClose is the close immediately
@@ -2668,6 +2780,7 @@ export function normalizeYahooChart(result) {
     change: finitePair(latest, previous) ? latest - previous : null,
     changePercent: finitePair(latest, previous) && previous !== 0 ? ((latest - previous) / previous) * 100 : null,
     history,
+    splits,
   };
 }
 
@@ -2793,12 +2906,14 @@ export function quarterlyFacts(rows, options = {}) {
 }
 
 function assembleSymbol(symbol, chart, fundamentals) {
-  const closes = chart.history.map((row) => row.adjustedClose).filter(Number.isFinite);
+  const closes = chart.history.map((row) => row.splitAdjustedClose ?? row.close ?? row.adjustedClose).filter(Number.isFinite);
   const window = closes.slice(-252);
   const yearLow = window.length ? Math.min(...window) : null;
   const yearHigh = window.length ? Math.max(...window) : null;
-  const valuationHistory = fundamentals.available ? buildValuationHistory(chart.history, fundamentals) : [];
+  const valuationHistory = fundamentals.available ? buildValuationHistory(chart.history, fundamentals, chart.splits ?? []) : [];
   const latestValuation = valuationHistory.at(-1) ?? null;
+  const currentTrailingPE = latestValuation?.trailingEpsPerShare > 0 ? round(chart.price / latestValuation.trailingEpsPerShare) : null;
+  const currentTrailingPS = latestValuation?.trailingRevenuePerShare > 0 ? round(chart.price / latestValuation.trailingRevenuePerShare) : null;
   const row = {
     symbol,
     name: chart.name ?? fundamentals.entityName ?? null,
@@ -2813,10 +2928,10 @@ function assembleSymbol(symbol, chart, fundamentals) {
     yearLow: round(yearLow),
     positionIn52WeekRange: round(rangePosition(chart.price, yearLow, yearHigh)),
     valuation: latestValuation ? {
-      trailingPE: latestValuation.trailingPE,
-      trailingPS: latestValuation.trailingPS,
-      trailingPEPercentile5Y: percentile(latestValuation.trailingPE, valuationHistory.map((x) => x.trailingPE)),
-      trailingPSPercentile5Y: percentile(latestValuation.trailingPS, valuationHistory.map((x) => x.trailingPS)),
+      trailingPE: currentTrailingPE,
+      trailingPS: currentTrailingPS,
+      trailingPEPercentile5Y: percentile(currentTrailingPE, valuationHistory.map((x) => x.trailingPE)),
+      trailingPSPercentile5Y: percentile(currentTrailingPS, valuationHistory.map((x) => x.trailingPS)),
       fundamentalAsOf: latestValuation.fundamentalAsOf,
     } : null,
     reportedGrowth: fundamentals.available ? reportedGrowth(fundamentals) : null,
@@ -2828,6 +2943,7 @@ function assembleSymbol(symbol, chart, fundamentals) {
       cacheStatus: fundamentals.cacheStatus ?? null,
       cachedAt: fundamentals.cachedAt ?? null,
     } : fundamentals,
+    splits: chart.splits ?? [],
     valuationHistory,
     missing: false,
   };
@@ -2864,19 +2980,34 @@ function latestQuarterGrowth(rows) {
     : null;
 }
 
-export function buildValuationHistory(prices, fundamentals) {
+export function buildValuationHistory(prices, fundamentals, splits = []) {
   return prices.map((price) => {
+    const splitAdjustedClose = price.splitAdjustedClose ?? price.close ?? price.adjustedClose;
     const availableRevenue = fundamentals.quarterlyRevenue.filter((x) => x.filed <= price.date).slice(-4);
     const availableEps = fundamentals.quarterlyEps.filter((x) => x.filed <= price.date).slice(-4);
     const availableShares = fundamentals.quarterlyShares.filter((x) => x.filed <= price.date).at(-1);
     const revenue = availableRevenue.length === 4 ? availableRevenue.reduce((sum, x) => sum + x.value, 0) : null;
-    const eps = availableEps.length === 4 ? availableEps.reduce((sum, x) => sum + x.value, 0) : null;
-    const shares = availableShares?.value ?? null;
-    const trailingPE = eps > 0 ? price.adjustedClose / eps : null;
-    const trailingPS = revenue > 0 && shares > 0 ? (price.adjustedClose * shares) / revenue : null;
+    const eps = availableEps.length === 4 ? availableEps.reduce((sum, x) => sum + splitAdjustedPerShare(x.value, x.filed, splits), 0) : null;
+    const shares = availableShares ? availableShares.value * splitFactorAfter(availableShares.filed, splits) : null;
+    const trailingPE = eps > 0 ? splitAdjustedClose / eps : null;
+    const trailingPS = revenue > 0 && shares > 0 ? (splitAdjustedClose * shares) / revenue : null;
     const filed = [...availableRevenue, ...availableEps, ...(availableShares ? [availableShares] : [])].map((x) => x.filed).sort().at(-1) ?? null;
-    return { date: price.date, adjustedClose: round(price.adjustedClose), trailingPE: round(trailingPE), trailingPS: round(trailingPS), fundamentalAsOf: filed };
+    return {
+      date: price.date, adjustedClose: round(splitAdjustedClose), trailingPE: round(trailingPE), trailingPS: round(trailingPS), fundamentalAsOf: filed,
+      trailingEpsPerShare: round(eps), trailingRevenuePerShare: revenue > 0 && shares > 0 ? round(revenue / shares) : null,
+      splitBasis: "current-share basis", splitEventsApplied: splits.filter((split) => split.date > filed).length,
+    };
   }).filter((row) => row.trailingPE !== null || row.trailingPS !== null);
+}
+
+function splitFactorAfter(date, splits) {
+  if (!date) return 1;
+  return splits.filter((split) => split.date > date).reduce((factor, split) => factor * split.ratio, 1);
+}
+
+function splitAdjustedPerShare(value, filed, splits) {
+  const factor = splitFactorAfter(filed, splits);
+  return Number(value) / factor;
 }
 
 export function buildTargetAndMispricing(row) {
@@ -2885,13 +3016,31 @@ export function buildTargetAndMispricing(row) {
   const cacheStatus = row?.fundamentals?.cacheStatus ?? row?.fundamentalCacheStatus ?? null;
   if (!Number.isFinite(price) || price <= 0) return unavailableTarget(row, "current price unavailable");
   if (cacheStatus === "stale") return unavailableTarget(row, "SEC fundamentals cache is expired pending refresh");
+  if (!["fresh", "refreshed"].includes(cacheStatus)) return unavailableTarget(row, "SEC fundamental freshness is unavailable");
+  if ((row?.splits?.length ?? 0) > 0 && history.some((item) => item.splitBasis !== "current-share basis")) {
+    return unavailableTarget(row, "split events exist but valuation history is not normalized to current-share basis");
+  }
   const preferredMetric = Number.isFinite(row?.valuation?.trailingPE) && row.valuation.trailingPE > 0 ? "trailingPE" : "trailingPS";
   const multiples = history.map((item) => item?.[preferredMetric]).filter((value) => Number.isFinite(value) && value > 0);
   const metricVintages = normalizedMetricVintages(history, preferredMetric);
   if (multiples.length < 126 || metricVintages.length < 2) {
     return unavailableTarget(row, `insufficient trailing history: ${multiples.length} valuation observations and ${metricVintages.length} filing vintages`);
   }
-  const normalizedInput = median(metricVintages.slice(-4).map((item) => item.value));
+  const recentVintages = metricVintages.slice(-4);
+  const normalizedInput = recentVintages.at(-1)?.value;
+  const currentMultiple = row?.valuation?.[preferredMetric];
+  const impliedCurrentInput = Number.isFinite(currentMultiple) && currentMultiple > 0 ? price / currentMultiple : null;
+  const currentInputDifferencePercent = Number.isFinite(impliedCurrentInput) && normalizedInput > 0
+    ? round((Math.abs(impliedCurrentInput - normalizedInput) / normalizedInput) * 100)
+    : null;
+  if (!Number.isFinite(currentInputDifferencePercent) || currentInputDifferencePercent > 10) {
+    return unavailableTarget(row, "current TTM input and quoted trailing multiple fail consistency check");
+  }
+  const vintageMedian = median(recentVintages.map((item) => item.value));
+  const vintageDispersionPercent = vintageMedian > 0
+    ? round(((Math.max(...recentVintages.map((item) => item.value)) - Math.min(...recentVintages.map((item) => item.value))) / vintageMedian) * 100)
+    : null;
+  if (!Number.isFinite(vintageDispersionPercent) || vintageDispersionPercent > 200) return unavailableTarget(row, "trailing per-share filing vintages fail dispersion sanity check");
   const bearMultiple = quantile(multiples, 0.25);
   const baseMultiple = quantile(multiples, 0.5);
   const bullMultiple = quantile(multiples, 0.75);
@@ -2907,7 +3056,9 @@ export function buildTargetAndMispricing(row) {
   const preferredEntryPrice = round(baseValue / 1.2);
   const valuationAdjustment = baseUpsidePercent >= 30 ? 2 : baseUpsidePercent >= 20 ? 1 : baseUpsidePercent >= 10 ? 0 : baseUpsidePercent >= 5 ? -1 : -2;
   const valuationLabel = valuationAdjustment > 0 ? "Opportunity Bonus" : valuationAdjustment < 0 ? "Opportunity Penalty" : "Neutral";
-  const confidence = multiples.length >= 756 && metricVintages.length >= 4 ? "High" : multiples.length >= 252 && metricVintages.length >= 3 ? "Medium" : "Low";
+  const confidence = multiples.length >= 756 && metricVintages.length >= 4 && vintageDispersionPercent <= 35
+    ? "High"
+    : multiples.length >= 252 && metricVintages.length >= 3 && vintageDispersionPercent <= 75 ? "Medium" : "Low";
   const metricLabel = preferredMetric === "trailingPE" ? "normalized TTM EPS/share" : "normalized TTM revenue/share";
   const multipleLabel = preferredMetric === "trailingPE" ? "trailing P/E" : "trailing P/S";
   return {
@@ -2919,12 +3070,13 @@ export function buildTargetAndMispricing(row) {
     method: "trailing-data implied fair-value range",
     metric: preferredMetric,
     normalizedInput: round(normalizedInput),
-    normalizedInputVintages: Math.min(4, metricVintages.length),
+    normalizedInputVintages: Math.min(4, metricVintages.length), vintageDispersionPercent, currentInputDifferencePercent,
+    splitEventsApplied: row?.splits?.length ?? 0, splitBasis: "current-share basis",
     historicalObservations: multiples.length,
     multiplePercentiles: { bear: 25, base: 50, bull: 75 },
     multiples: { bear: round(bearMultiple), base: round(baseMultiple), bull: round(bullMultiple) },
     formula: `${metricLabel} × historical ${multipleLabel} P25/P50/P75`,
-    assumptions: "Most recent up to four distinct filing-vintage TTM per-share observations are median-normalized; historical multiples are point-in-time and use only filings available on each price date.",
+    assumptions: "Latest valid TTM per-share input is used; up to four filing vintages test stability. Yahoo adjusted prices and SEC per-share/share facts are normalized to the current split basis; historical multiples use only filings available on each price date.",
     confidence,
     consensusCrossCheck: { status: "unavailable", reason: "no fresh analyst-consensus target source configured" },
     valuationAdjustment,
@@ -2936,10 +3088,11 @@ export function buildTargetAndMispricing(row) {
 function normalizedMetricVintages(history, metric) {
   const byFiling = new Map();
   for (const row of history) {
-    const multiple = row?.[metric];
-    const price = row?.adjustedClose;
-    if (!row?.fundamentalAsOf || !Number.isFinite(multiple) || multiple <= 0 || !Number.isFinite(price) || price <= 0) continue;
-    byFiling.set(row.fundamentalAsOf, { asOf: row.fundamentalAsOf, value: price / multiple });
+    const value = metric === "trailingPE" ? row?.trailingEpsPerShare : row?.trailingRevenuePerShare;
+    const fallback = Number.isFinite(row?.[metric]) && row[metric] > 0 && Number.isFinite(row?.adjustedClose) ? row.adjustedClose / row[metric] : null;
+    const normalized = Number.isFinite(value) && value > 0 ? value : fallback;
+    if (!row?.fundamentalAsOf || !Number.isFinite(normalized) || normalized <= 0) continue;
+    byFiling.set(row.fundamentalAsOf, { asOf: row.fundamentalAsOf, value: normalized, splitBasis: row.splitBasis ?? "fixture-unspecified" });
   }
   return [...byFiling.values()].sort((a, b) => a.asOf.localeCompare(b.asOf));
 }
