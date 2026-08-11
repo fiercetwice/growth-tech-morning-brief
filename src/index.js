@@ -10,8 +10,8 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.7";
-const BUILD_REVISION = "0.5.7-hf5.2";
+const SERVICE_VERSION = "0.5.8";
+const BUILD_REVISION = "0.5.8";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -272,7 +272,7 @@ export async function buildSnapshot(env, now = new Date(), options = {}) {
   };
 
   const snapshot = {
-    schemaVersion: 7,
+    schemaVersion: 8,
     generatedAt: now.toISOString(),
     session: marketSession(now),
     sources: {
@@ -862,8 +862,9 @@ function buildDecisionFramework(rows) {
 
 function aggregateDecision(rows) {
   if (!rows.length) return { fundamentals: "Unavailable", valuation: "Unavailable", momentum: "Unavailable", stance: "Neutral", symbols: [] };
-  const staleFundamentalRows = rows.filter((row) => row.fundamentalCacheStatus === "stale" && Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
+  const staleFundamentalRows = rows.filter((row) => row.fundamentalCacheStatus === "stale");
   const freshFundamentalRows = rows.filter((row) => row.fundamentalCacheStatus !== "stale" && Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
+  const freshWithoutGrowthRows = rows.filter((row) => row.fundamentalCacheStatus !== "stale" && !Number.isFinite(row.reportedGrowth?.revenueTtmYoY));
   const growth = median(freshFundamentalRows.map((row) => row.reportedGrowth.revenueTtmYoY));
   const valuation = median(rows.map((row) => row.valuation?.selectedPercentile).filter(Number.isFinite));
   const momentum = median(rows.map(momentumScore).filter(Number.isFinite));
@@ -882,6 +883,7 @@ function aggregateDecision(rows) {
       medianReportedRevenueTtmYoY: growth,
       medianHistoricalValuationPercentile: valuation,
       freshFundamentals: freshFundamentalRows.map(fundamentalEvidence),
+      freshFundamentalsWithoutGrowth: freshWithoutGrowthRows.map(fundamentalEvidence),
       staleFundamentals: staleFundamentalRows.map(fundamentalEvidence),
     },
   };
@@ -978,7 +980,7 @@ export function toBrief(snapshot) {
     throw new Error(`Research capacity invariant failed: expected ${targetResearchCount}, selected ${candidates.length}`);
   }
   const brief = {
-    schemaVersion: 7,
+    schemaVersion: 8,
     generatedAt: snapshot.generatedAt,
     session: snapshot.session,
     coverage: snapshot.coverage,
@@ -1056,7 +1058,8 @@ function autoWatchlistPriority(row, newEventSymbols) {
   const rangeExtreme = Number.isFinite(row.positionIn52WeekRange)
     ? Math.abs(row.positionIn52WeekRange - 50) / 25
     : 0;
-  return newEvent + move + financialCoverage + rangeExtreme;
+  const valuationOpportunity = (row.targetAndMispricing?.valuationAdjustment ?? 0) * 2;
+  return newEvent + move + financialCoverage + rangeExtreme + valuationOpportunity;
 }
 
 export function compactSnapshotForReport(snapshot) {
@@ -1098,6 +1101,7 @@ function compactDiscoveryRow(row) {
     valuation: row.valuation ?? null,
     reportedGrowth: row.reportedGrowth ?? null,
     fundamentals: row.fundamentals ?? null,
+    targetAndMispricing: unavailableTarget(row, "historical valuation series unavailable for discovery candidate"),
     fundamentalCoverage: row.fundamentalCoverage ?? { status: "unavailable", reason: "discovery enrichment not run" },
     news: row.news ?? [],
     missing: false,
@@ -1126,7 +1130,8 @@ function todaySetup(row, earnings) {
   if (extremeTrim) reasons.push("valuation-risk flag: valuation and range position both at/above 90th threshold");
   return {
     eligible: reasons.length > 0,
-    score: verifiedNews.length * 3 + (earningsToday ? 3 : 0) + (dislocation ? 2 : 0) + (extremeTrim ? 2 : 0),
+    score: verifiedNews.length * 3 + (earningsToday ? 3 : 0) + (dislocation ? 2 : 0) + (extremeTrim ? 2 : 0)
+      + (row.targetAndMispricing?.valuationAdjustment ?? 0),
     reasons,
     verifiedCatalyst: verifiedNews.length > 0 || earningsToday,
     dislocation,
@@ -1287,10 +1292,12 @@ function candidateResearchPrompt(compact, candidates, options = {}) {
     "Use only the supplied evidence. Do not infer that a headline caused a move unless the linkage is direct.",
     `Analyze only these batch symbols: ${[...candidateSymbols].join(", ")}. Do not place any other equity ticker in candidate fields; non-candidate market facts are context only.`,
     "Discovery names cannot pass the action gate when valuation, fundamentals, liquidity context, or a verified fresh company catalyst is missing.",
-    "Price movement alone may support Watch, never Buy/Sell. Without supplied portfolio holdings and target weights, extremeTrim is a valuation-risk flag only: use Watch, never Review position size or Trim.",
+    "Price movement alone may support Watch, never Buy/Sell. A core name without same-day news may support a value call only when the supplied target engine has Medium/High confidence, at least 20% base upside, complete financial evidence, and you state a testable rerating path within 1Q or 2Q. Discovery names still require a verified fresh catalyst.",
+    "Use the supplied deterministic trailing-implied target values exactly. They are not analyst targets. The valuation adjustment may affect ranking and action preference but cannot bypass financial, risk, liquidity, catalyst, or rerating-path gates.",
+    "Without supplied portfolio holdings and target weights, extremeTrim is a valuation-risk flag only: use Watch, never Review position size or Trim.",
     "Return {\"candidates\":[...]} with exactly one object per supplied symbol and these fields:",
-    "symbol, catalystSummary, evidenceFor (array), evidenceAgainst (array), mispricingThesis, strategicPosition (Buy/Hold/Avoid), todayAction (Buy now/Buy on weakness/Sell/Review position size/Watch/No action), confidence (High/Medium/Low), entryExitCondition, riskReward, invalidation, missingEvidence (array), sourceQuality, gateResult (pass/fail), gateReason.",
-    "Do not invent target, support, resistance, stop, or entry prices. A dollar-denominated price may appear in entryExitCondition, invalidation, riskReward, or mispricingThesis only when it exactly matches the supplied current price, 52-week low, or 52-week high.",
+    "symbol, catalystSummary, evidenceFor (array), evidenceAgainst (array), mispricingThesis, strategicPosition (Buy/Hold/Avoid), todayAction (Buy now/Buy on weakness/Sell/Review position size/Watch/No action), confidence (High/Medium/Low), entryExitCondition, riskReward, invalidation, reratingPath, reratingHorizon (1Q/2Q/Unavailable), missingEvidence (array), sourceQuality, gateResult (pass/fail), gateReason.",
+    "Do not invent target, support, resistance, stop, or entry prices. A dollar-denominated price may appear in entryExitCondition, invalidation, riskReward, or mispricingThesis only when it exactly matches a supplied current, 52-week, bear/base/bull, or preferred-entry price.",
     options.retry ? `Repair the previous failure exactly: ${options.validationErrors}` : "",
     `Batch: ${options.batchNumber}`,
     "Market context:",
@@ -1326,13 +1333,15 @@ export function validateResearchBatch(parsed, candidates) {
   for (const symbol of expected) if (!actual.includes(symbol)) errors.push(`missing candidate: ${symbol}`);
   for (const symbol of actual) if (!expected.includes(symbol)) errors.push(`unexpected candidate: ${symbol}`);
   if (actual.length !== expected.length) errors.push(`expected ${expected.length} candidate objects, received ${actual.length}`);
-  const requiredStrings = ["catalystSummary", "mispricingThesis", "strategicPosition", "todayAction", "confidence", "entryExitCondition", "riskReward", "invalidation", "sourceQuality", "gateResult", "gateReason"];
+  const requiredStrings = ["catalystSummary", "mispricingThesis", "strategicPosition", "todayAction", "confidence", "entryExitCondition", "riskReward", "invalidation", "reratingPath", "reratingHorizon", "sourceQuality", "gateResult", "gateReason"];
   for (const row of parsed.candidates) {
     for (const field of requiredStrings) if (typeof row?.[field] !== "string" || !row[field].trim()) errors.push(`${row?.symbol ?? "unknown"} missing ${field}`);
     for (const field of ["evidenceFor", "evidenceAgainst", "missingEvidence"]) if (!Array.isArray(row?.[field])) errors.push(`${row?.symbol ?? "unknown"} ${field} must be an array`);
     if (!["Buy", "Hold", "Avoid"].includes(row?.strategicPosition)) errors.push(`${row?.symbol ?? "unknown"} invalid strategicPosition`);
     if (!TODAY_ACTIONS.includes(row?.todayAction)) errors.push(`${row?.symbol ?? "unknown"} invalid todayAction`);
     if (!["High", "Medium", "Low"].includes(row?.confidence)) errors.push(`${row?.symbol ?? "unknown"} invalid confidence`);
+    if (!["1Q", "2Q", "Unavailable"].includes(row?.reratingHorizon)) errors.push(`${row?.symbol ?? "unknown"} invalid reratingHorizon`);
+    if (["1Q", "2Q"].includes(row?.reratingHorizon) && !isTestableReratingPath(row?.reratingPath)) errors.push(`${row?.symbol ?? "unknown"} reratingPath is not testable within the stated horizon`);
     if (!["pass", "fail"].includes(row?.gateResult)) errors.push(`${row?.symbol ?? "unknown"} invalid gateResult`);
     validatePacketPriceLevels(row, candidates.find((candidate) => candidate.symbol === row?.symbol), errors);
   }
@@ -1342,20 +1351,33 @@ export function validateResearchBatch(parsed, candidates) {
 export function normalizeResearchPacket(packet, candidate) {
   const discoveryBlocked = candidate?.sourceType === "discovery"
     && (!discoveryFinancialsComplete(candidate) || !candidate?.setup?.verifiedCatalyst);
-  const recommendedAction = ["Buy now", "Buy on weakness", "Sell"].includes(packet.todayAction)
-    ? candidate?.setup?.verifiedCatalyst
+  const target = candidate?.targetAndMispricing;
+  const targetUsable = target?.status === "available" && ["High", "Medium"].includes(target.confidence);
+  const baseUpside = target?.baseUpsidePercent;
+  const financialEvidenceComplete = Boolean(candidate?.valuation && candidate?.reportedGrowth);
+  const reratingEligible = candidate?.sourceType !== "discovery"
+    && targetUsable && Number.isFinite(baseUpside) && baseUpside >= 20
+    && financialEvidenceComplete && ["1Q", "2Q"].includes(packet.reratingHorizon)
+    && isTestableReratingPath(packet.reratingPath);
+  let valuationAdjustedAction = packet.todayAction;
+  if (packet.todayAction === "Buy now" && (!targetUsable || !Number.isFinite(baseUpside) || baseUpside < 10)) {
+    valuationAdjustedAction = targetUsable && baseUpside >= 5 ? "Buy on weakness" : "Watch";
+  }
+  if (packet.todayAction === "Buy on weakness" && (!targetUsable || !Number.isFinite(baseUpside) || baseUpside < 5)) valuationAdjustedAction = "Watch";
+  const recommendedAction = ["Buy now", "Buy on weakness", "Sell"].includes(valuationAdjustedAction)
+    ? (valuationAdjustedAction === "Sell" ? candidate?.setup?.verifiedCatalyst : candidate?.setup?.verifiedCatalyst || reratingEligible)
     : false;
   const gateResult = packet.gateResult === "pass" && recommendedAction && !discoveryBlocked ? "pass" : "fail";
   const portfolioInput = candidate?.portfolio?.holding === true && Number.isFinite(candidate?.portfolio?.targetWeight);
   const portfolioReview = ["Trim", "Review position size"].includes(packet.todayAction) && candidate?.setup?.extremeTrim && portfolioInput;
-  const unsupportedPortfolioAction = ["Trim", "Review position size"].includes(packet.todayAction) && !portfolioInput;
+  const unsupportedPortfolioAction = ["Trim", "Review position size"].includes(valuationAdjustedAction) && !portfolioInput;
   const finalAction = gateResult === "pass"
-    ? packet.todayAction
+    ? valuationAdjustedAction
     : portfolioReview
       ? "Review position size"
       : unsupportedPortfolioAction
         ? "Watch"
-        : (["Review position size", "Watch", "No action"].includes(packet.todayAction) ? packet.todayAction : "Watch");
+        : (["Review position size", "Watch", "No action"].includes(valuationAdjustedAction) ? valuationAdjustedAction : "Watch");
   return {
     ...packet,
     status: "complete",
@@ -1363,7 +1385,7 @@ export function normalizeResearchPacket(packet, candidate) {
     gateResult,
     todayAction: finalAction,
     finalAction,
-    gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, unsupportedPortfolioAction ? "position-size action requires supplied holdings and target weights; valuation risk remains Watch-only" : null, !recommendedAction && !portfolioReview && !unsupportedPortfolioAction ? "action lacks deterministic catalyst eligibility" : null].filter(Boolean).join("; "),
+    gateReason: gateResult === "pass" ? packet.gateReason : [packet.gateReason, discoveryBlocked ? "discovery evidence gate incomplete" : null, unsupportedPortfolioAction ? "position-size action requires supplied holdings and target weights; valuation risk remains Watch-only" : null, ["Buy now", "Buy on weakness"].includes(packet.todayAction) && !targetUsable ? "actionable Buy requires an available Medium/High-confidence deterministic target" : null, packet.todayAction === "Buy now" && targetUsable && baseUpside < 10 ? "Buy now requires at least neutral (10%) base upside; 5-10% prefers Buy on weakness and below 5% remains Watch" : null, !recommendedAction && !portfolioReview && !unsupportedPortfolioAction ? "action lacks deterministic catalyst or qualified 1Q/2Q rerating-path eligibility" : null].filter(Boolean).join("; "),
     sourceSnapshot: {
       symbol: candidate.symbol,
       sourceType: candidate.sourceType,
@@ -1375,6 +1397,7 @@ export function normalizeResearchPacket(packet, candidate) {
       dollarVolume: candidate.dollarVolume,
       relativeVolume: candidate.relativeVolume,
       valuation: candidate.valuation,
+      targetAndMispricing: candidate.targetAndMispricing,
       reportedGrowth: candidate.reportedGrowth,
       fundamentals: candidate.fundamentals,
       fundamentalCoverage: candidate.fundamentalCoverage,
@@ -1386,14 +1409,20 @@ export function normalizeResearchPacket(packet, candidate) {
 
 function validatePacketPriceLevels(packet, candidate, errors) {
   if (!candidate) return;
-  const supplied = [candidate.price, candidate.yearLow, candidate.yearHigh].filter(Number.isFinite);
-  for (const field of ["entryExitCondition", "invalidation", "riskReward", "mispricingThesis"]) {
+  const target = candidate.targetAndMispricing;
+  const supplied = [candidate.price, candidate.yearLow, candidate.yearHigh, target?.bearValue, target?.baseValue, target?.bullValue, target?.preferredEntryPrice].filter(Number.isFinite);
+  for (const field of ["entryExitCondition", "invalidation", "riskReward", "mispricingThesis", "reratingPath"]) {
     const values = [...String(packet?.[field] ?? "").matchAll(/\$\s*([0-9]+(?:\.[0-9]+)?)/g)].map((match) => Number(match[1]));
     for (const value of values) {
       const sourced = supplied.some((known) => Math.abs(known - value) <= Math.max(0.01, Math.abs(known) * 0.001));
       if (!sourced) errors.push(`${packet?.symbol ?? "unknown"} unsourced price level in ${field}: $${value}`);
     }
   }
+}
+
+function isTestableReratingPath(value) {
+  const text = String(value ?? "").trim();
+  return text.length >= 20 && /\b(?:revenue|earnings|eps|margin|guidance|backlog|bookings|capex|cash flow|customer|contract|utilization|estimate|shipment|adoption)\b/i.test(text);
 }
 
 function discoveryFinancialsComplete(candidate) {
@@ -1506,6 +1535,9 @@ export function synthesisContext(compact, research) {
       yearHigh: row.yearHigh,
       positionIn52WeekRange: row.positionIn52WeekRange,
       valuation: row.valuation,
+      targetAndMispricing: researchSet.has(row.symbol)
+        ? row.targetAndMispricing
+        : unavailableTarget(row, "not researched today; context-only names cannot receive targets"),
       reportedGrowth: row.reportedGrowth,
       fundamentalCacheStatus: row.fundamentalCacheStatus,
       fundamentalAsOf: row.fundamentalAsOf,
@@ -1581,8 +1613,8 @@ export function renderMorningBrief(compact, identity = {}) {
     ...sectorRows.map(([sector, row]) => `| ${tableCell(sector)} | ${tableCell(row.fundamentals)} | ${tableCell(row.valuation)} | ${tableCell(row.momentum)} | ${tableCell(row.stance)} | ${tableCell(sectorEvidence(row))} |`),
     "",
     "# Watchlist",
-    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Catalyst | Risk | Final Action | Research Status |",
-    "|---|---:|---:|---:|---|---:|---|---|---|---|",
+    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Implied Value (Bear/Base/Bull) | Base Upside / Bear Downside | Preferred Entry | Valuation Signal | Catalyst | Risk | Final Action | Research Status |",
+    "|---|---:|---:|---:|---|---:|---|---|---:|---|---|---|---|---|",
     ...(compact.watchlist ?? []).map((row) => renderWatchlistRow(row)),
   ];
   return lines.join("\n");
@@ -1616,6 +1648,7 @@ export function renderResearchAudit(compact, identity = {}) {
       `- Status: ${packet.status}; model gate=${packet.modelGateResult ?? "unavailable"}; recommended action=${packet.gateResult === "pass" ? "yes" : "no"}.`,
       `- Catalyst: ${cleanReportText(packet.catalystSummary)}`,
       `- Balance sheet: ${balanceSheetDisplay(packet.sourceSnapshot?.fundamentals)}.`,
+      `- Target & mispricing: ${targetAuditDisplay(packet.sourceSnapshot?.targetAndMispricing)}.`,
       `- Evidence against: ${normalizedEvidenceAgainst(packet).join("; ") || "unavailable"}.`,
       `- Missing evidence: ${(packet.missingEvidence ?? []).map(cleanReportText).join("; ") || "none stated"}.`,
       "",
@@ -1631,7 +1664,17 @@ function renderWatchlistRow(row) {
   const trailing = metric && Number.isFinite(selected) ? `Trailing ${metric} ${round(selected)}` : "Trailing valuation unavailable";
   const forward = metric ? `Forward ${metric} unavailable` : "Forward valuation unavailable";
   const finalAction = [...TODAY_ACTIONS, "Wait"].includes(row.finalAction) ? row.finalAction : "Wait";
-  return `| ${tableCell(row.symbol)} | ${money(row.price)} | ${percent(row.changePercent, true)} | ${percent(row.positionIn52WeekRange)} | ${trailing}; ${forward} | ${percent(valuation?.selectedPercentile)} | ${tableCell(row.catalyst)} | ${tableCell(row.risk)} | ${finalAction} | ${row.researchStatus === "not_researched_today" ? "Not researched today" : "Researched"} |`;
+  const target = row.targetAndMispricing;
+  const availableTarget = target?.status === "available";
+  const values = availableTarget ? `${money(target.bearValue)} / ${money(target.baseValue)} / ${money(target.bullValue)}; trailing-implied` : `Target unavailable — ${target?.reason ?? "insufficient inputs"}`;
+  const upsideRisk = availableTarget ? `${percent(target.baseUpsidePercent, true)} / ${percent(target.downsideToBearPercent)}; R/R ${Number.isFinite(target.riskRewardRatio) ? round(target.riskRewardRatio) : "n/m"}` : "unavailable";
+  const signal = availableTarget ? `${target.valuationAdjustment >= 0 ? "+" : ""}${target.valuationAdjustment} ${target.valuationLabel}; ${target.confidence}; consensus unavailable` : `${target?.confidence ?? "Unavailable"}; consensus unavailable`;
+  return `| ${tableCell(row.symbol)} | ${money(row.price)} | ${percent(row.changePercent, true)} | ${percent(row.positionIn52WeekRange)} | ${trailing}; ${forward} | ${percent(valuation?.selectedPercentile)} | ${tableCell(values)} | ${tableCell(upsideRisk)} | ${availableTarget ? money(target.preferredEntryPrice) : "unavailable"} | ${tableCell(signal)} | ${tableCell(row.catalyst)} | ${tableCell(row.risk)} | ${finalAction} | ${row.researchStatus === "not_researched_today" ? "Not researched today" : "Researched"} |`;
+}
+
+function targetAuditDisplay(target) {
+  if (target?.status !== "available") return `Target unavailable — ${target?.reason ?? "insufficient inputs"}`;
+  return `current ${money(target.currentPrice)} (price as of ${target.priceAsOf ?? "unavailable"}; inputs as of ${target.inputAsOf ?? "unavailable"}); ${money(target.bearValue)} bear / ${money(target.baseValue)} base / ${money(target.bullValue)} bull; ${percent(target.baseUpsidePercent, true)} base upside; ${percent(target.downsideToBearPercent)} downside to bear; R/R ${Number.isFinite(target.riskRewardRatio) ? round(target.riskRewardRatio) : "not meaningful"}; preferred entry at or below ${money(target.preferredEntryPrice)}; method ${target.method}; formula ${target.formula}; assumptions ${target.assumptions}; confidence ${target.confidence}; consensus cross-check unavailable`;
 }
 
 function formatMarketGroup(group, category) {
@@ -1650,11 +1693,13 @@ function sectorEvidence(row) {
   const growth = row?.metrics?.medianReportedRevenueTtmYoY;
   const valuation = row?.metrics?.medianHistoricalValuationPercentile;
   const fresh = formatFundamentalEvidence(row?.metrics?.freshFundamentals);
+  const freshWithoutGrowth = formatFundamentalEvidence(row?.metrics?.freshFundamentalsWithoutGrowth);
   const stale = formatFundamentalEvidence(row?.metrics?.staleFundamentals);
   return [
     symbols,
     `median fresh reported revenue growth ${percent(growth)}`,
     fresh ? `fresh fundamentals ${fresh}` : null,
+    freshWithoutGrowth ? `fresh fundamentals but reported revenue growth unavailable ${freshWithoutGrowth}` : null,
     stale ? `stale fundamentals excluded ${stale}` : null,
     `median valuation percentile ${percent(valuation)}`,
   ].filter(Boolean).join("; ");
@@ -1983,13 +2028,14 @@ function parseMarkdownTable(section) {
 }
 
 function validateWatchlistTable(section, compact, errors) {
-  const expectedHeaders = ["Symbol", "Price", "Daily Change", "52-Week Position", "Valuation", "Trailing 5Y Percentile", "Catalyst", "Risk", "Final Action", "Research Status"];
+  const expectedHeaders = ["Symbol", "Price", "Daily Change", "52-Week Position", "Valuation", "Trailing 5Y Percentile", "Implied Value (Bear/Base/Bull)", "Base Upside / Bear Downside", "Preferred Entry", "Valuation Signal", "Catalyst", "Risk", "Final Action", "Research Status"];
   const table = parseMarkdownTable(section);
   const normalizedHeaders = table.headers.map(normalizeCell);
   for (const header of expectedHeaders) if (!normalizedHeaders.includes(normalizeCell(header))) errors.push(`Watchlist missing column: ${header}`);
   const symbolIndex = normalizedHeaders.indexOf(normalizeCell("Symbol"));
   const actionIndex = normalizedHeaders.indexOf(normalizeCell("Final Action"));
   const statusIndex = normalizedHeaders.indexOf(normalizeCell("Research Status"));
+  const targetIndex = normalizedHeaders.indexOf(normalizeCell("Implied Value (Bear/Base/Bull)"));
   const researchSymbols = new Set(compact?.researchSymbols ?? (compact?.research?.packets ?? []).map((packet) => packet.symbol));
   for (const expected of compact?.watchlist ?? []) {
     const row = table.rows.find((candidate) => normalizeCell(candidate[symbolIndex]) === normalizeCell(expected.symbol));
@@ -2003,15 +2049,35 @@ function validateWatchlistTable(section, compact, errors) {
     if (!researchSymbols.has(expected.symbol)) {
       if (!/^Wait$/i.test(action)) errors.push(`unresearched watchlist symbol must be Wait: ${expected.symbol}`);
       if (!/not\s+researched/i.test(row[statusIndex] ?? "")) errors.push(`unresearched watchlist symbol must disclose research status: ${expected.symbol}`);
+      if (!/target\s+unavailable/i.test(row[targetIndex] ?? "")) errors.push(`unresearched watchlist symbol cannot receive target: ${expected.symbol}`);
     } else if (expected.finalAction && normalizeCell(actionText) !== normalizeCell(expected.finalAction)) {
       errors.push(`Watchlist Final Action changed deterministic gate result: ${expected.symbol}`);
     }
+    validateRenderedTarget(row, normalizedHeaders, expected, errors);
   }
   const recommendedActions = compact?.research?.funnel?.recommendedActions;
   if (recommendedActions === 0) {
     const tradeActions = table.rows.filter((row) => /^(Buynow|Buyonweakness|Sell)$/i.test(String(row[actionIndex] ?? "").replace(/[\s*`_]/g, "")));
     if (tradeActions.length) errors.push("recommendedActions=0 forbids Buy/Sell in Watchlist Final Action");
   }
+}
+
+function validateRenderedTarget(row, headers, expected, errors) {
+  const target = expected.targetAndMispricing;
+  const cell = (name) => row[headers.indexOf(normalizeCell(name))] ?? "";
+  if (target?.status !== "available") {
+    if (!/target\s+unavailable/i.test(cell("Implied Value (Bear/Base/Bull)"))) errors.push(`Watchlist must mark target unavailable: ${expected.symbol}`);
+    return;
+  }
+  const expectedValues = [target.bearValue, target.baseValue, target.bullValue].map(money);
+  for (const value of expectedValues) if (!cell("Implied Value (Bear/Base/Bull)").includes(value)) errors.push(`Watchlist changed deterministic target value for ${expected.symbol}: ${value}`);
+  if (!cell("Base Upside / Bear Downside").includes(percent(target.baseUpsidePercent, true))) errors.push(`Watchlist changed deterministic base upside: ${expected.symbol}`);
+  if (!cell("Base Upside / Bear Downside").includes(percent(target.downsideToBearPercent))) errors.push(`Watchlist changed deterministic bear downside: ${expected.symbol}`);
+  const riskReward = Number.isFinite(target.riskRewardRatio) ? String(round(target.riskRewardRatio)) : "n/m";
+  if (!cell("Base Upside / Bear Downside").includes(`R/R ${riskReward}`)) errors.push(`Watchlist changed deterministic risk/reward: ${expected.symbol}`);
+  if (!cell("Preferred Entry").includes(money(target.preferredEntryPrice))) errors.push(`Watchlist changed deterministic preferred entry: ${expected.symbol}`);
+  if (!cell("Valuation Signal").includes(String(target.valuationAdjustment))) errors.push(`Watchlist changed deterministic valuation adjustment: ${expected.symbol}`);
+  if (!cell("Valuation Signal").includes(target.confidence)) errors.push(`Watchlist changed deterministic target confidence: ${expected.symbol}`);
 }
 
 function validatePortfolioAndBalanceSheetClaims(markdown, compact, errors) {
@@ -2527,6 +2593,7 @@ function compactRow(row) {
       selectedPercentile: usePe ? row.valuation.trailingPEPercentile5Y : row.valuation.trailingPSPercentile5Y,
       fundamentalAsOf: row.valuation.fundamentalAsOf,
     } : null,
+    targetAndMispricing: row.targetAndMispricing ?? buildTargetAndMispricing(row),
     reportedGrowth: row.reportedGrowth ?? null,
     fundamentalCacheStatus: row.fundamentals?.cacheStatus ?? null,
     fundamentalCachedAt: row.fundamentals?.cachedAt ?? null,
@@ -2732,12 +2799,13 @@ function assembleSymbol(symbol, chart, fundamentals) {
   const yearHigh = window.length ? Math.max(...window) : null;
   const valuationHistory = fundamentals.available ? buildValuationHistory(chart.history, fundamentals) : [];
   const latestValuation = valuationHistory.at(-1) ?? null;
-  return {
+  const row = {
     symbol,
     name: chart.name ?? fundamentals.entityName ?? null,
     currency: chart.currency,
     exchange: chart.exchange,
     price: round(chart.price),
+    priceAsOf: chart.asOf ?? chart.history.at(-1)?.date ?? null,
     previousClose: round(chart.previousClose),
     change: round(chart.change),
     changePercent: round(chart.changePercent),
@@ -2763,6 +2831,8 @@ function assembleSymbol(symbol, chart, fundamentals) {
     valuationHistory,
     missing: false,
   };
+  row.targetAndMispricing = buildTargetAndMispricing(row);
+  return row;
 }
 
 export function reportedGrowth(fundamentals) {
@@ -2805,8 +2875,97 @@ export function buildValuationHistory(prices, fundamentals) {
     const trailingPE = eps > 0 ? price.adjustedClose / eps : null;
     const trailingPS = revenue > 0 && shares > 0 ? (price.adjustedClose * shares) / revenue : null;
     const filed = [...availableRevenue, ...availableEps, ...(availableShares ? [availableShares] : [])].map((x) => x.filed).sort().at(-1) ?? null;
-    return { date: price.date, trailingPE: round(trailingPE), trailingPS: round(trailingPS), fundamentalAsOf: filed };
+    return { date: price.date, adjustedClose: round(price.adjustedClose), trailingPE: round(trailingPE), trailingPS: round(trailingPS), fundamentalAsOf: filed };
   }).filter((row) => row.trailingPE !== null || row.trailingPS !== null);
+}
+
+export function buildTargetAndMispricing(row) {
+  const price = row?.price;
+  const history = row?.valuationHistory ?? [];
+  const cacheStatus = row?.fundamentals?.cacheStatus ?? row?.fundamentalCacheStatus ?? null;
+  if (!Number.isFinite(price) || price <= 0) return unavailableTarget(row, "current price unavailable");
+  if (cacheStatus === "stale") return unavailableTarget(row, "SEC fundamentals cache is expired pending refresh");
+  const preferredMetric = Number.isFinite(row?.valuation?.trailingPE) && row.valuation.trailingPE > 0 ? "trailingPE" : "trailingPS";
+  const multiples = history.map((item) => item?.[preferredMetric]).filter((value) => Number.isFinite(value) && value > 0);
+  const metricVintages = normalizedMetricVintages(history, preferredMetric);
+  if (multiples.length < 126 || metricVintages.length < 2) {
+    return unavailableTarget(row, `insufficient trailing history: ${multiples.length} valuation observations and ${metricVintages.length} filing vintages`);
+  }
+  const normalizedInput = median(metricVintages.slice(-4).map((item) => item.value));
+  const bearMultiple = quantile(multiples, 0.25);
+  const baseMultiple = quantile(multiples, 0.5);
+  const bullMultiple = quantile(multiples, 0.75);
+  if (![normalizedInput, bearMultiple, baseMultiple, bullMultiple].every((value) => Number.isFinite(value) && value > 0)) return unavailableTarget(row, "normalized trailing input or historical multiple unavailable");
+  const bearValue = round(normalizedInput * bearMultiple);
+  const baseValue = round(normalizedInput * baseMultiple);
+  const bullValue = round(normalizedInput * bullMultiple);
+  const baseUpsidePercent = round(((baseValue - price) / price) * 100);
+  const downsideToBearPercent = round(((price - bearValue) / price) * 100);
+  const upside = Math.max(0, baseValue - price);
+  const downside = Math.max(0, price - bearValue);
+  const riskRewardRatio = upside > 0 && downside > 0 ? round(upside / downside) : null;
+  const preferredEntryPrice = round(baseValue / 1.2);
+  const valuationAdjustment = baseUpsidePercent >= 30 ? 2 : baseUpsidePercent >= 20 ? 1 : baseUpsidePercent >= 10 ? 0 : baseUpsidePercent >= 5 ? -1 : -2;
+  const valuationLabel = valuationAdjustment > 0 ? "Opportunity Bonus" : valuationAdjustment < 0 ? "Opportunity Penalty" : "Neutral";
+  const confidence = multiples.length >= 756 && metricVintages.length >= 4 ? "High" : multiples.length >= 252 && metricVintages.length >= 3 ? "Medium" : "Low";
+  const metricLabel = preferredMetric === "trailingPE" ? "normalized TTM EPS/share" : "normalized TTM revenue/share";
+  const multipleLabel = preferredMetric === "trailingPE" ? "trailing P/E" : "trailing P/S";
+  return {
+    status: "available",
+    currentPrice: round(price),
+    priceAsOf: row.priceAsOf ?? row.generatedAt ?? null,
+    inputAsOf: metricVintages.at(-1)?.asOf ?? row.valuation?.fundamentalAsOf ?? null,
+    bearValue, baseValue, bullValue, baseUpsidePercent, downsideToBearPercent, riskRewardRatio, preferredEntryPrice,
+    method: "trailing-data implied fair-value range",
+    metric: preferredMetric,
+    normalizedInput: round(normalizedInput),
+    normalizedInputVintages: Math.min(4, metricVintages.length),
+    historicalObservations: multiples.length,
+    multiplePercentiles: { bear: 25, base: 50, bull: 75 },
+    multiples: { bear: round(bearMultiple), base: round(baseMultiple), bull: round(bullMultiple) },
+    formula: `${metricLabel} × historical ${multipleLabel} P25/P50/P75`,
+    assumptions: "Most recent up to four distinct filing-vintage TTM per-share observations are median-normalized; historical multiples are point-in-time and use only filings available on each price date.",
+    confidence,
+    consensusCrossCheck: { status: "unavailable", reason: "no fresh analyst-consensus target source configured" },
+    valuationAdjustment,
+    valuationLabel,
+    calibration: { outcomeStatus: "pending", catalystType: "record with research packet", dataCompleteness: confidence === "Low" ? "limited" : "complete", evaluationHorizons: ["1D", "5D", "1M", "3M"], marketBenchmark: "SPY", sectorBenchmark: null },
+  };
+}
+
+function normalizedMetricVintages(history, metric) {
+  const byFiling = new Map();
+  for (const row of history) {
+    const multiple = row?.[metric];
+    const price = row?.adjustedClose;
+    if (!row?.fundamentalAsOf || !Number.isFinite(multiple) || multiple <= 0 || !Number.isFinite(price) || price <= 0) continue;
+    byFiling.set(row.fundamentalAsOf, { asOf: row.fundamentalAsOf, value: price / multiple });
+  }
+  return [...byFiling.values()].sort((a, b) => a.asOf.localeCompare(b.asOf));
+}
+
+function quantile(values, probability) {
+  const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const index = (sorted.length - 1) * probability;
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (index - lower);
+}
+
+function unavailableTarget(row, reason) {
+  return {
+    status: "unavailable",
+    currentPrice: Number.isFinite(row?.price) ? round(row.price) : null,
+    priceAsOf: row?.priceAsOf ?? null,
+    inputAsOf: row?.valuation?.fundamentalAsOf ?? row?.fundamentalAsOf ?? null,
+    reason,
+    confidence: "Unavailable",
+    consensusCrossCheck: { status: "unavailable", reason: "no fresh analyst-consensus target source configured" },
+    valuationAdjustment: 0,
+    valuationLabel: "Neutral",
+  };
 }
 
 export function percentile(value, values) {
