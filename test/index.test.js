@@ -345,6 +345,50 @@ test("brief computes internal stock posture and non-transactional sector stance 
   assert.equal(brief.opportunityGate.candidates[0].admissionType, "auto_watchlist");
 });
 
+test("brief excludes expired SEC growth from sector fundamentals ratings", () => {
+  const brief = toBrief({
+    generatedAt: "2026-08-11T05:54:44.315Z", session: "closed",
+    coverage: { requested: 1, succeeded: 1, failed: 0 },
+    watchlist: [{
+      symbol: "NVDA", price: 217.55, changePercent: -2.86, yearLow: 100, yearHigh: 250,
+      positionIn52WeekRange: 78.37, missing: false,
+      valuation: { trailingPE: 33.32, trailingPS: 20, trailingPEPercentile5Y: 82.1, trailingPSPercentile5Y: 90, fundamentalAsOf: "2026-05-28" },
+      reportedGrowth: { revenueTtmYoY: 32.29, asOf: "2026-05-28" },
+      fundamentals: { cacheStatus: "stale", asOf: "2026-05-28" },
+    }],
+  });
+
+  const gpu = brief.decisionFramework.sectorScorecard.GPU;
+  assert.equal(gpu.fundamentals, "Stale");
+  assert.equal(gpu.stance, "Neutral");
+  assert.equal(gpu.metrics.medianReportedRevenueTtmYoY, null);
+  assert.deepEqual(gpu.metrics.freshFundamentals, []);
+  assert.deepEqual(gpu.metrics.staleFundamentals, [{ symbol: "NVDA", asOf: "2026-05-28" }]);
+});
+
+test("mixed-freshness sectors calculate fundamentals only from fresh members", () => {
+  const member = (symbol, revenueTtmYoY, cacheStatus, fundamentalAsOf) => ({
+    symbol, price: 100, changePercent: 0, yearLow: 50, yearHigh: 150, positionIn52WeekRange: 50, missing: false,
+    valuation: { trailingPE: 20, trailingPS: 10, trailingPEPercentile5Y: 50, trailingPSPercentile5Y: 70, fundamentalAsOf },
+    reportedGrowth: { revenueTtmYoY, asOf: fundamentalAsOf },
+    fundamentals: { cacheStatus, asOf: fundamentalAsOf },
+  });
+  const brief = toBrief({
+    generatedAt: "2026-08-11T05:54:44.315Z", session: "closed",
+    coverage: { requested: 2, succeeded: 2, failed: 0 },
+    watchlist: [
+      member("NVDA", 100, "stale", "2026-05-28"),
+      member("AVGO", 10, "fresh", "2026-08-01"),
+    ],
+  });
+
+  const gpu = brief.decisionFramework.sectorScorecard.GPU;
+  assert.equal(gpu.fundamentals, "Moderate");
+  assert.equal(gpu.metrics.medianReportedRevenueTtmYoY, 10);
+  assert.deepEqual(gpu.metrics.freshFundamentals, [{ symbol: "AVGO", asOf: "2026-08-01" }]);
+  assert.deepEqual(gpu.metrics.staleFundamentals, [{ symbol: "NVDA", asOf: "2026-05-28" }]);
+});
+
 test("brief admits a liquid discovery name with a material event outside the core watchlist", () => {
   const brief = toBrief({
     generatedAt: "2026-08-05T15:00:00.000Z", session: "regular_trading",
