@@ -392,6 +392,31 @@ test("catalyst lifecycle assigns directional verification from one structured st
   assert.deepEqual([pending.status, pending.direction, pending.gateQualified], ["reported_pending_verification", null, false]);
 });
 
+test("Yahoo search hits must name the queried company before becoming company-specific catalysts", () => {
+  const published = Date.parse("2026-08-19T12:00:00.000Z") / 1000;
+  const body = { news: [
+    { title: "Ecolab's CoolIT Deal Raises AI Upside but Also Debt and Cost Risks", link: "https://example.test/ecl", providerPublishTime: published, publisher: "Example" },
+    { title: "Vertiv wins major AI data-center contract", link: "https://example.test/vrt", providerPublishTime: published, publisher: "Example" },
+  ] };
+  const [indirect, direct] = normalizeYahooNews(body, "VRT", new Date("2026-08-19T18:00:00.000Z"));
+  assert.deepEqual([indirect.entityMatch, indirect.relationship], ["indirect", "sector_or_competitor_read_through"]);
+  assert.deepEqual([direct.entityMatch, direct.relationship], ["direct", "company_specific"]);
+
+  const indirectState = catalystStateFor({ symbol: "VRT", news: [indirect] }, null);
+  const directState = catalystStateFor({ symbol: "VRT", news: [direct] }, null);
+  assert.deepEqual([indirectState.status, indirectState.verified, indirectState.sourceType], ["unavailable", false, "sector_read_through"]);
+  assert.deepEqual([directState.status, directState.verified, directState.direction], ["verified_positive", true, "positive"]);
+});
+
+test("competitor headlines cannot verify catalysts for ANET or AVGO", () => {
+  const published = Date.parse("2026-08-19T12:00:00.000Z") / 1000;
+  const news = (title) => ({ news: [{ title, link: "https://example.test/news", providerPublishTime: published }] });
+  const anet = normalizeYahooNews(news("Cisco Drops 10% Post Q4 Earnings"), "ANET", new Date("2026-08-19T18:00:00.000Z"))[0];
+  const avgo = normalizeYahooNews(news("Marvell Expands Google AI Partnership"), "AVGO", new Date("2026-08-19T18:00:00.000Z"))[0];
+  assert.equal(catalystStateFor({ symbol: "ANET", news: [anet] }, null).verified, false);
+  assert.equal(catalystStateFor({ symbol: "AVGO", news: [avgo] }, null).verified, false);
+});
+
 test("target engine falls back to trailing P/S and applies the valuation score thresholds", () => {
   const valuationHistory = Array.from({ length: 300 }, (_, index) => {
     const vintage = Math.floor(index / 100);
