@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Growth Tech Morning Brief API
   description: Read the latest saved Growth Tech morning brief or explicitly refresh its market snapshot.
-  version: 0.5.8.3
+  version: 0.5.9.0
 servers:
   - url: https://growth-tech-morning-brief.ck-market-tools.workers.dev
 paths:
@@ -147,6 +147,24 @@ components:
         downsideToBearPercent: { type: number }
         riskRewardRatio: { type: [number, "null"] }
         preferredEntryPrice: { type: number }
+        buyZones:
+          type: object
+          properties:
+            status: { type: string, enum: [available, unavailable] }
+            suggested:
+              type: object
+              properties:
+                low: { type: number }
+                high: { type: number }
+            stronger:
+              type: object
+              properties:
+                low: { type: number }
+                high: { type: number }
+            currentPosition: { type: string }
+            inputs: { type: object }
+            method: { type: string }
+            reason: { type: string }
         method: { type: string }
         formula: { type: string }
         assumptions: { type: string }
@@ -178,7 +196,7 @@ components:
       properties:
         schemaVersion:
           type: integer
-          enum: [8]
+          enum: [9]
         generatedAt:
           type: string
           format: date-time
