@@ -10,8 +10,8 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.9.0";
-const BUILD_REVISION = "0.5.9.0";
+const SERVICE_VERSION = "0.5.9.1";
+const BUILD_REVISION = "0.5.9.1";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -91,6 +91,22 @@ const CIKS = {
   META: "0001326801", GOOGL: "0001652044", ORCL: "0001341439",
   TSM: "0001046179", VRT: "0001674101", CEG: "0001868275",
   FTNT: "0001262039",
+};
+
+const COMPANY_HEADLINE_ALIASES = {
+  NVDA: ["NVIDIA"],
+  AMZN: ["Amazon", "AWS"],
+  MSFT: ["Microsoft", "Azure"],
+  ANET: ["Arista Networks", "Arista"],
+  CRWV: ["CoreWeave"],
+  AVGO: ["Broadcom"],
+  META: ["Meta Platforms", "Meta", "Facebook"],
+  GOOGL: ["Alphabet", "Google"],
+  ORCL: ["Oracle"],
+  TSM: ["Taiwan Semiconductor", "TSMC"],
+  VRT: ["Vertiv"],
+  CEG: ["Constellation Energy"],
+  FTNT: ["Fortinet"],
 };
 
 export default {
@@ -465,7 +481,7 @@ export async function buildDiscoveryContext(env, now = new Date(), coreSymbols =
       .filter((row) => Math.abs(row.changePercent ?? 0) >= 3)
       .map((row) => ({ ...row, discoveryScore: discoveryScore(row), sourceType: "discovery" }))
       .sort((a, b) => b.discoveryScore - a.discoveryScore).slice(0, limit);
-    const newsSettled = await Promise.allSettled(candidates.map(async (row) => normalizeYahooNews(await fetchYahooNews(row.symbol, env), row.symbol, now).slice(0, 3)));
+    const newsSettled = await Promise.allSettled(candidates.map(async (row) => normalizeYahooNews(await fetchYahooNews(row.symbol, env), row.symbol, now, row.name).slice(0, 3)));
     const newsItems = newsSettled.flatMap((result) => result.status === "fulfilled" ? result.value : []);
     for (const row of candidates) row.news = newsItems.filter((item) => item.symbols?.includes(row.symbol)).slice(0, 3);
     const fundamentalsCoverage = await enrichDiscoveryCandidates(candidates, env, now);
@@ -682,18 +698,31 @@ export function normalizeFedMonetaryNews(xml, now = new Date()) {
   return { status: "available", source: "Federal Reserve monetary policy RSS (official)", asOf: now.toISOString(), items };
 }
 
-export function normalizeYahooNews(body, symbol, now = new Date()) {
+export function normalizeYahooNews(body, symbol, now = new Date(), companyName = null) {
   const cutoff = now.getTime() - 48 * 60 * 60 * 1000;
-  return (Array.isArray(body?.news) ? body.news : []).map((item) => ({
-    title: cleanText(item.title),
-    url: cleanText(item.link),
-    publishedAt: isoDate(item.providerPublishTime),
-    source: cleanText(item.publisher) || "Yahoo Finance",
-    kind: "company_news",
-    symbols: [symbol],
-    verified: Boolean(item.link && item.title),
-    material: materialCompanyHeadline(item.title),
-  })).filter((item) => item.title && item.url && item.publishedAt && Date.parse(item.publishedAt) >= cutoff);
+  return (Array.isArray(body?.news) ? body.news : []).map((item) => {
+    const title = cleanText(item.title);
+    const entityMatch = headlineNamesCompany(title, symbol, companyName) ? "direct" : "indirect";
+    return {
+      title,
+      url: cleanText(item.link),
+      publishedAt: isoDate(item.providerPublishTime),
+      source: cleanText(item.publisher) || "Yahoo Finance",
+      kind: "company_news",
+      symbols: [symbol],
+      verified: Boolean(item.link && item.title),
+      entityMatch,
+      relationship: entityMatch === "direct" ? "company_specific" : "sector_or_competitor_read_through",
+      material: materialCompanyHeadline(item.title),
+    };
+  }).filter((item) => item.title && item.url && item.publishedAt && Date.parse(item.publishedAt) >= cutoff);
+}
+
+function headlineNamesCompany(title, symbol, companyName = null) {
+  const aliases = new Set([symbol, ...(COMPANY_HEADLINE_ALIASES[symbol] ?? [])]);
+  const normalizedName = cleanText(companyName)?.replace(/\b(?:incorporated|inc\.?|corp(?:oration)?\.?|co\.?|company|holdings?|plc|ltd\.?)\b.*$/i, "").trim();
+  if (normalizedName?.length >= 4) aliases.add(normalizedName);
+  return [...aliases].filter(Boolean).some((alias) => new RegExp(`(^|[^A-Za-z0-9])${escapeRegExp(alias)}(?:['’]s)?(?=$|[^A-Za-z0-9])`, "i").test(title ?? ""));
 }
 
 function materialCompanyHeadline(title = "") {
@@ -1034,9 +1063,11 @@ function catalystFor(state) {
 }
 
 export function catalystStateFor(row, earnings) {
-  const materialNews = (row?.news ?? [])
+  const allMaterialNews = (row?.news ?? [])
     .filter((item) => item.verified && item.material !== false)
     .sort((a, b) => Date.parse(b.publishedAt ?? 0) - Date.parse(a.publishedAt ?? 0));
+  const materialNews = allMaterialNews.filter((item) => item.entityMatch !== "indirect");
+  const indirectNews = allMaterialNews.filter((item) => item.entityMatch === "indirect");
   const directionalNews = materialNews.find((item) => catalystDirection(item.title));
   if (directionalNews) {
     const direction = catalystDirection(directionalNews.title);
@@ -1082,6 +1113,11 @@ export function catalystStateFor(row, earnings) {
     status: "reported_pending_verification", direction: null, verified: false, gateQualified: false,
     sourceType: "company_news", evidence: materialNews[0],
     display: `Material company report pending directional verification — ${materialNews[0].title}`,
+  };
+  if (indirectNews.length) return {
+    status: "unavailable", direction: null, verified: false, gateQualified: false,
+    sourceType: "sector_read_through", evidence: indirectNews[0],
+    display: `Unavailable — indirect sector/competitor read-through is not a company-specific catalyst — ${indirectNews[0].title}`,
   };
   return {
     status: "unavailable", direction: null, verified: false, gateQualified: false,
@@ -1594,7 +1630,12 @@ export function normalizeResearchPacket(packet, candidate) {
   const recommendedAction = ["Buy now", "Buy on weakness", "Sell"].includes(valuationAdjustedAction)
     ? (valuationAdjustedAction === "Sell" ? catalystState.direction === "negative" : catalystState.direction === "positive" || reratingEligible)
     : false;
-  const gateResult = packet.gateResult === "pass" && recommendedAction && !discoveryBlocked ? "pass" : "fail";
+  const strategicPositionAligned = valuationAdjustedAction === "Sell"
+    ? packet.strategicPosition === "Avoid"
+    : ["Buy now", "Buy on weakness"].includes(valuationAdjustedAction)
+      ? packet.strategicPosition === "Buy"
+      : true;
+  const gateResult = packet.gateResult === "pass" && recommendedAction && strategicPositionAligned && !discoveryBlocked ? "pass" : "fail";
   const portfolioInput = candidate?.portfolio?.holding === true && Number.isFinite(candidate?.portfolio?.targetWeight);
   const portfolioReview = ["Trim", "Review position size"].includes(packet.todayAction) && candidate?.setup?.extremeTrim && portfolioInput;
   const unsupportedPortfolioAction = ["Trim", "Review position size"].includes(valuationAdjustedAction) && !portfolioInput;
@@ -1616,6 +1657,7 @@ export function normalizeResearchPacket(packet, candidate) {
     reratingPath: reratingEligible ? packet.reratingHorizon : "Unavailable",
     evidenceAgainstCount: packet.evidenceAgainst?.length ?? 0,
     missingEvidenceCount: packet.missingEvidence?.length ?? 0,
+    strategicPositionAligned,
     finalAction,
   };
   return {
@@ -1661,10 +1703,11 @@ function structuredGateReason(audit, flags = {}) {
       : null;
   const reasons = [
     `target confidence ${audit.targetConfidence}`,
-    audit.freshCatalyst ? `catalyst ${audit.catalystStatus ?? "verified"}` : `catalyst ${audit.catalystStatus ?? "unavailable"}`,
+    audit.freshCatalyst ? `catalyst ${humanizeToken(audit.catalystStatus ?? "verified")}` : `catalyst ${humanizeToken(audit.catalystStatus ?? "unavailable")}`,
     audit.reratingPath !== "Unavailable" ? `qualified rerating path ${reratingHorizonLabel(audit.reratingPath)}` : "qualified rerating path unavailable",
     researchEvidence,
     audit.strategicPosition ? `strategic position ${audit.strategicPosition}` : null,
+    audit.strategicPositionAligned === false ? "strategic position is inconsistent with the requested trade action" : null,
     flags.discoveryBlocked ? "discovery evidence incomplete" : null,
     flags.unsupportedPortfolioAction ? "portfolio inputs unavailable" : null,
     audit.result === "pass" ? `action ${audit.finalAction}` : null,
@@ -1862,6 +1905,11 @@ function gateAuditForPacket(packet) {
     reratingPath: ["1Q", "2Q"].includes(packet.reratingHorizon) && packet.gateResult === "pass" ? packet.reratingHorizon : "Unavailable",
     evidenceAgainstCount: packet.evidenceAgainst?.length ?? 0,
     missingEvidenceCount: packet.missingEvidence?.length ?? 0,
+    strategicPositionAligned: packet.strategicPosition === "Buy"
+      ? ["Buy now", "Buy on weakness"].includes(packet.finalAction ?? packet.todayAction)
+      : packet.strategicPosition === "Avoid"
+        ? (packet.finalAction ?? packet.todayAction) === "Sell"
+        : !["Buy now", "Buy on weakness", "Sell"].includes(packet.finalAction ?? packet.todayAction),
     finalAction: packet.finalAction ?? packet.todayAction ?? "No action",
   };
 }
@@ -1894,7 +1942,7 @@ export function renderMorningBrief(compact, identity = {}) {
     `- **Primary Valuation Risk:** ${valuationRisk}`,
     "",
     "# Overnight and Market Context",
-    `- **As Of:** ${compact.generatedAt ?? generatedAt}; session=${compact.session ?? "unavailable"}.`,
+    `- **As Of:** ${compact.generatedAt ?? generatedAt}; session=${humanizeToken(compact.session ?? "unavailable")}.`,
     `- **Global Markets:** Point-in-time Growth Tech context only; source status is preserved below and no broad-market conclusion is inferred.`,
     `- **Futures:** ${formatMarketGroup(compact.marketContext?.futures, "futures")}`,
     `- **Rates:** ${formatMarketGroup(compact.marketContext?.rates, "rates")}`,
@@ -1958,26 +2006,29 @@ function marketGroupLabel(name) {
 
 function keyCompanyEvent(compact) {
   const researchSymbols = new Set(compact.researchSymbols ?? (compact.research?.packets ?? []).map((packet) => packet.symbol));
-  const earnings = compact.calendars?.earnings;
-  const events = (earnings?.events ?? [])
-    .filter((event) => researchSymbols.has(event.symbol) && Object.hasOwn(CIKS, event.symbol))
-    .sort((a, b) => marketNumber(b.marketCap) - marketNumber(a.marketCap));
-  const event = events[0];
-  if (!event) return { label: "Key Event Status", text: "No material company event identified among researched core-watchlist names." };
-  const sectors = Object.entries(SECTOR_MEMBERS).filter(([, symbols]) => symbols.includes(event.symbol)).map(([sector]) => sector);
+  const packetBySymbol = new Map((compact.research?.packets ?? []).map((packet) => [packet.symbol, packet]));
+  const statusRank = { verified_positive: 5, verified_negative: 5, reported_pending_verification: 4, scheduled: 3 };
+  const rows = (compact.watchlist ?? [])
+    .filter((row) => researchSymbols.has(row.symbol) && Object.hasOwn(CIKS, row.symbol) && (statusRank[row.catalystState?.status] ?? 0) > 0)
+    .sort((a, b) => {
+      const gateDelta = Number(packetBySymbol.get(b.symbol)?.gateResult === "pass") - Number(packetBySymbol.get(a.symbol)?.gateResult === "pass");
+      return gateDelta || (statusRank[b.catalystState?.status] ?? 0) - (statusRank[a.catalystState?.status] ?? 0);
+    });
+  const row = rows[0];
+  if (!row) return { label: "Key Event Status", text: "No material company event identified among researched core-watchlist names." };
+  const state = row.catalystState;
+  const sectors = Object.entries(SECTOR_MEMBERS).filter(([, symbols]) => symbols.includes(row.symbol)).map(([sector]) => sector);
   const exposure = sectors.length ? `; relevant scorecard exposure: ${sectors.join(", ")}` : "";
-  if (event.lifecycle?.status === "reported_pending_verification") {
-    return { label: "Key Reported Event", text: `${event.symbol} earnings reported; result status pending verification${exposure}.` };
+  if (["verified_positive", "verified_negative"].includes(state.status)) {
+    return { label: "Key Reported Event", text: `${row.symbol} ${cleanReportText(state.display)}${exposure}.` };
   }
-  if (event.lifecycle?.status === "verified_result") {
-    return verifiedEarningsEvidence(event.lifecycle.evidence)
-      ? { label: "Key Reported Event", text: `${event.symbol} earnings result verified from structured evidence${exposure}.` }
-      : { label: "Key Reported Event", text: `${event.symbol} earnings reported; result status pending verification${exposure}.` };
+  if (state.status === "reported_pending_verification") {
+    if (/scheduled window opened/i.test(state.display ?? "")) {
+      return { label: "Key Event Status", text: `${row.symbol} ${cleanReportText(state.display)}${exposure}.` };
+    }
+    return { label: "Key Reported Event", text: `${row.symbol} ${cleanReportText(state.display)}${exposure}.` };
   }
-  if (event.lifecycle?.status === "pending_verification") {
-    return { label: "Key Event Status", text: `${event.symbol} earnings scheduled window has opened; event status pending verification${exposure}.` };
-  }
-  return { label: "Key Scheduled Event", text: `${event.symbol} earnings${event.time ? ` (${cleanReportText(event.time)})` : ""}${exposure}.` };
+  return { label: "Key Scheduled Event", text: `${row.symbol} ${cleanReportText(state.display)}${exposure}.` };
 }
 
 function highestRankedRecommendation(packets) {
@@ -1997,7 +2048,7 @@ function formatHighestRankedRecommendation(packet) {
   const audit = gateAuditForPacket(packet);
   const basis = [
     `target confidence ${audit.targetConfidence}`,
-    audit.freshCatalyst ? `catalyst ${audit.catalystStatus}` : null,
+    audit.freshCatalyst ? `catalyst ${humanizeToken(audit.catalystStatus)}` : null,
     audit.reratingPath !== "Unavailable" ? `qualified rerating path ${reratingHorizonLabel(audit.reratingPath)}` : null,
   ].filter(Boolean).join("; ");
   const zones = packet.sourceSnapshot?.targetAndMispricing?.buyZones;
@@ -2233,6 +2284,10 @@ function fieldCompletenessSummary(packets) {
 
 function cleanReportText(value) {
   return String(value ?? "unavailable").replace(/[\r\n|]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function humanizeToken(value) {
+  return cleanReportText(value).replaceAll("_", " ");
 }
 
 function tableCell(value) {
