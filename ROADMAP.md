@@ -80,8 +80,11 @@ The valuation score may improve candidate ranking but cannot independently suppo
 - Reject Buy/Sell actions that conflict with the packet's strategic position.
 - Preserve regression coverage for Buy-now versus Buy-on-weakness zone semantics and render lifecycle/session tokens as human-readable text.
 
-## v0.5.10 — Typed supply-chain discovery and thesis memory
+## v0.5.10 — Typed evidence, supply-chain discovery, and thesis memory
 
+- Classify direct company headlines as `company_event` or `company_analysis`; preserve indirect items as `sector_read_through`.
+- Admit only `company_event` evidence into the catalyst lifecycle, direction verification, recommendation gate, and Executive Summary Key Reported Event.
+- Keep analysis/commentary visible as non-gating Watchlist and event-ledger context with an explicit reason.
 - Add sourced customer, supplier, competitor, and substitution edges with economic direction, exposure, timing, and confidence.
 - Use graph propagation for candidate discovery only; every propagated name requires independent research before sentiment or action.
 - Preserve thesis changes, invalidation conditions, event deltas, and subsequent outcomes by company.

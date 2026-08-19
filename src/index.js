@@ -10,8 +10,8 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.9.1";
-const BUILD_REVISION = "0.5.9.1";
+const SERVICE_VERSION = "0.5.10";
+const BUILD_REVISION = "0.5.10";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -418,7 +418,7 @@ function selectCoreNewsSymbols(watchlist, calendars, limit) {
 export async function buildEventLedger(snapshot, env, date = snapshot.generatedAt?.slice(0, 10)) {
   const events = [];
   for (const item of snapshot.news?.company?.items ?? []) {
-    for (const symbol of item.symbols ?? [null]) events.push(eventRecord("company_news", symbol, item.title, item.publishedAt, item.url, item.source));
+    for (const symbol of item.symbols ?? [null]) events.push(eventRecord(item.sourceType ?? item.kind ?? "company_analysis", symbol, item.title, item.publishedAt, item.url, item.source));
   }
   for (const item of snapshot.calendars?.earnings?.events ?? []) {
     events.push(eventRecord("earnings", item.symbol, `${item.symbol} earnings${item.time ? ` ${item.time}` : ""}`, date, null, snapshot.calendars.earnings.source));
@@ -703,12 +703,14 @@ export function normalizeYahooNews(body, symbol, now = new Date(), companyName =
   return (Array.isArray(body?.news) ? body.news : []).map((item) => {
     const title = cleanText(item.title);
     const entityMatch = headlineNamesCompany(title, symbol, companyName) ? "direct" : "indirect";
+    const sourceType = companyNewsSourceType(title, entityMatch);
     return {
       title,
       url: cleanText(item.link),
       publishedAt: isoDate(item.providerPublishTime),
       source: cleanText(item.publisher) || "Yahoo Finance",
-      kind: "company_news",
+      kind: sourceType,
+      sourceType,
       symbols: [symbol],
       verified: Boolean(item.link && item.title),
       entityMatch,
@@ -727,6 +729,15 @@ function headlineNamesCompany(title, symbol, companyName = null) {
 
 function materialCompanyHeadline(title = "") {
   return /earnings|revenue|profit|guidance|forecast|outlook|contract|customer|partnership|acqui|merger|offering|buyback|dividend|layoff|restructur|FDA|SEC|investigation|lawsuit|regulat|ban|export|launch|announc|order|backlog|capacity|data.?center|AI\b|artificial intelligence/i.test(title);
+}
+
+function companyNewsSourceType(title = "", entityMatch = "indirect") {
+  if (entityMatch !== "direct") return "sector_read_through";
+  return companyEventHeadline(title) ? "company_event" : "company_analysis";
+}
+
+function companyEventHeadline(title = "") {
+  return /\b(?:reports?|posts?|releases?|announces?)\b.*\b(?:earnings|results?|revenue|profit|quarter)\b|\b(?:earnings|revenue|profit)\b.*\b(?:beats?|misses?)\b|\b(?:earnings|quarterly|financial)\s+results?\b|\b(?:raises?|cuts?|lowers?|withdraws?|reaffirms?|updates?)\b.*\b(?:guidance|forecast|outlook)\b|\b(?:wins?|secures?|signs?|awarded?)\b.*\b(?:contract|customer|partnership|order)\b|\b(?:announces?|launches?|unveils?|acquires?|merges?|completes?)\b.*\b(?:platform|product|service|contract|partnership|acquisition|merger|offering|buyback|dividend|facility|capacity|data.?center)\b|\b(?:acquisition|merger|offering|buyback|dividend|layoffs?|restructuring|bankruptcy|investigation|lawsuit|settlement|approval|recall|export ban|regulatory action)\b/i.test(title);
 }
 
 function xmlValue(xml, tag) {
@@ -1066,8 +1077,9 @@ export function catalystStateFor(row, earnings) {
   const allMaterialNews = (row?.news ?? [])
     .filter((item) => item.verified && item.material !== false)
     .sort((a, b) => Date.parse(b.publishedAt ?? 0) - Date.parse(a.publishedAt ?? 0));
-  const materialNews = allMaterialNews.filter((item) => item.entityMatch !== "indirect");
-  const indirectNews = allMaterialNews.filter((item) => item.entityMatch === "indirect");
+  const materialNews = allMaterialNews.filter((item) => item.entityMatch !== "indirect" && item.sourceType !== "company_analysis");
+  const analysisNews = allMaterialNews.filter((item) => item.entityMatch !== "indirect" && item.sourceType === "company_analysis");
+  const indirectNews = allMaterialNews.filter((item) => item.entityMatch === "indirect" || item.sourceType === "sector_read_through");
   const directionalNews = materialNews.find((item) => catalystDirection(item.title));
   if (directionalNews) {
     const direction = catalystDirection(directionalNews.title);
@@ -1076,7 +1088,7 @@ export function catalystStateFor(row, earnings) {
       direction,
       verified: true,
       gateQualified: true,
-      sourceType: "company_news",
+      sourceType: "company_event",
       evidence: directionalNews,
       display: `Verified ${direction} catalyst — ${directionalNews.title}`,
     };
@@ -1111,8 +1123,13 @@ export function catalystStateFor(row, earnings) {
   };
   if (materialNews.length) return {
     status: "reported_pending_verification", direction: null, verified: false, gateQualified: false,
-    sourceType: "company_news", evidence: materialNews[0],
-    display: `Material company report pending directional verification — ${materialNews[0].title}`,
+    sourceType: "company_event", evidence: materialNews[0],
+    display: `Material company event pending directional verification — ${materialNews[0].title}`,
+  };
+  if (analysisNews.length) return {
+    status: "unavailable", direction: null, verified: false, gateQualified: false,
+    sourceType: "company_analysis", evidence: analysisNews[0],
+    display: `Unavailable — company analysis/commentary is not a reportable company event — ${analysisNews[0].title}`,
   };
   if (indirectNews.length) return {
     status: "unavailable", direction: null, verified: false, gateQualified: false,
@@ -1144,7 +1161,7 @@ export function earningsLifecycle(event, generatedAt, companyNews = []) {
   const ny = zonedParts(Number.isNaN(now.getTime()) ? new Date() : now, "America/New_York");
   const eventDate = event.date ?? ny.date;
   const resultNews = companyNews
-    .filter((item) => item.symbols?.includes(event.symbol) && item.verified && isEarningsResultHeadline(item.title)
+    .filter((item) => item.symbols?.includes(event.symbol) && item.verified && item.sourceType !== "company_analysis" && isEarningsResultHeadline(item.title)
       && item.publishedAt && zonedParts(new Date(item.publishedAt), "America/New_York").date === eventDate)
     .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))[0];
   if (resultNews) {
@@ -1370,7 +1387,7 @@ function discoveryRiskFor(row) {
 
 function todaySetup(row) {
   const catalystState = row.catalystState ?? catalystStateFor(row, null);
-  const verifiedNews = catalystState.sourceType === "company_news" && catalystState.verified ? [catalystState.evidence] : [];
+  const verifiedNews = catalystState.sourceType === "company_event" && catalystState.verified ? [catalystState.evidence] : [];
   const dislocation = Number.isFinite(row.changePercent) && Math.abs(row.changePercent) >= 3;
   const extremeTrim = (row.valuation?.selectedPercentile ?? 0) >= 90 && (row.positionIn52WeekRange ?? 0) >= 90;
   const earningsToday = catalystState.sourceType === "earnings";
@@ -1545,6 +1562,7 @@ function candidateResearchPrompt(compact, candidates, options = {}) {
   return [
     "Research this bounded Growth-Tech candidate batch. Return JSON only, without Markdown fences.",
     "Use only the supplied evidence. Do not infer that a headline caused a move unless the linkage is direct.",
+    "Treat sourceType literally: company_event may enter the catalyst lifecycle; company_analysis and sector_read_through are context only and can never verify a catalyst, clear the action gate, or be described as a Key Reported Event.",
     "Treat earnings lifecycle fields literally. Scheduled and pending-verification events are not reported results; never describe them as a beat, miss, result, or verified catalyst. A reported_pending_verification event confirms only that a report exists, not its direction or magnitude.",
     `Analyze only these batch symbols: ${[...candidateSymbols].join(", ")}. Do not place any other equity ticker in candidate fields; non-candidate market facts are context only.`,
     "Discovery names cannot pass the action gate when valuation, fundamentals, liquidity context, or a directionally verified fresh company catalyst is missing.",
