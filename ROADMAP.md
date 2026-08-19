@@ -72,6 +72,14 @@ The valuation score may improve candidate ranking but cannot independently suppo
 - Enforce action semantics: `Buy now` means current price is in or below the approved suggested zone; `Buy on weakness` means the recommendation gate passed but price remains above it; `Watch` means the gate failed or no actionable entry exists.
 - Label zones for rejected recommendations as valuation references only, never actionable trade instructions.
 
+### v0.5.9.1 catalyst-integrity hotfix
+
+- Require the queried company or ticker to be named in a Yahoo headline before treating the result as company-specific.
+- Classify competitor and sector read-throughs as indirect context; never allow them to verify a catalyst or clear a Buy/Sell gate.
+- Render Executive Summary event status from the same catalyst lifecycle object used by Watchlist and Recommendation Gate.
+- Reject Buy/Sell actions that conflict with the packet's strategic position.
+- Preserve regression coverage for Buy-now versus Buy-on-weakness zone semantics and render lifecycle/session tokens as human-readable text.
+
 ## v0.5.10 — Typed supply-chain discovery and thesis memory
 
 - Add sourced customer, supplier, competitor, and substitution edges with economic direction, exposure, timing, and confidence.
