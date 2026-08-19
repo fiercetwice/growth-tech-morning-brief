@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.5.9.0 — executable buy zones and unified catalyst state
+# Growth Tech Morning Brief v0.5.9.1 — executable buy zones and unified catalyst state
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -97,7 +97,7 @@ curl "https://growth-tech-morning-brief.ck-market-tools.workers.dev/latest" \
 
 ## GitHub Actions deployment
 
-The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets. Before the post-deploy report test, the workflow waits until `/health` reports the exact engine version and build revision. It then calls the build-specific `/run-report/v0.5.9.0/build/0.5.9.0` endpoint and retries only a 404 response, so a still-propagating older Worker cannot generate or overwrite the new report artifact.
+The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets. Before the post-deploy report test, the workflow waits until `/health` reports the exact engine version and build revision. It then calls the build-specific `/run-report/v0.5.9.1/build/0.5.9.1` endpoint and retries only a 404 response, so a still-propagating older Worker cannot generate or overwrite the new report artifact.
 
 
 ## AI provider router, report generation, and delivery
@@ -123,6 +123,8 @@ v0.5.8.3 makes the recommendation and valuation output auditable. It adds a per-
 v0.5.8.4 removes free-form model prose from recommendation-gate output and renders a structured deterministic gate audit instead. Earnings events carry explicit scheduled, pending-verification, reported-pending-verification, or verified-result lifecycle states; only structured evidence can support result characterization. Valuation bear/base/bull cases are not treated as stop-loss or thesis-invalidation levels. Executive Summary recommendation text is concise, and unknown SEC dates render as `<symbol> fundamentals date unavailable`.
 
 v0.5.9.0 consolidates catalyst evidence into one deterministic state object used by the Watchlist catalyst cell, recommendation gate, and Summary. Its lifecycle is `unavailable`, `scheduled`, `reported_pending_verification`, `verified_positive`, or `verified_negative`; only directionally verified evidence can clear a matching Buy or Sell catalyst gate. It also adds `Suggested Buy Target / Buy Zone`, keeps the former preferred-entry value as a clearly labeled valuation threshold, and enforces action semantics: `Buy now` means spot is inside or below the approved suggested zone, `Buy on weakness` means the gate passed but spot remains above it, and `Watch` means the gate failed or no defensible executable zone exists. Rejected names may show a valuation-derived reference zone, but it is explicitly labeled non-actionable.
+
+v0.5.9.1 hardens that decision layer against ticker-search contamination. A Yahoo result is now classified as company-specific only when the headline names the queried ticker, a configured company alias, or the discovery candidate's normalized company name. Competitor and sector read-throughs remain visible as indirect context but cannot become verified catalysts or clear the action gate. Executive Summary event text now reads the same per-symbol catalyst state used by Watchlist and Recommendation Gate. Buy/Sell actions must also agree with the research packet's strategic position, and rendered lifecycle/session labels use human-readable words instead of underscore tokens.
 
 The AI Cycle Dashboard now consumes structured direct-indicator observations from official company disclosures. The Worker loads an `AI_CYCLE_OBSERVATIONS_JSON` override first, then R2 `ai-cycle/latest.json`, then the release-bundled official bootstrap catalog. Quarterly observations default to a 120-day freshness window. A full directional rating requires fresh observations from at least two independent companies; one company is `Partial Coverage`, and expired or absent observations degrade to `Insufficient Data`. Observation values, units, period-end dates, publication dates, source types, and official URLs are preserved in the snapshot; company definitions are evaluated directionally and never summed.
 
