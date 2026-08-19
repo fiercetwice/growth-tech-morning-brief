@@ -38,7 +38,8 @@ Build an auditable valuation decision layer that answers both whether a company 
 - Bear, base, and bull value
 - Base upside and downside to bear value
 - Risk/reward ratio
-- Preferred entry price
+- Valuation threshold (legacy preferred-entry calculation, explicitly non-executable)
+- Suggested Buy Target / Buy Zone and Stronger Buy Zone when recent price/volatility inputs support them
 - Method, formula, assumptions, and confidence
 - Consensus target cross-check when available
 - Valuation Opportunity Bonus or Penalty
@@ -60,7 +61,18 @@ The valuation score may improve candidate ranking but cannot independently suppo
 - Measure 1D, 5D, 1M, and 3M returns versus SPY and the relevant sector benchmark.
 - Calibrate target methods and valuation bonuses from realized outcomes without rewriting historical snapshots.
 
-## v0.5.9 — Typed supply-chain discovery and thesis memory
+## v0.5.9 — Executable decision layer
+
+- Consolidate catalyst evidence into one lifecycle object: `Unavailable → Scheduled → Reported/Pending Verification → Verified Positive/Negative`.
+- Make Catalyst, Executive Summary, action gate, and Research Audit read the same catalyst object.
+- Preserve the existing valuation threshold as a broad valuation constraint; do not present it as a weakness entry.
+- Add deterministic `Suggested Buy Target / Buy Zone` and `Stronger Buy Zone` outputs using recent support distribution, realized volatility, modeled bear/base values, the valuation threshold, and a minimum risk/reward constraint.
+- Keep all zone inputs, formulas, lookbacks, and intermediate anchors in the stored target packet for audit and later calibration.
+- Require Medium/High target confidence and an available executable zone for Buy actions; return `Unavailable` instead of inventing a zone.
+- Enforce action semantics: `Buy now` means current price is in or below the approved suggested zone; `Buy on weakness` means the recommendation gate passed but price remains above it; `Watch` means the gate failed or no actionable entry exists.
+- Label zones for rejected recommendations as valuation references only, never actionable trade instructions.
+
+## v0.5.10 — Typed supply-chain discovery and thesis memory
 
 - Add sourced customer, supplier, competitor, and substitution edges with economic direction, exposure, timing, and confidence.
 - Use graph propagation for candidate discovery only; every propagated name requires independent research before sentiment or action.

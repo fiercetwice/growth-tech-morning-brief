@@ -15,6 +15,8 @@ When a brief is returned:
 - Historical valuation percentile is point-in-time and based on SEC filings available on each observation date.
 - Treat `targetAndMispricing` values as deterministic trailing-implied ranges, not analyst price targets. State the method, input as-of, confidence, and unavailable reason. Never create a target for a context-only or unresearched name.
 - A valuation bonus can improve ranking but cannot bypass financial, liquidity, catalyst, risk, or qualified 1Q/2Q rerating-path gates. Discovery names still require a verified fresh catalyst.
+- Treat `preferredEntryPrice` as a valuation threshold, not the price that defines weakness. Use only the deterministic `buyZones` object for executable suggested and stronger entry ranges.
+- `Buy now` means current price is inside or below the approved suggested zone; `Buy on weakness` means the recommendation gate passed but price remains above that zone; `Watch` means no recommendation or actionable zone qualified.
 - Yahoo price data is unofficial. Do not imply that it is an exchange-certified real-time feed.
 - If `coverage.failed` is greater than zero, disclose the incomplete coverage.
 - If `getLatestBrief` returns `no_brief_yet`, ask whether the user wants to run `refreshMorningBrief`.

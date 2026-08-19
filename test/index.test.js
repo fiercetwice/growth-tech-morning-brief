@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildCalendarContext, buildDiscoveryContext, buildEventLedger, buildMarketContext, buildSnapshot, buildTargetAndMispricing, buildValuationHistory, loadAiCycleObservations, normalizeAiCycleObservations, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
+  buildCalendarContext, buildDiscoveryContext, buildEventLedger, buildExecutableBuyZones, buildMarketContext, buildSnapshot, buildTargetAndMispricing, buildValuationHistory, catalystStateFor, loadAiCycleObservations, normalizeAiCycleObservations, normalizeFedMonetaryNews, normalizeNasdaqEarningsCalendar,
   normalizeNasdaqMacroCalendar, normalizeNasdaqStockUniverse, normalizeSecTickerMap, normalizeYahooNews, marketSession, normalizeYahooChart, percentile, quarterlyFacts,
   reportedGrowth, toBrief, zonedParts,
 } from "../src/index.js";
@@ -351,9 +351,45 @@ test("target engine creates an auditable trailing P/E implied range", () => {
   assert.equal(target.bearValue < target.baseValue, true);
   assert.equal(target.baseValue < target.bullValue, true);
   assert.equal(target.preferredEntryPrice, Math.round((target.baseValue / 1.2) * 100) / 100);
+  assert.equal(target.buyZones.status, "available");
+  assert.equal(target.buyZones.stronger.high < target.buyZones.suggested.low, true);
+  assert.equal(target.buyZones.suggested.low < target.buyZones.suggested.high, true);
+  assert.match(target.buyZones.method, /realized volatility.*minimum modeled risk\/reward/i);
   assert.match(target.formula, /normalized TTM EPS\/share × historical trailing P\/E/);
   assert.deepEqual(target.consensusCrossCheck, { status: "unavailable", reason: "no fresh analyst-consensus target source configured" });
   assert.equal(target.confidence, "Medium");
+});
+
+test("executable buy zones are auditable and remain distinct from the valuation threshold", () => {
+  const valuationHistory = Array.from({ length: 60 }, (_, index) => ({
+    date: `2026-${String(Math.floor(index / 28) + 1).padStart(2, "0")}-${String((index % 28) + 1).padStart(2, "0")}`,
+    adjustedClose: 90 + index * 0.4 + (index % 5),
+  }));
+  const zones = buildExecutableBuyZones({
+    currentPrice: 118,
+    valuationHistory,
+    bearValue: 85,
+    baseValue: 135,
+    preferredEntryPrice: 112.5,
+  });
+  assert.equal(zones.status, "available");
+  assert.equal(zones.suggested.high <= 112.5, true);
+  assert.equal(zones.stronger.high < zones.suggested.low, true);
+  assert.equal(zones.inputs.minimumRiskReward, 2);
+  assert.equal(zones.currentPosition, "above_suggested_zone");
+});
+
+test("catalyst lifecycle assigns directional verification from one structured state", () => {
+  const positive = catalystStateFor({ news: [{
+    title: "Company wins major AI contract", verified: true, material: true, publishedAt: "2026-08-19T12:00:00Z",
+  }] }, null);
+  const negative = catalystStateFor({ news: [{
+    title: "Company cuts annual guidance", verified: true, material: true, publishedAt: "2026-08-19T12:00:00Z",
+  }] }, null);
+  const pending = catalystStateFor({ news: [] }, { lifecycle: { status: "reported_pending_verification", evidence: null } });
+  assert.deepEqual([positive.status, positive.direction, positive.gateQualified], ["verified_positive", "positive", true]);
+  assert.deepEqual([negative.status, negative.direction, negative.gateQualified], ["verified_negative", "negative", true]);
+  assert.deepEqual([pending.status, pending.direction, pending.gateQualified], ["reported_pending_verification", null, false]);
 });
 
 test("target engine falls back to trailing P/S and applies the valuation score thresholds", () => {
@@ -605,5 +641,7 @@ test("brief admits a liquid discovery name with a material event outside the cor
   assert.equal(brief.discovery.candidates[0].symbol, "LITE");
   assert.equal(brief.opportunityGate.candidates[0].symbol, "LITE");
   assert.equal(brief.opportunityGate.candidates[0].setup.verifiedCatalyst, true);
+  assert.equal(brief.opportunityGate.candidates[0].setup.catalystState.status, "verified_positive");
+  assert.equal(brief.discovery.candidates[0].catalyst, brief.discovery.candidates[0].setup.catalystState.display);
   assert.match(brief.opportunityGate.candidates[0].risk, /fundamental coverage unavailable; valuation unavailable/);
 });

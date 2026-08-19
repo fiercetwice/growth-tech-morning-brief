@@ -13,9 +13,9 @@ test("GPT Action schema targets the deployed Worker and all routes", () => {
   assert.match(schema, /operationId: refreshMorningBrief/);
 });
 
-test("GPT Action contract uses bearer auth and schema version 8", () => {
+test("GPT Action contract uses bearer auth and schema version 9", () => {
   assert.match(schema, /type: http\n\s+scheme: bearer/);
-  assert.match(schema, /schemaVersion:[\s\S]*enum: \[8\]/);
+  assert.match(schema, /schemaVersion:[\s\S]*enum: \[9\]/);
   assert.match(schema, /required: \[schemaVersion, generatedAt, session, coverage, discovery, opportunityGate, watchlist, markdown\]/);
 });
 
@@ -24,7 +24,7 @@ test("refresh action is explicitly opt-in", () => {
 });
 
 test("Worker accepts a trailing slash on the GPT read route", async () => {
-  const expected = { schemaVersion: 8, markdown: "ok" };
+  const expected = { schemaVersion: 9, markdown: "ok" };
   const env = {
     RUN_TOKEN_REQUIRED: "true",
     RUN_TOKEN: "smoke-token",
@@ -40,22 +40,22 @@ test("Worker accepts a trailing slash on the GPT read route", async () => {
 test("health exposes the deployed release for propagation-safe smoke tests", async () => {
   const response = await worker.fetch(new Request("https://example.test/health"), {});
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.8.4", buildRevision: "0.5.8.4" });
+  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.9.0", buildRevision: "0.5.9.0" });
 });
 
 test("build-specific report route rejects same-engine old builds without starting generation", async () => {
-  const current = await worker.fetch(new Request("https://example.test/run-report/v0.5.8.4/build/0.5.8.4", {
+  const current = await worker.fetch(new Request("https://example.test/run-report/v0.5.9.0/build/0.5.9.0", {
     method: "POST",
   }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
   assert.equal(current.status, 401);
 
-  const staleBuild = await worker.fetch(new Request("https://example.test/run-report/v0.5.8.4/build/0.5.7-hf5.2", {
+  const staleBuild = await worker.fetch(new Request("https://example.test/run-report/v0.5.9.0/build/0.5.7-hf5.2", {
     method: "POST",
   }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
   assert.equal(staleBuild.status, 404);
   assert.deepEqual(await staleBuild.json(), { error: "not_found" });
 
-  const engineOnly = await worker.fetch(new Request("https://example.test/run-report/v0.5.8.4", {
+  const engineOnly = await worker.fetch(new Request("https://example.test/run-report/v0.5.9.0", {
     method: "POST",
   }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
   assert.equal(engineOnly.status, 404);

@@ -54,8 +54,8 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "# Growth Tech Morning Brief",
     "",
     "**Report Mode:** standard",
-    "**Engine Version:** 0.5.8.4",
-    "**Build Revision:** 0.5.8.4",
+    "**Engine Version:** 0.5.9.0",
+    "**Build Revision:** 0.5.9.0",
     "**Report ID:** 00000000-0000-4000-8000-000000000000",
     "**Generated At:** 2026-08-05T13:35:00.000Z",
     "",
@@ -96,9 +96,9 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     sectorRow("Cloud Software", ["MSFT", "AMZN", "GOOGL", "META", "ORCL"]),
     "",
     "# Watchlist",
-    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Implied Value (Bear/Base/Bull) | Base Upside / Bear-Case Return | Preferred Entry | Valuation Signal | Catalyst | Risk | Final Action | Recommendation Gate Result | Research Status |",
-    "|---|---:|---:|---:|---|---|---|---|---|---|---|---|---|---|---|",
-    ...symbols.map((symbol) => `| ${symbol} | $110 | +10% | 50% | Unavailable | Unavailable | Target unavailable | unavailable | unavailable | Unavailable; consensus unavailable | No verified catalyst | Evidence gap | ${watchlistAction} | Rejected — evidence gate incomplete | Researched |`),
+    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Implied Value (Bear/Base/Bull) | Base Upside / Bear-Case Return | Valuation Threshold | Suggested Buy Target / Buy Zone | Valuation Signal | Catalyst | Risk | Final Action | Recommendation Gate Result | Research Status |",
+    "|---|---:|---:|---:|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ...symbols.map((symbol) => `| ${symbol} | $110 | +10% | 50% | Unavailable | Unavailable | Target unavailable | unavailable | unavailable | unavailable | Unavailable; consensus unavailable | No verified catalyst | Evidence gap | ${watchlistAction} | Rejected — evidence gate incomplete | Researched |`),
   ].join("\n");
 }
 
@@ -109,9 +109,9 @@ function verboseNoTradeReport(symbols = ["NVDA"]) {
 test("verbose Morning Brief keeps research audit out of the five-section product", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.8.4",
+    engineVersion: "0.5.9.0",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
-    buildRevision: "0.5.8.4",
+    buildRevision: "0.5.9.0",
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
@@ -141,8 +141,8 @@ test("unavailable market context must be marked unavailable at category level", 
 test("verbose validation applies section-aware research and context-only ticker scopes", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.8.4",
-    buildRevision: "0.5.8.4",
+    engineVersion: "0.5.9.0",
+    buildRevision: "0.5.9.0",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
@@ -244,8 +244,8 @@ test("synthesis exposes a filtered two-level ticker universe while preserving so
     delta: { new: ["nvda", "msft", "lite"], unchanged: [], resolved: [] },
   };
   const compact = {
-    schemaVersion: 8,
-    engineVersion: "0.5.8.4",
+    schemaVersion: 9,
+    engineVersion: "0.5.9.0",
     reportMode: "verbose",
     calendars: { earnings: { events: [{ symbol: "NVDA" }, { symbol: "MSFT" }, { symbol: "LITE" }], watchlistMatches: ["NVDA", "MSFT"] } },
     decisionFramework: { aiCycle: { GPU: { evidence: "NVDA +1%, MSFT -1%" } } },
@@ -391,7 +391,7 @@ test("scheduled run stores Gemini report, sends Resend email, and preserves webh
   const stored = bucket.objects.get("reports/2026-08-05.md");
   assert.equal(stored, webhookMarkdown);
   assert.equal(bucket.objects.get("reports/latest.md"), stored);
-  assert.match(stored, /\*\*Build Revision:\*\* 0\.5\.8/);
+  assert.match(stored, /\*\*Build Revision:\*\* 0\.5\.9/);
   assert.doesNotMatch(stored, /Research Audit/);
   assert.ok(bucket.objects.has("research-audit/2026-08-05.md"));
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportDate, "2026-08-05");
@@ -509,10 +509,10 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiProvider, "deepseek");
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
-  assert.equal(body.report.reportEngineVersion, "0.5.8.4");
-  assert.equal(body.report.reportBuildRevision, "0.5.8.4");
+  assert.equal(body.report.reportEngineVersion, "0.5.9.0");
+  assert.equal(body.report.reportBuildRevision, "0.5.9.0");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.8.4");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.9.0");
   assert.match(bucket.objects.get("reports/latest.md"), /# Executive Summary/);
   assert.doesNotMatch(bucket.objects.get("reports/latest.md"), /Research Audit/);
   assert.ok(bucket.objects.has("research-audit/latest.md"));
@@ -671,7 +671,7 @@ test("structured research blocks Buy now without a verified catalyst", () => {
   assert.equal(normalized.gateResult, "fail");
   assert.equal(normalized.todayAction, "Watch");
   assert.equal(normalized.finalAction, "Watch");
-  assert.match(normalized.gateReason, /fresh catalyst unavailable; qualified rerating path unavailable/);
+  assert.match(normalized.gateReason, /catalyst unavailable; qualified rerating path unavailable/);
 });
 
 test("verified trade recommendation becomes the packet's single final action", () => {
@@ -753,11 +753,49 @@ test("neutral 10-20% upside does not change a catalyst-backed Buy now", () => {
   assert.equal(normalized.finalAction, "Buy now");
 });
 
+test("executable buy zones deterministically distinguish Buy now from Buy on weakness", () => {
+  const packet = {
+    symbol: "AMZN", gateResult: "pass", todayAction: "Buy now", gateReason: "model assessment",
+    strategicPosition: "Buy", confidence: "High", reratingPath: "Unavailable", reratingHorizon: "Unavailable",
+  };
+  const baseCandidate = {
+    symbol: "AMZN", sourceType: "core", valuation: { trailingPE: 25 }, reportedGrowth: { revenueTtmYoY: 15 },
+    setup: { catalystState: { status: "verified_positive", direction: "positive", verified: true, gateQualified: true } },
+    targetAndMispricing: {
+      status: "available", confidence: "High", baseUpsidePercent: 25,
+      buyZones: { status: "available", suggested: { low: 260, high: 265 }, stronger: { low: 245, high: 255 } },
+    },
+  };
+  const aboveZone = normalizeResearchPacket(packet, { ...baseCandidate, price: 271 });
+  const insideZone = normalizeResearchPacket(packet, { ...baseCandidate, price: 263 });
+  assert.equal(aboveZone.gateResult, "pass");
+  assert.equal(aboveZone.finalAction, "Buy on weakness");
+  assert.equal(insideZone.gateResult, "pass");
+  assert.equal(insideZone.finalAction, "Buy now");
+});
+
+test("a displayed valuation buy zone is not actionable when the recommendation gate fails", () => {
+  const normalized = normalizeResearchPacket({
+    symbol: "MSFT", gateResult: "fail", todayAction: "Buy on weakness", gateReason: "model assessment",
+    strategicPosition: "Hold", confidence: "Medium", reratingPath: "Unavailable", reratingHorizon: "Unavailable",
+  }, {
+    symbol: "MSFT", sourceType: "core", price: 498, valuation: { trailingPE: 28 }, reportedGrowth: { revenueTtmYoY: 12 },
+    setup: { catalystState: { status: "unavailable", direction: null, verified: false, gateQualified: false } },
+    targetAndMispricing: {
+      status: "available", confidence: "High", baseUpsidePercent: 25,
+      buyZones: { status: "available", suggested: { low: 475, high: 485 }, stronger: { low: 455, high: 465 } },
+    },
+  });
+  assert.equal(normalized.gateResult, "fail");
+  assert.equal(normalized.finalAction, "Watch");
+  assert.equal(normalized.gateAudit.catalystStatus, "unavailable");
+});
+
 test("renderer uses final action, sector stance, explicit valuation basis, and explicit Dollar change label", () => {
   const compact = {
-    schemaVersion: 8,
-    engineVersion: "0.5.8.4",
-    buildRevision: "0.5.8.4",
+    schemaVersion: 9,
+    engineVersion: "0.5.9.0",
+    buildRevision: "0.5.9.0",
     reportMode: "verbose",
     generatedAt: "2026-08-10T23:45:11.044Z",
     session: "after_hours",
@@ -819,7 +857,7 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
 
 test("renderer explains rejected recommendations and uses signed bear-case and entry-threshold semantics", () => {
   const compact = {
-    schemaVersion: 8, engineVersion: "0.5.8.4", buildRevision: "0.5.8.4", reportMode: "verbose",
+    schemaVersion: 9, engineVersion: "0.5.9.0", buildRevision: "0.5.9.0", reportMode: "verbose",
     generatedAt: "2026-08-11T21:44:18.325Z", session: "after_hours", marketContext: {}, calendars: null, news: {},
     decisionFramework: { aiCycle: {}, sectorScorecard: {} }, opportunityGate: { candidates: [] },
     watchlist: [{
@@ -828,6 +866,7 @@ test("renderer explains rejected recommendations and uses signed bear-case and e
       targetAndMispricing: {
         status: "available", currentPrice: 272.27, bearValue: 365.32, baseValue: 503.35, bullValue: 694.06,
         baseUpsidePercent: 84.87, downsideToBearPercent: -34.18, riskRewardRatio: null, preferredEntryPrice: 419.46,
+        buyZones: { status: "available", suggested: { low: 260, high: 265 }, stronger: { low: 245, high: 255 }, method: "fixture" },
         valuationAdjustment: 2, valuationLabel: "Opportunity Bonus", confidence: "Medium",
       },
       catalyst: "n/a — no company-specific catalyst in snapshot", risk: "no quantified risk flag in snapshot",
@@ -847,9 +886,10 @@ test("renderer explains rejected recommendations and uses signed bear-case and e
 
   assert.match(report, /Base Upside \/ Bear-Case Return/);
   assert.match(report, /\+84\.87% \/ \+34\.18%; No modeled downside to Bear value/);
-  assert.match(report, /Current price already below entry threshold \(\$419\.46\)/);
-  assert.match(report, /Rejected — target confidence Medium; fresh catalyst unavailable; qualified rerating path unavailable; research assessment failed; strategic position Hold; final action Watch/);
-  assert.match(report, /Highest-Ranked Recommendation:\*\* No gate-qualified recommendation\. Leading researched setups: AMZN rejected: target confidence Medium; fresh catalyst unavailable; qualified rerating path unavailable; research assessment failed; strategic position Hold; final action Watch/);
+  assert.match(report, /Valuation threshold satisfied \(\$419\.46\); not an executable buy target/);
+  assert.match(report, /Valuation-derived suggested \$260–\$265; stronger \$245–\$255; not actionable — recommendation gate rejected/);
+  assert.match(report, /Rejected — target confidence Medium; catalyst unavailable; qualified rerating path unavailable; strategic position Hold/);
+  assert.match(report, /Highest-Ranked Recommendation:\*\* No recommendation qualified\. Closest setup: AMZN — Medium target confidence, but no verified catalyst or qualified rerating path; strategic position remains Hold\./);
   assert.doesNotMatch(report, /passes the action gate|earnings beat expectations/);
   const changedBearReturn = report.replace("+84.87% / +34.18%", "+84.87% / -34.18%");
   assert.match(validateReportCompleteness(changedBearReturn, ["AMZN"], synthesis).errors.join("; "), /changed deterministic bear-case return: AMZN/);
@@ -899,9 +939,9 @@ test("valuation scenario prices cannot become recommendation invalidation levels
 
 test("renderer excludes expired SEC fundamentals and surfaces their symbols and as-of dates", () => {
   const compact = {
-    schemaVersion: 8,
-    engineVersion: "0.5.8.4",
-    buildRevision: "0.5.8.4",
+    schemaVersion: 9,
+    engineVersion: "0.5.9.0",
+    buildRevision: "0.5.9.0",
     reportMode: "verbose",
     generatedAt: "2026-08-11T05:54:44.315Z",
     session: "closed",
@@ -968,9 +1008,9 @@ test("renderer excludes expired SEC fundamentals and surfaces their symbols and 
 
 test("Executive Summary prioritizes core scheduled events, gate-approved recommendations, and researched valuation risk", () => {
   const compact = {
-    schemaVersion: 8,
-    engineVersion: "0.5.8.4",
-    buildRevision: "0.5.8.4",
+    schemaVersion: 9,
+    engineVersion: "0.5.9.0",
+    buildRevision: "0.5.9.0",
     reportMode: "verbose",
     generatedAt: "2026-08-11T13:00:00.000Z",
     session: "premarket",
@@ -1014,7 +1054,7 @@ test("Executive Summary prioritizes core scheduled events, gate-approved recomme
     packets: [
       { symbol: "KOPN", status: "complete", modelGateResult: "fail", gateResult: "fail", finalAction: "Watch", catalystSummary: "CES product announcement", sourceSnapshot: { sourceType: "discovery", setup: { verifiedCatalyst: true } } },
       { symbol: "CRWV", status: "complete", modelGateResult: "fail", gateResult: "fail", finalAction: "Watch", sourceSnapshot: { sourceType: "core", setup: { verifiedCatalyst: true } } },
-      { symbol: "AMZN", status: "complete", modelGateResult: "pass", gateResult: "pass", confidence: "High", todayAction: "Buy on weakness", finalAction: "Buy on weakness", gateReason: "target confidence High; fresh catalyst unavailable; qualified rerating path 1Q; strategic position Buy; final action Buy on weakness", gateAudit: { result: "pass", researchAssessment: "pass", strategicPosition: "Buy", targetConfidence: "High", freshCatalyst: false, reratingPath: "1Q", finalAction: "Buy on weakness" }, invalidation: "Reassess if the stated 1Q fundamental rerating path does not materialize; valuation scenario prices are not stop levels.", sourceSnapshot: { sourceType: "core", setup: { score: 2 }, targetAndMispricing: { baseUpsidePercent: 30 } } },
+      { symbol: "AMZN", status: "complete", modelGateResult: "pass", gateResult: "pass", confidence: "High", todayAction: "Buy on weakness", finalAction: "Buy on weakness", gateReason: "target confidence High; catalyst unavailable; qualified rerating path 1Q; strategic position Buy; final action Buy on weakness", gateAudit: { result: "pass", researchAssessment: "pass", strategicPosition: "Buy", targetConfidence: "High", freshCatalyst: false, reratingPath: "1Q", finalAction: "Buy on weakness" }, invalidation: "Reassess if the stated 1Q fundamental rerating path does not materialize; valuation scenario prices are not stop levels.", sourceSnapshot: { sourceType: "core", setup: { score: 2 }, targetAndMispricing: { baseUpsidePercent: 30 } } },
       { symbol: "ANET", status: "complete", modelGateResult: "fail", gateResult: "fail", finalAction: "Watch", sourceSnapshot: { sourceType: "core", setup: {} } },
     ],
     batches: [],
@@ -1029,7 +1069,7 @@ test("Executive Summary prioritizes core scheduled events, gate-approved recomme
   assert.match(report, /\*\*Market Context:\*\* Nasdaq 100 futures -0\.45%; U\.S\. 10Y yield -1 bps; U\.S\. Dollar Index \+0\.12%; WTI crude \+1\.33%/);
   assert.match(report, /\*\*Key Scheduled Event:\*\* CRWV earnings \(time-after-hours\); relevant scorecard exposure: GPU Cloud\./);
   assert.doesNotMatch(report.split("# Overnight and Market Context")[0], /KOPN|CES product announcement/);
-  assert.match(report, /\*\*Highest-Ranked Recommendation:\*\* AMZN — Buy on weakness; target confidence High; qualified rerating path 1Q\./);
+  assert.match(report, /\*\*Highest-Ranked Recommendation:\*\* AMZN — Buy on weakness; target confidence High; qualified rerating path within 1 quarter\./);
   assert.match(report, /\*\*Primary Valuation Risk:\*\* ANET — historical valuation percentile 97\.8%; 52-week range position 98\.8%; sector exposure: Networking\./);
 
   compact.calendars.earnings.events[1].lifecycle = { status: "pending_verification" };
@@ -1108,7 +1148,7 @@ test("research packets reject unsourced support, resistance, target, and stop pr
 
 test("separate research audit deterministically renders negative net debt as net cash", () => {
   const audit = renderResearchAudit({
-    engineVersion: "0.5.8.4", buildRevision: "0.5.8.4",
+    engineVersion: "0.5.9.0", buildRevision: "0.5.9.0",
     opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
     dataQuality: { discoveryFundamentals: { sourceFailures: 0 } },
     research: {
@@ -1166,7 +1206,7 @@ test("research-provider failures become incomplete packets without exposing the 
   assert.equal(result.report.aiProvider, "gemini");
   assert.equal(result.report.aiModel, "gemini-3.5-flash");
   assert.equal(result.report.reportMode, "standard");
-  assert.equal(result.report.reportEngineVersion, "0.5.8.4");
+  assert.equal(result.report.reportEngineVersion, "0.5.9.0");
   assert.equal(result.report.generation.validation, "passed");
   assert.equal(result.report.storage.stored, true);
 });
@@ -1397,8 +1437,8 @@ test("existing dated report prevents duplicate report generation but still evalu
 
   assert.deepEqual(result.report, {
     date: "2026-08-05",
-    engineVersion: "0.5.8.4",
-    buildRevision: "0.5.8.4",
+    engineVersion: "0.5.9.0",
+    buildRevision: "0.5.9.0",
     generated: false,
     stored: true,
     storage: null,
