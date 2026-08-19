@@ -78,6 +78,7 @@ test("company news keeps only fresh symbol-linked headlines", () => {
   assert.equal(news.length, 1);
   assert.deepEqual(news[0].symbols, ["NVDA"]);
   assert.equal(news[0].source, "Reuters");
+  assert.equal(news[0].sourceType, "company_event");
   assert.equal(news[0].material, true);
 });
 
@@ -401,11 +402,25 @@ test("Yahoo search hits must name the queried company before becoming company-sp
   const [indirect, direct] = normalizeYahooNews(body, "VRT", new Date("2026-08-19T18:00:00.000Z"));
   assert.deepEqual([indirect.entityMatch, indirect.relationship], ["indirect", "sector_or_competitor_read_through"]);
   assert.deepEqual([direct.entityMatch, direct.relationship], ["direct", "company_specific"]);
+  assert.deepEqual([indirect.sourceType, direct.sourceType], ["sector_read_through", "company_event"]);
 
   const indirectState = catalystStateFor({ symbol: "VRT", news: [indirect] }, null);
   const directState = catalystStateFor({ symbol: "VRT", news: [direct] }, null);
   assert.deepEqual([indirectState.status, indirectState.verified, indirectState.sourceType], ["unavailable", false, "sector_read_through"]);
   assert.deepEqual([directState.status, directState.verified, directState.direction], ["verified_positive", true, "positive"]);
+});
+
+test("company analysis is context only and cannot enter the catalyst lifecycle", () => {
+  const published = Date.parse("2026-08-19T12:00:00.000Z") / 1000;
+  const [analysis] = normalizeYahooNews({ news: [{
+    title: "Arista Benefits From AI Networking Surge: Will Momentum Persist?",
+    link: "https://example.test/anet-analysis", providerPublishTime: published, publisher: "Zacks",
+  }] }, "ANET", new Date("2026-08-19T18:00:00.000Z"));
+
+  assert.deepEqual([analysis.entityMatch, analysis.sourceType, analysis.kind], ["direct", "company_analysis", "company_analysis"]);
+  const state = catalystStateFor({ symbol: "ANET", news: [analysis] }, null);
+  assert.deepEqual([state.status, state.verified, state.gateQualified, state.sourceType], ["unavailable", false, false, "company_analysis"]);
+  assert.match(state.display, /analysis\/commentary is not a reportable company event/i);
 });
 
 test("competitor headlines cannot verify catalysts for ANET or AVGO", () => {

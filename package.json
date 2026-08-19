@@ -1,7 +1,7 @@
 {
   "name": "growth-tech-morning-brief",
-  "version": "0.5.9.1",
-  "buildRevision": "0.5.9.1",
+  "version": "0.5.10",
+  "buildRevision": "0.5.10",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,4 +13,5 @@
     "wrangler": "^4.27.0"
   }
 }
+
 
