@@ -10,8 +10,8 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.10";
-const BUILD_REVISION = "0.5.10";
+const SERVICE_VERSION = "0.5.10.1";
+const BUILD_REVISION = "0.5.10.1";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -1514,45 +1514,74 @@ export function validateResearchConsistency(research, candidates) {
 }
 
 async function researchCandidateBatch(env, route, compact, candidates, batchNumber) {
-  const failures = [];
-  for (let attempt = 1; attempt <= MAX_AI_ATTEMPTS; attempt += 1) {
-    const prompt = candidateResearchPrompt(compact, candidates, {
+  const originalSymbols = candidates.map((row) => row.symbol);
+  const packetBySymbol = new Map();
+  const failuresBySymbol = new Map(candidates.map((candidate) => [candidate.symbol, []]));
+  let pending = [...candidates];
+  let attempts = 0;
+  for (let attempt = 1; attempt <= MAX_AI_ATTEMPTS && pending.length; attempt += 1) {
+    attempts = attempt;
+    const validationErrors = uniqueMessages(pending.flatMap((candidate) => failuresBySymbol.get(candidate.symbol) ?? []));
+    const prompt = candidateResearchPrompt(compact, pending, {
       batchNumber,
       retry: attempt > 1,
-      validationErrors: failures.at(-1),
+      validationErrors: validationErrors.join("; "),
     });
     const response = await requestAiReport(env, route, prompt, {
       maxTokens: positiveInteger(env.RESEARCH_MAX_TOKENS, DEFAULT_RESEARCH_MAX_TOKENS),
     });
     const extracted = extractAiReport(response.body, route, env);
     if (!response.ok || extracted.finishReason !== "STOP" || !extracted.markdown) {
-      failures.push(aiFailureDiagnostic(response.status, route, extracted, env));
+      const failure = aiFailureDiagnostic(response.status, route, extracted, env);
+      for (const candidate of pending) appendUnique(failuresBySymbol.get(candidate.symbol), failure);
       continue;
     }
     const parsed = parseJsonObject(extracted.markdown);
-    const validation = validateResearchBatch(parsed, candidates);
-    if (!validation.ok) {
-      failures.push(validation.errors.join("; "));
+    if (!parsed || !Array.isArray(parsed.candidates)) {
+      for (const candidate of pending) appendUnique(failuresBySymbol.get(candidate.symbol), "response must contain candidates array");
       continue;
     }
-    return {
-      batchNumber,
-      symbols: candidates.map((row) => row.symbol),
-      attempts: attempt,
-      status: "complete",
-      failures,
-      packets: parsed.candidates.map((packet) => normalizeResearchPacket(packet, candidates.find((row) => row.symbol === packet.symbol))),
-    };
+    const rowsBySymbol = new Map();
+    for (const row of parsed.candidates) {
+      if (!rowsBySymbol.has(row?.symbol)) rowsBySymbol.set(row?.symbol, []);
+      rowsBySymbol.get(row?.symbol).push(row);
+    }
+    const nextPending = [];
+    for (const candidate of pending) {
+      const rows = rowsBySymbol.get(candidate.symbol) ?? [];
+      const errors = rows.length === 0
+        ? [`missing candidate: ${candidate.symbol}`]
+        : rows.length > 1
+          ? [`duplicate candidate: ${candidate.symbol}`]
+          : validateResearchPacket(rows[0], candidate).errors;
+      if (errors.length) {
+        for (const error of errors) appendUnique(failuresBySymbol.get(candidate.symbol), error);
+        nextPending.push(candidate);
+      } else {
+        packetBySymbol.set(candidate.symbol, normalizeResearchPacket(rows[0], candidate));
+      }
+    }
+    pending = nextPending;
   }
-  const failure = failures.join(" | ") || "unknown research failure";
+  const failures = uniqueMessages([...failuresBySymbol.values()].flat());
+  const completeCount = packetBySymbol.size;
   return {
     batchNumber,
-    symbols: candidates.map((row) => row.symbol),
-    attempts: MAX_AI_ATTEMPTS,
-    status: "incomplete",
+    symbols: originalSymbols,
+    attempts,
+    status: completeCount === candidates.length ? "complete" : completeCount > 0 ? "partial" : "incomplete",
     failures,
-    packets: candidates.map((candidate) => incompleteResearchPacket(candidate, failure)),
+    packets: candidates.map((candidate) => packetBySymbol.get(candidate.symbol)
+      ?? incompleteResearchPacket(candidate, uniqueMessages(failuresBySymbol.get(candidate.symbol)).join("; ") || "unknown research failure")),
   };
+}
+
+function appendUnique(values, value) {
+  if (value && !values.includes(value)) values.push(value);
+}
+
+function uniqueMessages(values = []) {
+  return [...new Set(values.filter(Boolean))];
 }
 
 function candidateResearchPrompt(compact, candidates, options = {}) {
@@ -1607,19 +1636,28 @@ export function validateResearchBatch(parsed, candidates) {
   for (const symbol of expected) if (!actual.includes(symbol)) errors.push(`missing candidate: ${symbol}`);
   for (const symbol of actual) if (!expected.includes(symbol)) errors.push(`unexpected candidate: ${symbol}`);
   if (actual.length !== expected.length) errors.push(`expected ${expected.length} candidate objects, received ${actual.length}`);
-  const requiredStrings = ["catalystSummary", "mispricingThesis", "strategicPosition", "todayAction", "confidence", "entryExitCondition", "riskReward", "invalidation", "reratingPath", "reratingHorizon", "sourceQuality", "gateResult", "gateReason"];
-  for (const row of parsed.candidates) {
-    for (const field of requiredStrings) if (typeof row?.[field] !== "string" || !row[field].trim()) errors.push(`${row?.symbol ?? "unknown"} missing ${field}`);
-    for (const field of ["evidenceFor", "evidenceAgainst", "missingEvidence"]) if (!Array.isArray(row?.[field])) errors.push(`${row?.symbol ?? "unknown"} ${field} must be an array`);
-    if (!["Buy", "Hold", "Avoid"].includes(row?.strategicPosition)) errors.push(`${row?.symbol ?? "unknown"} invalid strategicPosition`);
-    if (!TODAY_ACTIONS.includes(row?.todayAction)) errors.push(`${row?.symbol ?? "unknown"} invalid todayAction`);
-    if (!["High", "Medium", "Low"].includes(row?.confidence)) errors.push(`${row?.symbol ?? "unknown"} invalid confidence`);
-    if (!["1Q", "2Q", "Unavailable"].includes(row?.reratingHorizon)) errors.push(`${row?.symbol ?? "unknown"} invalid reratingHorizon`);
-    if (["1Q", "2Q"].includes(row?.reratingHorizon) && !isTestableReratingPath(row?.reratingPath)) errors.push(`${row?.symbol ?? "unknown"} reratingPath is not testable within the stated horizon`);
-    if (!["pass", "fail"].includes(row?.gateResult)) errors.push(`${row?.symbol ?? "unknown"} invalid gateResult`);
-    validatePacketPriceLevels(row, candidates.find((candidate) => candidate.symbol === row?.symbol), errors);
+  for (const symbol of expected) {
+    const rows = parsed.candidates.filter((row) => row?.symbol === symbol);
+    if (rows.length > 1) errors.push(`duplicate candidate: ${symbol}`);
+    if (rows.length === 1) errors.push(...validateResearchPacket(rows[0], candidates.find((candidate) => candidate.symbol === symbol)).errors);
   }
-  return { ok: errors.length === 0, errors };
+  return { ok: errors.length === 0, errors: uniqueMessages(errors) };
+}
+
+export function validateResearchPacket(row, candidate) {
+  const errors = [];
+  const requiredStrings = ["catalystSummary", "mispricingThesis", "strategicPosition", "todayAction", "confidence", "entryExitCondition", "riskReward", "invalidation", "reratingPath", "reratingHorizon", "sourceQuality", "gateResult", "gateReason"];
+  if (!row || row.symbol !== candidate?.symbol) errors.push(`${candidate?.symbol ?? "unknown"} invalid symbol`);
+  for (const field of requiredStrings) if (typeof row?.[field] !== "string" || !row[field].trim()) errors.push(`${row?.symbol ?? candidate?.symbol ?? "unknown"} missing ${field}`);
+  for (const field of ["evidenceFor", "evidenceAgainst", "missingEvidence"]) if (!Array.isArray(row?.[field])) errors.push(`${row?.symbol ?? candidate?.symbol ?? "unknown"} ${field} must be an array`);
+  if (!["Buy", "Hold", "Avoid"].includes(row?.strategicPosition)) errors.push(`${row?.symbol ?? "unknown"} invalid strategicPosition`);
+  if (!TODAY_ACTIONS.includes(row?.todayAction)) errors.push(`${row?.symbol ?? "unknown"} invalid todayAction`);
+  if (!["High", "Medium", "Low"].includes(row?.confidence)) errors.push(`${row?.symbol ?? "unknown"} invalid confidence`);
+  if (!["1Q", "2Q", "Unavailable"].includes(row?.reratingHorizon)) errors.push(`${row?.symbol ?? "unknown"} invalid reratingHorizon`);
+  if (["1Q", "2Q"].includes(row?.reratingHorizon) && !isTestableReratingPath(row?.reratingPath)) errors.push(`${row?.symbol ?? "unknown"} reratingPath is not testable within the stated horizon`);
+  if (!["pass", "fail"].includes(row?.gateResult)) errors.push(`${row?.symbol ?? "unknown"} invalid gateResult`);
+  validatePacketPriceLevels(row, candidate, errors);
+  return { ok: errors.length === 0, errors: uniqueMessages(errors) };
 }
 
 export function normalizeResearchPacket(packet, candidate) {
@@ -1673,6 +1711,7 @@ export function normalizeResearchPacket(packet, candidate) {
     catalystDirection: catalystState.direction,
     freshCatalyst: catalystState.verified,
     reratingPath: reratingEligible ? packet.reratingHorizon : "Unavailable",
+    reratingPathDetail: reratingEligible ? packet.reratingPath : "Unavailable",
     evidenceAgainstCount: packet.evidenceAgainst?.length ?? 0,
     missingEvidenceCount: packet.missingEvidence?.length ?? 0,
     strategicPositionAligned,
@@ -1921,6 +1960,7 @@ function gateAuditForPacket(packet) {
     catalystDirection: catalystState.direction,
     freshCatalyst: catalystState.verified,
     reratingPath: ["1Q", "2Q"].includes(packet.reratingHorizon) && packet.gateResult === "pass" ? packet.reratingHorizon : "Unavailable",
+    reratingPathDetail: ["1Q", "2Q"].includes(packet.reratingHorizon) && packet.gateResult === "pass" ? packet.reratingPath : "Unavailable",
     evidenceAgainstCount: packet.evidenceAgainst?.length ?? 0,
     missingEvidenceCount: packet.missingEvidence?.length ?? 0,
     strategicPositionAligned: packet.strategicPosition === "Buy"
@@ -1944,7 +1984,7 @@ export function renderMorningBrief(compact, identity = {}) {
   const keyEvent = keyCompanyEvent(compact);
   const valuationRisk = primaryValuationRisk(compact.watchlist ?? [], sectorRows);
   const lines = [
-    `# Growth Tech Morning Brief — ${generatedAt.slice(0, 10)}`,
+    `# Growth Tech Morning Brief — ${reportDateFor(generatedAt)}`,
     "",
     `**Report Mode:** ${compact.reportMode}`,
     `**Engine Version:** ${compact.engineVersion}`,
@@ -2071,7 +2111,11 @@ function formatHighestRankedRecommendation(packet) {
   ].filter(Boolean).join("; ");
   const zones = packet.sourceSnapshot?.targetAndMispricing?.buyZones;
   const buyZone = ["Buy now", "Buy on weakness"].includes(action) && zones?.status === "available" ? executableBuyZoneSummary(zones) : null;
-  return `${packet.symbol} — ${action}${buyZone ? `; ${buyZone}` : ""}; ${basis}.`;
+  const reratingTrigger = !audit.freshCatalyst && audit.reratingPath !== "Unavailable"
+    && typeof audit.reratingPathDetail === "string" && audit.reratingPathDetail !== "Unavailable"
+    ? `; rerating trigger: ${cleanReportText(audit.reratingPathDetail)}`
+    : "";
+  return `${packet.symbol} — ${action}${buyZone ? `; ${buyZone}` : ""}; ${basis}${reratingTrigger}.`;
 }
 
 function formatRecommendationAbsence(packets, _modelQualifiedCount, _recommendedCount) {
@@ -2134,7 +2178,7 @@ export function renderResearchAudit(compact, identity = {}) {
   const missing = materialMissingFields(packets);
   const sourceFailures = compact.dataQuality?.discoveryFundamentals?.sourceFailures ?? 0;
   const lines = [
-    `# Growth Tech Research Audit — ${(identity.generatedAt ?? compact.generatedAt ?? "").slice(0, 10)}`,
+    `# Growth Tech Research Audit — ${reportDateFor(identity.generatedAt ?? compact.generatedAt)}`,
     "",
     `**Engine Version:** ${compact.engineVersion}`,
     `**Build Revision:** ${compact.buildRevision ?? BUILD_REVISION}`,
@@ -3171,7 +3215,7 @@ function compactRow(row) {
 function renderMarkdown(brief) {
   const candidates = brief.opportunityGate.candidates;
   const lines = [
-    `# Growth Tech Morning Brief — ${brief.generatedAt.slice(0, 10)}`,
+    `# Growth Tech Morning Brief — ${reportDateFor(brief.generatedAt)}`,
     "",
     `Coverage: ${brief.coverage.succeeded}/${brief.coverage.requested}. Session: ${brief.session}.`,
     "",
@@ -3654,6 +3698,11 @@ export function zonedParts(date, timeZone) {
   const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(date);
   const out = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
   return { date: `${out.year}-${out.month}-${out.day}`, hour: Number(out.hour), minute: Number(out.minute) };
+}
+
+function reportDateFor(value) {
+  const date = value instanceof Date ? value : new Date(value ?? NaN);
+  return Number.isFinite(date.getTime()) ? zonedParts(date, "America/New_York").date : "unknown-date";
 }
 
 function yahooHeaders(env) {

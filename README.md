@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.5.10 — typed company events and analysis
+# Growth Tech Morning Brief v0.5.10.1 — typed company events and analysis
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -17,6 +17,8 @@ Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/N
 - R2 caches SEC responses for seven days, keeps full dated calculation snapshots, stores compact dated briefs, and saves Gemini-generated Markdown reports.
 
 Yahoo and Nasdaq endpoints are unofficial public web endpoints and can change or rate-limit access. Every context category carries source and freshness metadata, and a category failure never blocks the equity snapshot. The Federal Reserve feed is official, but its inclusion does not by itself imply that a policy item caused a stock move. SEC data is authoritative but issuers use differing XBRL tags; unavailable fields remain null rather than being invented. Analyst-consensus forward valuation, target prices, and estimate revisions are not included and remain explicitly unavailable; trailing-implied ranges are never labeled analyst targets.
+
+v0.5.10.1 isolates structured-research validation by ticker. Valid packets survive a bad batch peer, retries contain only failed symbols, and repeated validation diagnostics are deduplicated. Catalyst-free Buy recommendations now print the qualifying rerating trigger, and report/audit headings use the America/New_York report date.
 
 ## One-time R2 setup and deployment
 
@@ -97,7 +99,7 @@ curl "https://growth-tech-morning-brief.ck-market-tools.workers.dev/latest" \
 
 ## GitHub Actions deployment
 
-The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets. Before the post-deploy report test, the workflow waits until `/health` reports the exact engine version and build revision. It then calls the build-specific `/run-report/v0.5.10/build/0.5.10` endpoint and retries only a 404 response, so a still-propagating older Worker cannot generate or overwrite the new report artifact.
+The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets. Before the post-deploy report test, the workflow waits until `/health` reports the exact engine version and build revision. It then calls the build-specific `/run-report/v0.5.10.1/build/0.5.10.1` endpoint and retries only a 404 response, so a still-propagating older Worker cannot generate or overwrite the new report artifact.
 
 
 ## AI provider router, report generation, and delivery

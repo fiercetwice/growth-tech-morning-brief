@@ -90,6 +90,14 @@ The valuation score may improve candidate ranking but cannot independently suppo
 - Preserve thesis changes, invalidation conditions, event deltas, and subsequent outcomes by company.
 - Rank the research queue by material information change rather than raw mentions.
 
+### v0.5.10.1 research-isolation hotfix
+
+- Validate and retry structured research per ticker so one malformed packet cannot invalidate valid batch peers.
+- Retry only failed symbols and deduplicate repeated validation diagnostics.
+- Show the testable rerating trigger when a Buy recommendation qualifies without a verified catalyst.
+- Use the America/New_York report date consistently in Morning Brief and Research Audit headings.
+- Preserve regressions for the VRT catalyst-free Buy path and the ORCL/MSFT/GOOGL mixed-validity batch.
+
 ## v0.6.0 — Portfolio-aware decision layer
 
 - Incorporate existing position size, concentration, tax lots, and correlated exposures.
