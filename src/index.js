@@ -10,8 +10,8 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.11";
-const BUILD_REVISION = "0.5.11";
+const SERVICE_VERSION = "0.5.11.1";
+const BUILD_REVISION = "0.5.11.1";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -1205,7 +1205,7 @@ function median(values) {
   return sorted.length % 2 ? sorted[middle] : round((sorted[middle - 1] + sorted[middle]) / 2);
 }
 
-export function toBrief(snapshot) {
+export function toBrief(snapshot, options = {}) {
   const rows = snapshot.watchlist.map(compactRow);
   const discoveredRows = (snapshot.discovery?.candidates ?? []).map(compactDiscoveryRow);
   const companyNews = snapshot.news?.company?.items ?? [];
@@ -1240,7 +1240,7 @@ export function toBrief(snapshot) {
   }
   const valid = [...rows, ...discoveredRows].filter((row) => !row.missing);
   const dataQuality = snapshotDataQuality(snapshot);
-  const candidates = selectResearchCandidates(rows, discoveredRows, snapshot.eventLedger);
+  const candidates = selectResearchCandidates(rows, discoveredRows, snapshot.eventLedger, MAX_RESEARCH_CANDIDATES, options.previousResearchSymbols);
   const validResearchUniverse = [...rows, ...discoveredRows].filter((row) => !row.missing);
   const targetResearchCount = Math.min(MAX_RESEARCH_CANDIDATES, validResearchUniverse.length);
   if (candidates.length !== targetResearchCount) {
@@ -1290,10 +1290,12 @@ export function toBrief(snapshot) {
   return brief;
 }
 
-export function selectResearchCandidates(coreRows, discoveryRows, eventLedger, maximum = MAX_RESEARCH_CANDIDATES) {
+export function selectResearchCandidates(coreRows, discoveryRows, eventLedger, maximum = MAX_RESEARCH_CANDIDATES, previousResearchSymbols = []) {
   const valid = [...coreRows, ...discoveryRows].filter((row) => !row.missing);
+  const previousSymbols = new Set(previousResearchSymbols ?? []);
   const admitted = valid.filter((row) => row.setup?.eligible)
-    .sort((a, b) => (b.setup?.score ?? 0) - (a.setup?.score ?? 0))
+    .sort((a, b) => (b.setup?.score ?? 0) - (a.setup?.score ?? 0)
+      || Number(previousSymbols.has(b.symbol)) - Number(previousSymbols.has(a.symbol)))
     .slice(0, maximum)
     .map((row) => ({ ...row, admissionType: "setup_gate", setup: { ...row.setup, admissionType: "setup_gate" } }));
   if (admitted.length >= maximum) return admitted;
@@ -1303,7 +1305,7 @@ export function selectResearchCandidates(coreRows, discoveryRows, eventLedger, m
     .filter((event) => event.delta === "new" && event.symbol)
     .map((event) => event.symbol));
   const fillers = coreRows.filter((row) => !row.missing && !selected.has(row.symbol))
-    .sort((a, b) => autoWatchlistPriority(b, newEventSymbols) - autoWatchlistPriority(a, newEventSymbols))
+    .sort((a, b) => autoWatchlistPriority(b, newEventSymbols, previousSymbols) - autoWatchlistPriority(a, newEventSymbols, previousSymbols))
     .slice(0, maximum - admitted.length)
     .map((row) => ({
       ...row,
@@ -1318,19 +1320,20 @@ export function selectResearchCandidates(coreRows, discoveryRows, eventLedger, m
   return [...admitted, ...fillers];
 }
 
-function autoWatchlistPriority(row, newEventSymbols) {
+function autoWatchlistPriority(row, newEventSymbols, previousSymbols = new Set()) {
   const newEvent = newEventSymbols.has(row.symbol) ? 100 : 0;
+  const continuity = previousSymbols.has(row.symbol) ? 3 : 0;
   const move = Math.min(20, Math.abs(row.changePercent ?? 0) * 4);
   const financialCoverage = row.valuation && row.reportedGrowth ? 6 : row.valuation || row.reportedGrowth ? 3 : 0;
   const rangeExtreme = Number.isFinite(row.positionIn52WeekRange)
     ? Math.abs(row.positionIn52WeekRange - 50) / 25
     : 0;
   const valuationOpportunity = (row.targetAndMispricing?.valuationAdjustment ?? 0) * 2;
-  return newEvent + move + financialCoverage + rangeExtreme + valuationOpportunity;
+  return newEvent + continuity + move + financialCoverage + rangeExtreme + valuationOpportunity;
 }
 
-export function compactSnapshotForReport(snapshot) {
-  const brief = toBrief(snapshot);
+export function compactSnapshotForReport(snapshot, options = {}) {
+  const brief = toBrief(snapshot, options);
   return {
     schemaVersion: brief.schemaVersion,
     generatedAt: brief.generatedAt,
@@ -1414,11 +1417,13 @@ function todaySetup(row) {
 export async function generateAiReport(env, snapshot, override = null, options = {}) {
   const route = selectedAiRoute(env, override);
   const { provider, model } = route;
-  const compact = compactSnapshotForReport(snapshot);
+  const previousResearch = await loadPreviousResearch(env);
+  const compact = compactSnapshotForReport(snapshot, {
+    previousResearchSymbols: (previousResearch?.packets ?? []).map((packet) => packet.symbol),
+  });
   compact.reportMode = selectedReportMode(env, options.reportMode);
   compact.engineVersion = SERVICE_VERSION;
   compact.buildRevision = BUILD_REVISION;
-  const previousResearch = await loadPreviousResearch(env);
   const research = applyThesisMemory(await researchCandidates(env, route, compact, previousResearch), previousResearch);
   const researchConsistency = validateResearchConsistency(research, compact.opportunityGate?.candidates ?? []);
   if (!researchConsistency.ok) throw new Error(`Research funnel consistency failed: ${researchConsistency.errors.join("; ")}`);
@@ -1471,6 +1476,10 @@ async function researchCandidates(env, route, compact, previousResearch = null) 
   const batches = [];
   for (let index = 0; index < candidates.length; index += batchSize) batches.push(candidates.slice(index, index + batchSize));
   const previousBySymbol = new Map((previousResearch?.packets ?? []).map((packet) => [packet.symbol, packet]));
+  for (const [symbol, entry] of Object.entries(previousResearch?.thesisMemory?.activeQualifiedTheses ?? {})) {
+    const packet = activeThesisPacket(entry);
+    if (packet) previousBySymbol.set(symbol, { ...packet, memoryType: "active_qualified_thesis" });
+  }
   const results = await Promise.all(batches.map((batch, index) => researchCandidateBatch(
     env, route, compact, batch, index + 1, batch.map((candidate) => previousBySymbol.get(candidate.symbol)).filter(Boolean),
   )));
@@ -1619,12 +1628,28 @@ async function loadPreviousResearch(env) {
 
 export function applyThesisMemory(research, previousResearch) {
   const previousBySymbol = new Map((previousResearch?.packets ?? []).map((packet) => [packet.symbol, packet]));
+  const priorActive = previousResearch?.thesisMemory?.activeQualifiedTheses ?? {};
+  const activeBySymbol = new Map(Object.entries(priorActive).map(([symbol, entry]) => [symbol, activeThesisPacket(entry)]));
+  for (const packet of previousResearch?.packets ?? []) {
+    if (!activeBySymbol.has(packet.symbol) && isQualifiedTradePacket(packet)) activeBySymbol.set(packet.symbol, packet);
+  }
   const packets = research.packets.map((current) => stabilizeResearchPacket(
     current,
-    previousBySymbol.get(current.symbol),
+    activeBySymbol.get(current.symbol) ?? previousBySymbol.get(current.symbol),
     research.generatedAt,
-    previousResearch?.generatedAt,
+    activeThesisGeneratedAt(priorActive[current.symbol]) ?? previousResearch?.generatedAt,
   ));
+  const activeQualifiedTheses = { ...priorActive };
+  for (const packet of packets) {
+    if (isQualifiedTradePacket(packet)) {
+      activeQualifiedTheses[packet.symbol] = {
+        generatedAt: research.generatedAt,
+        packet: activeThesisSnapshot(packet),
+      };
+    } else if (activeBySymbol.has(packet.symbol)) {
+      delete activeQualifiedTheses[packet.symbol];
+    }
+  }
   const researched = packets.filter((packet) => packet.status === "complete").length;
   const incomplete = packets.length - researched;
   const gateQualified = packets.filter((packet) => packet.modelGateResult === "pass").length;
@@ -1635,6 +1660,9 @@ export function applyThesisMemory(research, previousResearch) {
       status: previousResearch ? "available" : "unavailable",
       previousGeneratedAt: previousResearch?.generatedAt ?? null,
       stabilized: packets.filter((packet) => packet.actionMemory?.status === "model_only_change_blocked").length,
+      latestObservationCount: packets.length,
+      activeQualifiedCount: Object.keys(activeQualifiedTheses).length,
+      activeQualifiedTheses,
     },
     funnel: {
       ...research.funnel,
@@ -1646,6 +1674,24 @@ export function applyThesisMemory(research, previousResearch) {
     },
     packets,
   };
+}
+
+function activeThesisPacket(entry) {
+  return entry?.packet ?? entry ?? null;
+}
+
+function activeThesisGeneratedAt(entry) {
+  return entry?.generatedAt ?? null;
+}
+
+function isQualifiedTradePacket(packet) {
+  return packet?.status === "complete" && packet?.gateResult === "pass"
+    && ["Buy now", "Buy on weakness", "Sell"].includes(packet.finalAction ?? packet.todayAction);
+}
+
+function activeThesisSnapshot(packet) {
+  const { actionMemory: ignoredActionMemory, ...snapshot } = packet;
+  return snapshot;
 }
 
 function stabilizeResearchPacket(current, previous, currentGeneratedAt, previousGeneratedAt) {
@@ -1850,6 +1896,7 @@ function candidateResearchPrompt(compact, candidates, options = {}) {
     `Analyze only these batch symbols: ${[...candidateSymbols].join(", ")}. Do not place any other equity ticker in candidate fields; non-candidate market facts are context only.`,
     "Discovery names cannot pass the action gate when valuation, fundamentals, liquidity context, or a directionally verified fresh company catalyst is missing.",
     "Price movement alone may support Watch, never Buy/Sell. A core name without same-day news may support a value call only when the supplied target engine has Medium/High confidence, at least 20% base upside, complete financial evidence, and you state a testable rerating path within 1Q or 2Q. Discovery names still require a directionally verified fresh catalyst.",
+    "A testable rerating path must name an operating metric and an observable direction, threshold, or result within the stated horizon. Generic statements such as a fresh earnings report, contract announcement, catalyst, or move toward base value could trigger rerating do not qualify.",
     "Previous research is thesis memory, not new evidence. If strategicPosition, todayAction, or gateResult changes, the change must be supported by new supplied company-event, filing, target-input, risk, or executable price-location evidence; different wording alone is not evidence.",
     "Use the supplied deterministic trailing-implied target values exactly. They are not analyst targets. The valuation adjustment may affect ranking and action preference but cannot bypass financial, risk, liquidity, catalyst, or rerating-path gates.",
     "Without supplied portfolio holdings and target weights, extremeTrim is a valuation-risk flag only: use Watch, never Review position size or Trim.",
@@ -2069,7 +2116,10 @@ function validatePacketPriceLevels(packet, candidate, errors) {
 
 function isTestableReratingPath(value) {
   const text = String(value ?? "").trim();
-  return text.length >= 20 && /\b(?:revenue|earnings|eps|margin|guidance|backlog|bookings|capex|cash flow|customer|contract|utilization|estimate|shipment|adoption)\b/i.test(text);
+  const operatingMetric = /\b(?:revenue|sales|eps|margin|guidance|backlog|bookings|capex|cash flow|free cash flow|customer(?:s)?|contract(?:s)?|utilization|estimate(?:s)?|shipment(?:s)?|adoption)\b/i.test(text);
+  const observableOutcome = /\b(?:grow(?:th)?|increase|accelerat(?:e|ion)|reaccelerat(?:e|ion)|improv(?:e|ement)|expand|raise|beat|exceed|maintain|hold|declin(?:e|ing)|decelerat(?:e|ion)|compress|fall|convert|reach|above|below)\b|(?:>=|<=|>|<)\s*\d|\d+(?:\.\d+)?\s*%/i.test(text);
+  const valuationOnly = /\b(?:toward|to)\s+(?:the\s+)?(?:base|bull|bear)(?:\s+case)?\s+value\b/i.test(text) && !observableOutcome;
+  return text.length >= 30 && operatingMetric && observableOutcome && !valuationOnly;
 }
 
 function discoveryFinancialsComplete(candidate) {
@@ -2199,6 +2249,7 @@ export function synthesisContext(compact, research) {
           : packetBySymbol.get(row.symbol)?.finalAction ?? packetBySymbol.get(row.symbol)?.todayAction ?? "Wait",
       recommendationGateResult: recommendationGateResult(packetBySymbol.get(row.symbol), researchSet.has(row.symbol)),
       actionMemory: packetBySymbol.get(row.symbol)?.actionMemory,
+      gateAudit: packetBySymbol.get(row.symbol)?.gateAudit,
       reratingPath: packetBySymbol.get(row.symbol)?.reratingPath,
       reratingHorizon: packetBySymbol.get(row.symbol)?.reratingHorizon,
       researchStatus: researchSet.has(row.symbol) ? "researched" : "not_researched_today",
@@ -2451,7 +2502,7 @@ export function renderResearchAudit(compact, identity = {}) {
     `**Report Content SHA-256:** ${identity.contentHash ?? "unavailable"}`,
     "",
     `**Funnel:** screened=${funnel.screened ?? "unavailable"}; admitted=${funnel.admitted ?? 0}; researched=${funnel.researched ?? 0}; incomplete=${funnel.incomplete ?? 0}; gateQualified=${funnel.gateQualified ?? 0}; recommendedActions=${funnel.recommendedActions ?? 0}; rejectedOrWatch=${funnel.rejectedOrWatch ?? 0}`,
-    `**Thesis Memory:** ${thesisMemory.status ?? "unavailable"}; previous=${thesisMemory.previousGeneratedAt ?? "unavailable"}; model-only action changes blocked=${thesisMemory.stabilized ?? 0}.`,
+    `**Thesis Memory:** ${thesisMemory.status ?? "unavailable"}; previous=${thesisMemory.previousGeneratedAt ?? "unavailable"}; latest observations=${thesisMemory.latestObservationCount ?? packets.length}; active qualified theses=${thesisMemory.activeQualifiedCount ?? 0}; model-only action changes blocked=${thesisMemory.stabilized ?? 0}.`,
     `**Packet Completion:** capacity=${capacity.filled ?? packets.length}/${capacity.target ?? packets.length}; generated packets are not described as complete fields.`,
     `**Field Completeness:** ${fieldCompletenessSummary(packets)}`,
     `**Material Missing Fields:** ${missing.length ? missing.join("; ") : "None in the deterministic required-field set."}`,
@@ -2512,7 +2563,10 @@ function actionMemoryDisplay(memory) {
 function reratingPathDisplay(row) {
   const path = String(row?.reratingPath ?? "").trim();
   if (!path || path === "Unavailable" || !["1Q", "2Q"].includes(row?.reratingHorizon)) return "Unavailable";
-  return `${row.reratingHorizon ?? "horizon unavailable"} — ${path}`;
+  const qualified = row?.gateAudit?.reratingPath !== "Unavailable" && ["1Q", "2Q"].includes(row?.gateAudit?.reratingPath);
+  return qualified
+    ? `Qualified (${row.reratingHorizon}) — ${path}`
+    : `Model-proposed, not qualified (${row.reratingHorizon}) — ${path}`;
 }
 
 function targetAuditDisplay(target) {

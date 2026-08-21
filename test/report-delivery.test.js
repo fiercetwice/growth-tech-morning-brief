@@ -54,8 +54,8 @@ function completeReport(symbols = ["NVDA"], detail = "Balanced action is to moni
     "# Growth Tech Morning Brief",
     "",
     "**Report Mode:** standard",
-    "**Engine Version:** 0.5.11",
-    "**Build Revision:** 0.5.11",
+    "**Engine Version:** 0.5.11.1",
+    "**Build Revision:** 0.5.11.1",
     "**Report ID:** 00000000-0000-4000-8000-000000000000",
     "**Generated At:** 2026-08-05T13:35:00.000Z",
     "",
@@ -109,9 +109,9 @@ function verboseNoTradeReport(symbols = ["NVDA"]) {
 test("verbose Morning Brief keeps research audit out of the five-section product", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.11",
+    engineVersion: "0.5.11.1",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
-    buildRevision: "0.5.11",
+    buildRevision: "0.5.11.1",
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
   };
   const valid = validateReportCompleteness(verboseNoTradeReport(), ["NVDA"], compact);
@@ -125,8 +125,8 @@ test("Morning Brief and Research Audit headings use the New York report date", (
   const generatedAt = "2026-08-20T00:00:03.256Z";
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.11",
-    buildRevision: "0.5.11",
+    engineVersion: "0.5.11.1",
+    buildRevision: "0.5.11.1",
     generatedAt,
     marketContext: {},
     decisionFramework: { aiCycle: {}, sectorScorecard: {} },
@@ -160,8 +160,8 @@ test("unavailable market context must be marked unavailable at category level", 
 test("verbose validation applies section-aware research and context-only ticker scopes", () => {
   const compact = {
     reportMode: "verbose",
-    engineVersion: "0.5.11",
-    buildRevision: "0.5.11",
+    engineVersion: "0.5.11.1",
+    buildRevision: "0.5.11.1",
     opportunityGate: { maximumOpportunities: 8, candidates: [{ symbol: "NVDA", setup: { verifiedCatalyst: false } }] },
     discovery: { admittedSymbols: [] },
     research: { funnel: { screened: 0, admitted: 1, researched: 1, incomplete: 0, gateQualified: 0, recommendedActions: 0, rejectedOrWatch: 1 }, packets: [{ symbol: "NVDA" }] },
@@ -199,6 +199,20 @@ test("auto-watchlist fills unused research capacity without clearing the action 
   assert.equal(selected[0].admissionType, "setup_gate");
   assert.equal(selected.filter((row) => row.admissionType === "auto_watchlist").length, 11);
   assert.ok(selected.slice(1).every((row) => row.setup.eligible === false && row.setup.autoWatchlist === true));
+});
+
+test("auto-watchlist retains the previous research queue across near-identical snapshots", () => {
+  const rows = [
+    { symbol: "ANET", changePercent: -3.4, positionIn52WeekRange: 75 },
+    { symbol: "CRWV", changePercent: -3.6, positionIn52WeekRange: 36 },
+  ].map((row) => ({
+    ...row, price: 100, valuation: { trailingPE: 20 }, reportedGrowth: { revenueTtmYoY: 10 },
+    targetAndMispricing: { valuationAdjustment: 0 }, setup: { eligible: false, score: 0, reasons: [] }, missing: false,
+  }));
+  const selected = selectResearchCandidates(rows, [], { events: [] }, 1, ["ANET"]);
+  assert.equal(selected[0].symbol, "ANET");
+  const displaced = selectResearchCandidates(rows, [], { events: [{ symbol: "CRWV", delta: "new" }] }, 1, ["ANET"]);
+  assert.equal(displaced[0].symbol, "CRWV");
 });
 
 test("snapshot-to-report integration fills all 12 research slots from the full core watchlist", () => {
@@ -264,7 +278,7 @@ test("synthesis exposes a filtered two-level ticker universe while preserving so
   };
   const compact = {
     schemaVersion: 9,
-    engineVersion: "0.5.11",
+    engineVersion: "0.5.11.1",
     reportMode: "verbose",
     calendars: { earnings: { events: [{ symbol: "NVDA" }, { symbol: "MSFT" }, { symbol: "LITE" }], watchlistMatches: ["NVDA", "MSFT"] } },
     decisionFramework: { aiCycle: { GPU: { evidence: "NVDA +1%, MSFT -1%" } } },
@@ -533,10 +547,10 @@ test("authenticated run-report can route a forced verbose regeneration to a sele
   assert.equal(body.report.aiProvider, "deepseek");
   assert.equal(body.report.aiModel, "deepseek-v4-pro");
   assert.equal(body.report.reportMode, "verbose");
-  assert.equal(body.report.reportEngineVersion, "0.5.11");
-  assert.equal(body.report.reportBuildRevision, "0.5.11");
+  assert.equal(body.report.reportEngineVersion, "0.5.11.1");
+  assert.equal(body.report.reportBuildRevision, "0.5.11.1");
   assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.reportMode, "verbose");
-  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.11");
+  assert.equal(bucket.putOptions.get("reports/latest.md").customMetadata.engineVersion, "0.5.11.1");
   assert.match(bucket.objects.get("reports/latest.md"), /# Executive Summary/);
   assert.doesNotMatch(bucket.objects.get("reports/latest.md"), /Research Audit/);
   assert.ok(bucket.objects.has("research-audit/latest.md"));
@@ -834,7 +848,7 @@ test("VRT model-only Buy to Watch downgrade is blocked when deterministic eviden
   assert.match(packet.reratingPath, /Quarterly product revenue/);
   assert.equal(stabilized.funnel.recommendedActions, 1);
   const compact = {
-    schemaVersion: 9, engineVersion: "0.5.11", buildRevision: "0.5.11", reportMode: "verbose",
+    schemaVersion: 9, engineVersion: "0.5.11.1", buildRevision: "0.5.11.1", reportMode: "verbose",
     generatedAt: "2026-08-20T20:04:31.468Z", session: "after_hours", marketContext: {}, dataQuality: {},
     decisionFramework: { aiCycle: {}, sectorScorecard: { Cooling: { fundamentals: "Strong", valuation: "Low", momentum: "Positive", stance: "Favorable", symbols: ["VRT"] } } },
     opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
@@ -843,7 +857,7 @@ test("VRT model-only Buy to Watch downgrade is blocked when deterministic eviden
   const synthesis = synthesisContext(compact, stabilized);
   const report = renderMorningBrief(synthesis, { reportId: "00000000-0000-4000-8000-000000000099", generatedAt: compact.generatedAt });
   assert.match(report, /Buy now → Buy now; proposed Watch blocked/);
-  assert.match(report, /1Q — Quarterly product revenue must reaccelerate and management must raise next-quarter guidance/);
+  assert.match(report, /Qualified \(1Q\) — Quarterly product revenue must reaccelerate and management must raise next-quarter guidance/);
   const audit = renderResearchAudit(synthesis, { generatedAt: compact.generatedAt });
   assert.match(audit, /Blocked model observation:.*"finalAction":"Watch"/);
 });
@@ -865,6 +879,44 @@ test("AMZN model-only Watch to Buy upgrade is blocked without new evidence", () 
   assert.equal(stabilized.packets[0].gateResult, "fail");
   assert.equal(stabilized.packets[0].modelGateResult, "pass");
   assert.match(stabilized.packets[0].gateReason, /action change blocked/i);
+});
+
+test("active qualified thesis survives an intervening latest Watch observation", () => {
+  const candidate = thesisCandidate("VRT", 264.68);
+  const active = thesisPacket(candidate);
+  const latestWatch = thesisPacket(candidate, { strategicPosition: "Hold", todayAction: "Watch", gateResult: "fail" });
+  const currentWatch = thesisPacket(candidate, {
+    strategicPosition: "Hold", todayAction: "Watch", gateResult: "fail",
+    evidenceAgainst: ["No new company event."], missingEvidence: ["fresh guidance"],
+  });
+  const stabilized = applyThesisMemory({
+    generatedAt: "2026-08-21T13:35:00.000Z", funnel: { admitted: 1 }, batches: [], packets: [currentWatch],
+  }, {
+    generatedAt: "2026-08-21T12:00:00.000Z",
+    packets: [latestWatch],
+    thesisMemory: { activeQualifiedTheses: { VRT: { generatedAt: "2026-08-20T13:35:00.000Z", packet: active } } },
+  });
+  assert.equal(stabilized.packets[0].finalAction, "Buy now");
+  assert.equal(stabilized.packets[0].gateResult, "pass");
+  assert.equal(stabilized.packets[0].actionMemory.status, "model_only_change_blocked");
+  assert.equal(stabilized.thesisMemory.activeQualifiedCount, 1);
+  assert.equal(stabilized.thesisMemory.activeQualifiedTheses.VRT.packet.finalAction, "Buy now");
+});
+
+test("active qualified thesis clears when current deterministic inputs no longer qualify", () => {
+  const priorCandidate = thesisCandidate("VRT", 264.68);
+  const currentCandidate = thesisCandidate("VRT", 264.68, {
+    targetAndMispricing: { ...priorCandidate.targetAndMispricing, baseUpsidePercent: 4 },
+  });
+  const active = thesisPacket(priorCandidate);
+  const current = thesisPacket(currentCandidate, { strategicPosition: "Hold", todayAction: "Watch", gateResult: "fail" });
+  const stabilized = applyThesisMemory({ generatedAt: "2026-08-21T13:35:00.000Z", funnel: { admitted: 1 }, batches: [], packets: [current] }, {
+    generatedAt: "2026-08-20T13:35:00.000Z", packets: [current],
+    thesisMemory: { activeQualifiedTheses: { VRT: { generatedAt: "2026-08-20T13:35:00.000Z", packet: active } } },
+  });
+  assert.equal(stabilized.packets[0].finalAction, "Watch");
+  assert.equal(stabilized.thesisMemory.activeQualifiedCount, 0);
+  assert.equal(stabilized.thesisMemory.activeQualifiedTheses.VRT, undefined);
 });
 
 test("new filing evidence permits a Watch to Buy thesis change", () => {
@@ -922,6 +974,32 @@ test("research validation rejects a vague rerating path", () => {
   };
   const validation = validateResearchBatch({ candidates: [packet] }, [{ symbol: "NVDA", price: 100, yearLow: 70, yearHigh: 120 }]);
   assert.match(validation.errors.join("; "), /reratingPath is not testable/);
+});
+
+test("research validation rejects generic earnings or contract rerating language", () => {
+  for (const reratingPath of [
+    "A fresh earnings report could trigger rerating toward base value.",
+    "A major contract announcement could trigger a rerating toward the base case value.",
+  ]) {
+    const packet = {
+      symbol: "VRT", catalystSummary: "No same-day event.", evidenceFor: [], evidenceAgainst: [], missingEvidence: [],
+      mispricingThesis: "Potential value.", strategicPosition: "Buy", todayAction: "Buy on weakness", confidence: "Medium",
+      entryExitCondition: "Use the supplied zone.", riskReward: "Potentially favorable.", invalidation: "Reassess next quarter.",
+      reratingPath, reratingHorizon: "1Q", sourceQuality: "mixed", gateResult: "pass", gateReason: "value",
+    };
+    assert.match(validateResearchBatch({ candidates: [packet] }, [{ symbol: "VRT", price: 100, yearLow: 70, yearHigh: 120 }]).errors.join("; "), /reratingPath is not testable/);
+  }
+});
+
+test("research validation accepts a measurable operating rerating path", () => {
+  const packet = {
+    symbol: "VRT", catalystSummary: "No same-day event.", evidenceFor: [], evidenceAgainst: [], missingEvidence: [],
+    mispricingThesis: "Potential value.", strategicPosition: "Buy", todayAction: "Buy on weakness", confidence: "Medium",
+    entryExitCondition: "Use the supplied zone.", riskReward: "Potentially favorable.", invalidation: "Reassess next quarter.",
+    reratingPath: "Quarterly organic revenue growth must accelerate above 20% while operating margin expands.",
+    reratingHorizon: "1Q", sourceQuality: "primary filings", gateResult: "pass", gateReason: "value",
+  };
+  assert.doesNotMatch(validateResearchBatch({ candidates: [packet] }, [{ symbol: "VRT", price: 100, yearLow: 70, yearHigh: 120 }]).errors.join("; "), /reratingPath is not testable/);
 });
 
 test("valuation penalty deterministically downgrades Buy now", () => {
@@ -1009,8 +1087,8 @@ test("a displayed valuation buy zone is not actionable when the recommendation g
 test("renderer uses final action, sector stance, explicit valuation basis, and explicit Dollar change label", () => {
   const compact = {
     schemaVersion: 9,
-    engineVersion: "0.5.11",
-    buildRevision: "0.5.11",
+    engineVersion: "0.5.11.1",
+    buildRevision: "0.5.11.1",
     reportMode: "verbose",
     generatedAt: "2026-08-10T23:45:11.044Z",
     session: "after_hours",
@@ -1072,7 +1150,7 @@ test("renderer uses final action, sector stance, explicit valuation basis, and e
 
 test("renderer explains rejected recommendations and uses signed bear-case and entry-threshold semantics", () => {
   const compact = {
-    schemaVersion: 9, engineVersion: "0.5.11", buildRevision: "0.5.11", reportMode: "verbose",
+    schemaVersion: 9, engineVersion: "0.5.11.1", buildRevision: "0.5.11.1", reportMode: "verbose",
     generatedAt: "2026-08-11T21:44:18.325Z", session: "after_hours", marketContext: {}, calendars: null, news: {},
     decisionFramework: { aiCycle: {}, sectorScorecard: {} }, opportunityGate: { candidates: [] },
     watchlist: [{
@@ -1155,8 +1233,8 @@ test("valuation scenario prices cannot become recommendation invalidation levels
 test("renderer excludes expired SEC fundamentals and surfaces their symbols and as-of dates", () => {
   const compact = {
     schemaVersion: 9,
-    engineVersion: "0.5.11",
-    buildRevision: "0.5.11",
+    engineVersion: "0.5.11.1",
+    buildRevision: "0.5.11.1",
     reportMode: "verbose",
     generatedAt: "2026-08-11T05:54:44.315Z",
     session: "closed",
@@ -1224,8 +1302,8 @@ test("renderer excludes expired SEC fundamentals and surfaces their symbols and 
 test("Executive Summary prioritizes core scheduled events, gate-approved recommendations, and researched valuation risk", () => {
   const compact = {
     schemaVersion: 9,
-    engineVersion: "0.5.11",
-    buildRevision: "0.5.11",
+    engineVersion: "0.5.11.1",
+    buildRevision: "0.5.11.1",
     reportMode: "verbose",
     generatedAt: "2026-08-11T13:00:00.000Z",
     session: "premarket",
@@ -1310,7 +1388,7 @@ test("Executive Summary prioritizes core scheduled events, gate-approved recomme
 test("company analysis remains visible as context but is excluded from Key Reported Event", () => {
   const analysisTitle = "Arista Benefits From AI Networking Surge: Will Momentum Persist?";
   const compact = {
-    schemaVersion: 9, engineVersion: "0.5.11", buildRevision: "0.5.11", reportMode: "verbose",
+    schemaVersion: 9, engineVersion: "0.5.11.1", buildRevision: "0.5.11.1", reportMode: "verbose",
     generatedAt: "2026-08-19T23:12:33.774Z", session: "after_hours", marketContext: {}, calendars: null, news: {},
     decisionFramework: { aiCycle: {}, sectorScorecard: {} }, opportunityGate: { candidates: [] },
     researchSymbols: ["ANET"],
@@ -1390,7 +1468,7 @@ test("research packets reject unsourced support, resistance, target, and stop pr
 
 test("separate research audit deterministically renders negative net debt as net cash", () => {
   const audit = renderResearchAudit({
-    engineVersion: "0.5.11", buildRevision: "0.5.11",
+    engineVersion: "0.5.11.1", buildRevision: "0.5.11.1",
     opportunityGate: { researchCapacity: { filled: 1, target: 1 } },
     dataQuality: { discoveryFundamentals: { sourceFailures: 0 } },
     research: {
@@ -1448,7 +1526,7 @@ test("research-provider failures become incomplete packets without exposing the 
   assert.equal(result.report.aiProvider, "gemini");
   assert.equal(result.report.aiModel, "gemini-3.5-flash");
   assert.equal(result.report.reportMode, "standard");
-  assert.equal(result.report.reportEngineVersion, "0.5.11");
+  assert.equal(result.report.reportEngineVersion, "0.5.11.1");
   assert.equal(result.report.generation.validation, "passed");
   assert.equal(result.report.storage.stored, true);
 });
@@ -1679,8 +1757,8 @@ test("existing dated report prevents duplicate report generation but still evalu
 
   assert.deepEqual(result.report, {
     date: "2026-08-05",
-    engineVersion: "0.5.11",
-    buildRevision: "0.5.11",
+    engineVersion: "0.5.11.1",
+    buildRevision: "0.5.11.1",
     generated: false,
     stored: true,
     storage: null,

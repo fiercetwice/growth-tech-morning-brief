@@ -40,22 +40,22 @@ test("Worker accepts a trailing slash on the GPT read route", async () => {
 test("health exposes the deployed release for propagation-safe smoke tests", async () => {
   const response = await worker.fetch(new Request("https://example.test/health"), {});
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.11", buildRevision: "0.5.11" });
+  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.11.1", buildRevision: "0.5.11.1" });
 });
 
 test("build-specific report route rejects same-engine old builds without starting generation", async () => {
-  const current = await worker.fetch(new Request("https://example.test/run-report/v0.5.11/build/0.5.11", {
+  const current = await worker.fetch(new Request("https://example.test/run-report/v0.5.11.1/build/0.5.11.1", {
     method: "POST",
   }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
   assert.equal(current.status, 401);
 
-  const staleBuild = await worker.fetch(new Request("https://example.test/run-report/v0.5.11/build/0.5.7-hf5.2", {
+  const staleBuild = await worker.fetch(new Request("https://example.test/run-report/v0.5.11.1/build/0.5.11", {
     method: "POST",
   }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
   assert.equal(staleBuild.status, 404);
   assert.deepEqual(await staleBuild.json(), { error: "not_found" });
 
-  const engineOnly = await worker.fetch(new Request("https://example.test/run-report/v0.5.11", {
+  const engineOnly = await worker.fetch(new Request("https://example.test/run-report/v0.5.11.1", {
     method: "POST",
   }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
   assert.equal(engineOnly.status, 404);
@@ -80,5 +80,4 @@ test("post-deploy failures print actionable diagnostics before exiting", () => {
   assert.match(deployWorkflow, /echo "::error::\$failure"/);
   assert.match(deployWorkflow, /GITHUB_STEP_SUMMARY/);
 });
-
 
