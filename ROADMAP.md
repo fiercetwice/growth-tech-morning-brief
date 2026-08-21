@@ -98,6 +98,16 @@ The valuation score may improve candidate ranking but cannot independently suppo
 - Use the America/New_York report date consistently in Morning Brief and Research Audit headings.
 - Preserve regressions for the VRT catalyst-free Buy path and the ORCL/MSFT/GOOGL mixed-validity batch.
 
+## v0.5.11 — Thesis memory and recommendation stability
+
+- Load the latest validated research packet before each new research run and provide it as explicitly non-evidentiary thesis memory.
+- Block Buy-to-Watch and Watch-to-Buy changes when only model wording or strategic posture changes.
+- Permit action changes when company events, filing periods, reported inputs, target confidence/inputs, material valuation ranges, non-momentum risks, base-upside tiers, or executable price locations change.
+- Re-run remembered Buy theses through the current deterministic target, financial, catalyst, and zone gates; never preserve a Buy that no longer qualifies.
+- Expire remembered rerating paths after their stated 1Q or 2Q window.
+- Add Watchlist `Action Change / Reason` and `Rerating Path` columns, plus blocked model observations in Research Audit.
+- Cover VRT and AMZN intraday action drift, new-filing changes, and Buy-on-weakness to Buy-now zone transitions with deterministic regressions.
+
 ## v0.6.0 — Portfolio-aware decision layer
 
 - Incorporate existing position size, concentration, tax lots, and correlated exposures.

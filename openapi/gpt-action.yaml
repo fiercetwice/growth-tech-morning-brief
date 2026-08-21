@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Growth Tech Morning Brief API
   description: Read the latest saved Growth Tech morning brief or explicitly refresh its market snapshot.
-  version: 0.5.10.1
+  version: 0.5.11
 servers:
   - url: https://growth-tech-morning-brief.ck-market-tools.workers.dev
 paths:
