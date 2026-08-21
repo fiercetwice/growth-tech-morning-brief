@@ -98,6 +98,14 @@ The valuation score may improve candidate ranking but cannot independently suppo
 - Use the America/New_York report date consistently in Morning Brief and Research Audit headings.
 - Preserve regressions for the VRT catalyst-free Buy path and the ORCL/MSFT/GOOGL mixed-validity batch.
 
+## v0.5.11.1 — Active thesis and rerating-path quality hotfix
+
+- Preserve the last still-valid gate-qualified thesis separately from the latest model observation.
+- Revalidate and expire active theses against current valuation, financial, catalyst, risk, and price-location evidence.
+- Require measurable operating outcomes for 1Q/2Q rerating paths; reject generic event or valuation-target wording.
+- Label report paths as qualified versus model-proposed but not qualified.
+- Stabilize near-identical research queues by retaining prior symbols unless material new events outrank them.
+
 ## v0.5.11 — Thesis memory and recommendation stability
 
 - Load the latest validated research packet before each new research run and provide it as explicitly non-evidentiary thesis memory.

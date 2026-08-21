@@ -1,4 +1,4 @@
-# Growth Tech Morning Brief v0.5.11 — thesis memory and recommendation stability
+# Growth Tech Morning Brief v0.5.11.1 — active thesis and rerating-path quality hotfix
 
 Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/New_York without a paid FMP plan.
 
@@ -19,6 +19,8 @@ Cloudflare Worker that collects a Growth Tech market snapshot at 09:35 America/N
 Yahoo and Nasdaq endpoints are unofficial public web endpoints and can change or rate-limit access. Every context category carries source and freshness metadata, and a category failure never blocks the equity snapshot. The Federal Reserve feed is official, but its inclusion does not by itself imply that a policy item caused a stock move. SEC data is authoritative but issuers use differing XBRL tags; unavailable fields remain null rather than being invented. Analyst-consensus forward valuation, target prices, and estimate revisions are not included and remain explicitly unavailable; trailing-implied ranges are never labeled analyst targets.
 
 v0.5.10.1 isolates structured-research validation by ticker. Valid packets survive a bad batch peer, retries contain only failed symbols, and repeated validation diagnostics are deduplicated. Catalyst-free Buy recommendations now print the qualifying rerating trigger, and report/audit headings use the America/New_York report date.
+
+v0.5.11.1 separates the latest model observation from the last still-active gate-qualified thesis, so an intervening Watch packet cannot silently erase an earlier valid Buy thesis. The active thesis is revalidated against current inputs and expires or clears when material evidence changes. Rerating paths now require an operating metric plus an observable direction, threshold, or result; generic earnings, contract, catalyst, or base-value language no longer qualifies. Report output labels paths as `Qualified` or `Model-proposed, not qualified`, and near-identical research runs favor the prior queue unless a material new event outranks it.
 
 v0.5.11 adds cross-report thesis and action memory. The latest validated packet is supplied as non-evidentiary context to the next research pass, while deterministic hysteresis blocks Buy-to-Watch and Watch-to-Buy changes that are supported only by new model wording. A change is permitted when a company event, filing period, reported-growth input, target availability/confidence/input period, material valuation range, non-momentum risk flag, base-upside eligibility tier, or executable-zone location changes. Previous Buy theses are re-run against current deterministic gates and expire with their stated 1Q/2Q windows. Watchlist and Research Audit now expose the action transition, reason, complete rerating path, and any blocked model observation.
 
@@ -101,7 +103,7 @@ curl "https://growth-tech-morning-brief.ck-market-tools.workers.dev/latest" \
 
 ## GitHub Actions deployment
 
-The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets. Before the post-deploy report test, the workflow waits until `/health` reports the exact engine version and build revision. It then calls the build-specific `/run-report/v0.5.11/build/0.5.11` endpoint and retries only a 404 response, so a still-propagating older Worker cannot generate or overwrite the new report artifact.
+The `.github/workflows/cloudflare-worker.yml` workflow runs `npm test` for pull requests, pushes to `main`, and manual dispatches. Successful pushes to `main` and manual dispatches deploy the Worker with `npm run deploy` using the existing `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets. Before the post-deploy report test, the workflow waits until `/health` reports the exact engine version and build revision. It then calls the build-specific `/run-report/v0.5.11.1/build/0.5.11.1` endpoint and retries only a 404 response, so a still-propagating older Worker cannot generate or overwrite the new report artifact.
 
 
 ## AI provider router, report generation, and delivery
