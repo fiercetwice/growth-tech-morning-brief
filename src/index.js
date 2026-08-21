@@ -10,8 +10,8 @@ const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
-const SERVICE_VERSION = "0.5.10.1";
-const BUILD_REVISION = "0.5.10.1";
+const SERVICE_VERSION = "0.5.11";
+const BUILD_REVISION = "0.5.11";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -1418,7 +1418,8 @@ export async function generateAiReport(env, snapshot, override = null, options =
   compact.reportMode = selectedReportMode(env, options.reportMode);
   compact.engineVersion = SERVICE_VERSION;
   compact.buildRevision = BUILD_REVISION;
-  const research = await researchCandidates(env, route, compact);
+  const previousResearch = await loadPreviousResearch(env);
+  const research = applyThesisMemory(await researchCandidates(env, route, compact, previousResearch), previousResearch);
   const researchConsistency = validateResearchConsistency(research, compact.opportunityGate?.candidates ?? []);
   if (!researchConsistency.ok) throw new Error(`Research funnel consistency failed: ${researchConsistency.errors.join("; ")}`);
   research.storage = await storeResearchPackets(env, compact, research);
@@ -1444,7 +1445,7 @@ export async function generateAiReport(env, snapshot, override = null, options =
     generatedAt,
     validation: validation.ok ? "passed" : "failed",
     validationErrors: validation.errors.join("; "),
-    pipeline: "staged-research-deterministic-render-v1",
+    pipeline: "staged-research-deterministic-render-v2-thesis-memory",
     researchBatches: research.batches.length,
     researchComplete: research.funnel.researched,
     researchIncomplete: research.funnel.incomplete,
@@ -1464,15 +1465,18 @@ export async function generateAiReport(env, snapshot, override = null, options =
   return { markdown, auditMarkdown, provider, model, reportMode: synthesis.reportMode, research, metadata };
 }
 
-async function researchCandidates(env, route, compact) {
+async function researchCandidates(env, route, compact, previousResearch = null) {
   const candidates = (compact.opportunityGate?.candidates ?? []).slice(0, MAX_RESEARCH_CANDIDATES);
   const batchSize = Math.max(1, Math.min(5, Math.round(nonNegativeNumber(env.RESEARCH_BATCH_SIZE, DEFAULT_RESEARCH_BATCH_SIZE)) || DEFAULT_RESEARCH_BATCH_SIZE));
   const batches = [];
   for (let index = 0; index < candidates.length; index += batchSize) batches.push(candidates.slice(index, index + batchSize));
-  const results = await Promise.all(batches.map((batch, index) => researchCandidateBatch(env, route, compact, batch, index + 1)));
+  const previousBySymbol = new Map((previousResearch?.packets ?? []).map((packet) => [packet.symbol, packet]));
+  const results = await Promise.all(batches.map((batch, index) => researchCandidateBatch(
+    env, route, compact, batch, index + 1, batch.map((candidate) => previousBySymbol.get(candidate.symbol)).filter(Boolean),
+  )));
   const packets = results.flatMap((result) => result.packets);
   return {
-    schemaVersion: "candidate-research-v1",
+    schemaVersion: "candidate-research-v2",
     generatedAt: new Date().toISOString(),
     provider: route.provider,
     model: route.model,
@@ -1513,7 +1517,7 @@ export function validateResearchConsistency(research, candidates) {
   return { ok: errors.length === 0, errors };
 }
 
-async function researchCandidateBatch(env, route, compact, candidates, batchNumber) {
+async function researchCandidateBatch(env, route, compact, candidates, batchNumber, previousPackets = []) {
   const originalSymbols = candidates.map((row) => row.symbol);
   const packetBySymbol = new Map();
   const failuresBySymbol = new Map(candidates.map((candidate) => [candidate.symbol, []]));
@@ -1526,6 +1530,7 @@ async function researchCandidateBatch(env, route, compact, candidates, batchNumb
       batchNumber,
       retry: attempt > 1,
       validationErrors: validationErrors.join("; "),
+      previousPackets: previousPackets.filter((packet) => pending.some((candidate) => candidate.symbol === packet.symbol)),
     });
     const response = await requestAiReport(env, route, prompt, {
       maxTokens: positiveInteger(env.RESEARCH_MAX_TOKENS, DEFAULT_RESEARCH_MAX_TOKENS),
@@ -1584,6 +1589,255 @@ function uniqueMessages(values = []) {
   return [...new Set(values.filter(Boolean))];
 }
 
+function previousThesisPromptPacket(packet) {
+  return {
+    symbol: packet.symbol,
+    status: packet.status,
+    strategicPosition: packet.strategicPosition,
+    finalAction: packet.finalAction ?? packet.todayAction,
+    reratingPath: packet.reratingPath,
+    reratingHorizon: packet.reratingHorizon,
+    invalidation: packet.invalidation,
+    gateResult: packet.gateResult,
+    targetConfidence: packet.sourceSnapshot?.targetAndMispricing?.confidence,
+    targetInputAsOf: packet.sourceSnapshot?.targetAndMispricing?.inputAsOf,
+    catalystState: packet.sourceSnapshot?.setup?.catalystState,
+  };
+}
+
+async function loadPreviousResearch(env) {
+  if (!env.BRIEF_BUCKET?.get) return null;
+  try {
+    const object = await env.BRIEF_BUCKET.get("research/latest.json");
+    if (!object) return null;
+    const parsed = typeof object.json === "function" ? await object.json() : JSON.parse(await object.text());
+    return Array.isArray(parsed?.packets) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function applyThesisMemory(research, previousResearch) {
+  const previousBySymbol = new Map((previousResearch?.packets ?? []).map((packet) => [packet.symbol, packet]));
+  const packets = research.packets.map((current) => stabilizeResearchPacket(
+    current,
+    previousBySymbol.get(current.symbol),
+    research.generatedAt,
+    previousResearch?.generatedAt,
+  ));
+  const researched = packets.filter((packet) => packet.status === "complete").length;
+  const incomplete = packets.length - researched;
+  const gateQualified = packets.filter((packet) => packet.modelGateResult === "pass").length;
+  const recommendedActions = packets.filter((packet) => packet.gateResult === "pass" && ["Buy now", "Buy on weakness", "Sell"].includes(packet.finalAction)).length;
+  return {
+    ...research,
+    thesisMemory: {
+      status: previousResearch ? "available" : "unavailable",
+      previousGeneratedAt: previousResearch?.generatedAt ?? null,
+      stabilized: packets.filter((packet) => packet.actionMemory?.status === "model_only_change_blocked").length,
+    },
+    funnel: {
+      ...research.funnel,
+      researched,
+      incomplete,
+      gateQualified,
+      recommendedActions,
+      rejectedOrWatch: packets.length - recommendedActions,
+    },
+    packets,
+  };
+}
+
+function stabilizeResearchPacket(current, previous, currentGeneratedAt, previousGeneratedAt) {
+  const currentAction = current.finalAction ?? current.todayAction ?? "No action";
+  if (current.status !== "complete" || previous?.status !== "complete") {
+    return { ...current, actionMemory: initialActionMemory(currentAction, previous, previousGeneratedAt) };
+  }
+  const previousAction = previous.finalAction ?? previous.todayAction ?? "No action";
+  const changes = materialThesisChanges(previous, current);
+  if (reratingWindowExpired(previous, previousGeneratedAt, currentGeneratedAt)) changes.push("previous rerating window expired");
+  const priceChanges = priceEligibilityChanges(previous, current);
+  const baseMemory = {
+    previousGeneratedAt: previousGeneratedAt ?? null,
+    previousAction,
+    modelAction: currentAction,
+    finalAction: currentAction,
+    materialChanges: changes,
+    priceEligibilityChanges: priceChanges,
+  };
+  if (currentAction === previousAction) {
+    return { ...current, actionMemory: { ...baseMemory, status: "unchanged", reason: "Action unchanged from the previous comparable research packet." } };
+  }
+  if (isBuyAction(currentAction) && isBuyAction(previousAction)) {
+    return { ...current, actionMemory: { ...baseMemory, status: "price_location_change", reason: priceChanges.join("; ") || "Executable price location changed within an unchanged Buy thesis." } };
+  }
+  const buyWatchTransition = (isBuyAction(previousAction) && isWatchAction(currentAction))
+    || (isWatchAction(previousAction) && isBuyAction(currentAction));
+  if (!buyWatchTransition || changes.length || priceChanges.length) {
+    const reason = [...changes, ...priceChanges].join("; ") || "Action changed outside the Buy/Watch stability rule.";
+    return { ...current, actionMemory: { ...baseMemory, status: "evidence_change", reason } };
+  }
+  if (isBuyAction(previousAction)) {
+    const remembered = normalizeResearchPacket({
+      ...previous,
+      gateResult: previous.modelGateResult ?? previous.gateResult,
+      todayAction: previousAction,
+    }, current.sourceSnapshot);
+    if (remembered.gateResult === "pass" && isBuyAction(remembered.finalAction)) {
+      const reason = "Model-only downgrade blocked because no new company event, filing, target-input, risk, or price-eligibility evidence was supplied.";
+      const actionMemory = {
+        ...baseMemory,
+        status: "model_only_change_blocked",
+        finalAction: remembered.finalAction,
+        reason,
+        modelObservation: modelObservation(current),
+      };
+      return {
+        ...remembered,
+        actionMemory,
+        gateAudit: { ...remembered.gateAudit, actionStability: "blocked", actionStabilityReason: reason },
+      };
+    }
+    return {
+      ...current,
+      actionMemory: {
+        ...baseMemory,
+        status: "deterministic_gate_change",
+        reason: "Previous Buy thesis no longer clears the current deterministic valuation or evidence gate.",
+      },
+    };
+  }
+  const reason = "Model-only upgrade blocked because no new company event, filing, target-input, risk, or price-eligibility evidence was supplied.";
+  const gateAudit = {
+    ...current.gateAudit,
+    result: "fail",
+    finalAction: "Watch",
+    actionStability: "blocked",
+    actionStabilityReason: reason,
+  };
+  return {
+    ...current,
+    gateResult: "fail",
+    todayAction: "Watch",
+    finalAction: "Watch",
+    gateAudit,
+    gateReason: structuredGateReason(gateAudit),
+    actionMemory: { ...baseMemory, status: "model_only_change_blocked", finalAction: "Watch", reason, modelObservation: modelObservation(current) },
+  };
+}
+
+function initialActionMemory(currentAction, previous, previousGeneratedAt) {
+  return {
+    previousGeneratedAt: previousGeneratedAt ?? null,
+    previousAction: previous ? previous.finalAction ?? previous.todayAction ?? "No action" : "Unavailable",
+    modelAction: currentAction,
+    finalAction: currentAction,
+    materialChanges: [],
+    priceEligibilityChanges: [],
+    status: previous ? "not_comparable" : "initial",
+    reason: previous ? "Previous research packet was incomplete and is not comparable." : "No previous comparable research packet.",
+  };
+}
+
+function modelObservation(packet) {
+  return {
+    strategicPosition: packet.strategicPosition,
+    modelGateResult: packet.modelGateResult,
+    gateResult: packet.gateResult,
+    finalAction: packet.finalAction ?? packet.todayAction,
+    reratingPath: packet.reratingPath,
+    reratingHorizon: packet.reratingHorizon,
+    evidenceAgainstCount: packet.evidenceAgainst?.length ?? 0,
+    missingEvidenceCount: packet.missingEvidence?.length ?? 0,
+  };
+}
+
+function isBuyAction(action) {
+  return ["Buy now", "Buy on weakness"].includes(action);
+}
+
+function isWatchAction(action) {
+  return ["Watch", "No action"].includes(action);
+}
+
+function materialThesisChanges(previous, current) {
+  const changes = [];
+  const prior = previous.sourceSnapshot ?? {};
+  const next = current.sourceSnapshot ?? {};
+  const priorCatalyst = prior.setup?.catalystState ?? legacyCatalystState(prior.setup);
+  const nextCatalyst = next.setup?.catalystState ?? legacyCatalystState(next.setup);
+  if (JSON.stringify(catalystSignature(priorCatalyst)) !== JSON.stringify(catalystSignature(nextCatalyst))) changes.push("company-event or catalyst state changed");
+  const priorAsOf = fundamentalAsOf(prior);
+  const nextAsOf = fundamentalAsOf(next);
+  if (priorAsOf !== nextAsOf && (priorAsOf || nextAsOf)) changes.push(`fundamental period changed (${priorAsOf ?? "unavailable"} → ${nextAsOf ?? "unavailable"})`);
+  if (JSON.stringify(growthSignature(prior.reportedGrowth)) !== JSON.stringify(growthSignature(next.reportedGrowth))) changes.push("reported growth inputs changed");
+  const priorTarget = prior.targetAndMispricing ?? {};
+  const nextTarget = next.targetAndMispricing ?? {};
+  if (priorTarget.status !== nextTarget.status) changes.push(`target availability changed (${priorTarget.status ?? "unavailable"} → ${nextTarget.status ?? "unavailable"})`);
+  if (priorTarget.confidence !== nextTarget.confidence) changes.push(`target confidence changed (${priorTarget.confidence ?? "Unavailable"} → ${nextTarget.confidence ?? "Unavailable"})`);
+  if (priorTarget.inputAsOf !== nextTarget.inputAsOf && (priorTarget.inputAsOf || nextTarget.inputAsOf)) changes.push("target input period changed");
+  if (["bearValue", "baseValue", "bullValue"].some((field) => materiallyDifferent(priorTarget[field], nextTarget[field], 0.05))) changes.push("modeled valuation range changed by at least 5%");
+  const priorRisk = stableRisk(prior.risk);
+  const nextRisk = stableRisk(next.risk);
+  if (priorRisk !== nextRisk && (priorRisk || nextRisk)) changes.push("non-momentum risk flags changed");
+  return uniqueMessages(changes);
+}
+
+function priceEligibilityChanges(previous, current) {
+  const changes = [];
+  const prior = previous.sourceSnapshot ?? {};
+  const next = current.sourceSnapshot ?? {};
+  const priorTarget = prior.targetAndMispricing;
+  const nextTarget = next.targetAndMispricing;
+  if (upsideTier(priorTarget?.baseUpsidePercent) !== upsideTier(nextTarget?.baseUpsidePercent)) changes.push("base-upside eligibility tier changed");
+  const priorInZone = inSuggestedZone(prior.price, priorTarget?.buyZones);
+  const nextInZone = inSuggestedZone(next.price, nextTarget?.buyZones);
+  if (priorInZone !== null && nextInZone !== null && priorInZone !== nextInZone) changes.push(nextInZone ? "price entered the suggested buy zone" : "price moved above the suggested buy zone");
+  return changes;
+}
+
+function catalystSignature(state = {}) {
+  return { status: state.status ?? null, direction: state.direction ?? null, verified: state.verified === true, evidence: state.evidence?.id ?? state.evidence?.url ?? state.evidence?.title ?? null };
+}
+
+function fundamentalAsOf(snapshot) {
+  return snapshot.reportedGrowth?.asOf ?? snapshot.valuation?.fundamentalAsOf ?? snapshot.fundamentals?.asOf ?? null;
+}
+
+function growthSignature(growth = {}) {
+  return Object.fromEntries(["revenueTtmYoY", "revenueLatestQuarterYoY", "epsTtmYoY", "epsLatestQuarterYoY"].map((field) => [field, growth?.[field] ?? null]));
+}
+
+function materiallyDifferent(left, right, threshold) {
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return Number.isFinite(left) !== Number.isFinite(right);
+  return Math.abs(left - right) / Math.max(Math.abs(left), 1) >= threshold;
+}
+
+function stableRisk(value) {
+  return String(value ?? "").split(";").map((part) => part.trim()).filter((part) => part && !/momentum/i.test(part)).sort().join("; ");
+}
+
+function upsideTier(value) {
+  if (!Number.isFinite(value)) return "unavailable";
+  if (value >= 30) return "30+";
+  if (value >= 20) return "20-30";
+  if (value >= 10) return "10-20";
+  if (value >= 5) return "5-10";
+  return "below-5";
+}
+
+function inSuggestedZone(price, zones) {
+  return Number.isFinite(price) && zones?.status === "available" && Number.isFinite(zones.suggested?.high) ? price <= zones.suggested.high : null;
+}
+
+function reratingWindowExpired(packet, previousGeneratedAt, currentGeneratedAt) {
+  const maximumDays = packet.reratingHorizon === "1Q" ? 100 : packet.reratingHorizon === "2Q" ? 190 : null;
+  const previous = new Date(previousGeneratedAt ?? NaN).getTime();
+  const current = new Date(currentGeneratedAt ?? NaN).getTime();
+  return Number.isFinite(maximumDays) && Number.isFinite(previous) && Number.isFinite(current)
+    && current - previous > maximumDays * 86_400_000;
+}
+
 function candidateResearchPrompt(compact, candidates, options = {}) {
   const candidateSymbols = new Set(candidates.map((candidate) => candidate.symbol));
   const earnings = compact.calendars?.earnings;
@@ -1596,12 +1850,15 @@ function candidateResearchPrompt(compact, candidates, options = {}) {
     `Analyze only these batch symbols: ${[...candidateSymbols].join(", ")}. Do not place any other equity ticker in candidate fields; non-candidate market facts are context only.`,
     "Discovery names cannot pass the action gate when valuation, fundamentals, liquidity context, or a directionally verified fresh company catalyst is missing.",
     "Price movement alone may support Watch, never Buy/Sell. A core name without same-day news may support a value call only when the supplied target engine has Medium/High confidence, at least 20% base upside, complete financial evidence, and you state a testable rerating path within 1Q or 2Q. Discovery names still require a directionally verified fresh catalyst.",
+    "Previous research is thesis memory, not new evidence. If strategicPosition, todayAction, or gateResult changes, the change must be supported by new supplied company-event, filing, target-input, risk, or executable price-location evidence; different wording alone is not evidence.",
     "Use the supplied deterministic trailing-implied target values exactly. They are not analyst targets. The valuation adjustment may affect ranking and action preference but cannot bypass financial, risk, liquidity, catalyst, or rerating-path gates.",
     "Without supplied portfolio holdings and target weights, extremeTrim is a valuation-risk flag only: use Watch, never Review position size or Trim.",
     "Return {\"candidates\":[...]} with exactly one object per supplied symbol and these fields:",
     "symbol, catalystSummary, evidenceFor (array), evidenceAgainst (array), mispricingThesis, strategicPosition (Buy/Hold/Avoid), todayAction (Buy now/Buy on weakness/Sell/Review position size/Watch/No action), confidence (High/Medium/Low), entryExitCondition, riskReward, invalidation, reratingPath, reratingHorizon (1Q/2Q/Unavailable), missingEvidence (array), sourceQuality, gateResult (pass/fail), gateReason.",
     "Do not invent target, support, resistance, stop, or entry prices. A dollar-denominated price may appear in entryExitCondition, invalidation, riskReward, or mispricingThesis only when it exactly matches a supplied current, 52-week, bear/base/bull, valuation-threshold, suggested-zone, or stronger-zone price.",
     options.retry ? `Repair the previous failure exactly: ${options.validationErrors}` : "",
+    options.previousPackets?.length ? "Previous research memory:" : "",
+    options.previousPackets?.length ? JSON.stringify(options.previousPackets.map(previousThesisPromptPacket)) : "",
     `Batch: ${options.batchNumber}`,
     "Market context:",
     JSON.stringify({
@@ -1742,10 +1999,12 @@ export function normalizeResearchPacket(packet, candidate) {
       valuation: candidate.valuation,
       targetAndMispricing: candidate.targetAndMispricing,
       reportedGrowth: candidate.reportedGrowth,
-      fundamentals: candidate.fundamentals,
-      fundamentalCoverage: candidate.fundamentalCoverage,
+    fundamentals: candidate.fundamentals,
+    fundamentalCoverage: candidate.fundamentalCoverage,
+      fundamentalCacheStatus: candidate.fundamentalCacheStatus,
       setup: candidate.setup,
       news: candidate.news,
+      risk: candidate.risk,
     },
   };
 }
@@ -1765,6 +2024,7 @@ function structuredGateReason(audit, flags = {}) {
     researchEvidence,
     audit.strategicPosition ? `strategic position ${audit.strategicPosition}` : null,
     audit.strategicPositionAligned === false ? "strategic position is inconsistent with the requested trade action" : null,
+    audit.actionStability === "blocked" ? `action change blocked: ${audit.actionStabilityReason}` : null,
     flags.discoveryBlocked ? "discovery evidence incomplete" : null,
     flags.unsupportedPortfolioAction ? "portfolio inputs unavailable" : null,
     audit.result === "pass" ? `action ${audit.finalAction}` : null,
@@ -1908,6 +2168,7 @@ export function synthesisContext(compact, research) {
     contextOnlySymbols,
     research: {
       schemaVersion: research.schemaVersion,
+      thesisMemory: research.thesisMemory,
       funnel: research.funnel,
       batches: research.batches,
       packets: research.packets,
@@ -1937,6 +2198,9 @@ export function synthesisContext(compact, research) {
           ? "Wait"
           : packetBySymbol.get(row.symbol)?.finalAction ?? packetBySymbol.get(row.symbol)?.todayAction ?? "Wait",
       recommendationGateResult: recommendationGateResult(packetBySymbol.get(row.symbol), researchSet.has(row.symbol)),
+      actionMemory: packetBySymbol.get(row.symbol)?.actionMemory,
+      reratingPath: packetBySymbol.get(row.symbol)?.reratingPath,
+      reratingHorizon: packetBySymbol.get(row.symbol)?.reratingHorizon,
       researchStatus: researchSet.has(row.symbol) ? "researched" : "not_researched_today",
     })),
   };
@@ -2018,8 +2282,8 @@ export function renderMorningBrief(compact, identity = {}) {
     ...sectorRows.map(([sector, row]) => `| ${tableCell(sector)} | ${tableCell(row.fundamentals)} | ${tableCell(row.valuation)} | ${tableCell(row.momentum)} | ${tableCell(row.stance)} | ${tableCell(sectorEvidence(row))} |`),
     "",
     "# Watchlist",
-    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Implied Value (Bear/Base/Bull) | Base Upside / Bear-Case Return | Valuation Threshold | Suggested Buy Target / Buy Zone | Valuation Signal | Catalyst | Risk | Final Action | Recommendation Gate Result | Research Status |",
-    "|---|---:|---:|---:|---|---:|---|---|---|---|---|---|---|---|---|---|",
+    "| Symbol | Price | Daily Change | 52-Week Position | Valuation | Trailing 5Y Percentile | Implied Value (Bear/Base/Bull) | Base Upside / Bear-Case Return | Valuation Threshold | Suggested Buy Target / Buy Zone | Valuation Signal | Catalyst | Risk | Final Action | Action Change / Reason | Rerating Path | Recommendation Gate Result | Research Status |",
+    "|---|---:|---:|---:|---|---:|---|---|---|---|---|---|---|---|---|---|---|---|",
     ...(compact.watchlist ?? []).map((row) => renderWatchlistRow(row)),
   ];
   return lines.join("\n");
@@ -2177,6 +2441,7 @@ export function renderResearchAudit(compact, identity = {}) {
   const capacity = compact.opportunityGate?.researchCapacity ?? {};
   const missing = materialMissingFields(packets);
   const sourceFailures = compact.dataQuality?.discoveryFundamentals?.sourceFailures ?? 0;
+  const thesisMemory = compact.research?.thesisMemory ?? {};
   const lines = [
     `# Growth Tech Research Audit — ${reportDateFor(identity.generatedAt ?? compact.generatedAt)}`,
     "",
@@ -2186,6 +2451,7 @@ export function renderResearchAudit(compact, identity = {}) {
     `**Report Content SHA-256:** ${identity.contentHash ?? "unavailable"}`,
     "",
     `**Funnel:** screened=${funnel.screened ?? "unavailable"}; admitted=${funnel.admitted ?? 0}; researched=${funnel.researched ?? 0}; incomplete=${funnel.incomplete ?? 0}; gateQualified=${funnel.gateQualified ?? 0}; recommendedActions=${funnel.recommendedActions ?? 0}; rejectedOrWatch=${funnel.rejectedOrWatch ?? 0}`,
+    `**Thesis Memory:** ${thesisMemory.status ?? "unavailable"}; previous=${thesisMemory.previousGeneratedAt ?? "unavailable"}; model-only action changes blocked=${thesisMemory.stabilized ?? 0}.`,
     `**Packet Completion:** capacity=${capacity.filled ?? packets.length}/${capacity.target ?? packets.length}; generated packets are not described as complete fields.`,
     `**Field Completeness:** ${fieldCompletenessSummary(packets)}`,
     `**Material Missing Fields:** ${missing.length ? missing.join("; ") : "None in the deterministic required-field set."}`,
@@ -2195,10 +2461,13 @@ export function renderResearchAudit(compact, identity = {}) {
     "## Research Packets",
   ];
   for (const packet of packets) {
-    lines.push(
+    lines.push(...[
       `### ${packet.symbol} — ${packet.todayAction ?? "No action"}`,
       `- Status: ${packet.status}; model gate=${packet.modelGateResult ?? "unavailable"}; recommended action=${packet.gateResult === "pass" ? "yes" : "no"}.`,
       `- Deterministic gate: ${cleanReportText(recommendationGateResult(packet, true))}.`,
+      `- Action memory: ${cleanReportText(actionMemoryDisplay(packet.actionMemory))}.`,
+      `- Rerating path: ${cleanReportText(reratingPathDisplay(packet))}.`,
+      packet.actionMemory?.modelObservation ? `- Blocked model observation: ${cleanReportText(JSON.stringify(packet.actionMemory.modelObservation))}.` : null,
       `- Model catalyst analysis: ${cleanReportText(packet.catalystSummary)}`,
       `- Deterministic invalidation: ${cleanReportText(packet.invalidation)}`,
       `- Model invalidation (non-authoritative): ${cleanReportText(packet.modelInvalidation)}`,
@@ -2207,7 +2476,7 @@ export function renderResearchAudit(compact, identity = {}) {
       `- Evidence against: ${normalizedEvidenceAgainst(packet).join("; ") || "unavailable"}.`,
       `- Missing evidence: ${(packet.missingEvidence ?? []).map(cleanReportText).join("; ") || "none stated"}.`,
       "",
-    );
+    ].filter((line) => line !== null));
   }
   return lines.join("\n").trim();
 }
@@ -2227,7 +2496,23 @@ function renderWatchlistRow(row) {
   const buyZone = availableTarget ? executableBuyZoneDisplay(row, target) : "unavailable";
   const signal = availableTarget ? `${target.valuationAdjustment >= 0 ? "+" : ""}${target.valuationAdjustment} ${target.valuationLabel}; ${target.confidence}; consensus unavailable` : `${target?.confidence ?? "Unavailable"}; consensus unavailable`;
   const catalyst = row.catalystState ? catalystFor(row.catalystState) : row.catalyst;
-  return `| ${tableCell(row.symbol)} | ${money(row.price)} | ${percent(row.changePercent, true)} | ${percent(row.positionIn52WeekRange)} | ${trailing}; ${forward} | ${percent(valuation?.selectedPercentile)} | ${tableCell(values)} | ${tableCell(upsideRisk)} | ${tableCell(preferredEntry)} | ${tableCell(buyZone)} | ${tableCell(signal)} | ${tableCell(catalyst)} | ${tableCell(row.risk)} | ${finalAction} | ${tableCell(row.recommendationGateResult)} | ${row.researchStatus === "not_researched_today" ? "Not researched today" : "Researched"} |`;
+  return `| ${tableCell(row.symbol)} | ${money(row.price)} | ${percent(row.changePercent, true)} | ${percent(row.positionIn52WeekRange)} | ${trailing}; ${forward} | ${percent(valuation?.selectedPercentile)} | ${tableCell(values)} | ${tableCell(upsideRisk)} | ${tableCell(preferredEntry)} | ${tableCell(buyZone)} | ${tableCell(signal)} | ${tableCell(catalyst)} | ${tableCell(row.risk)} | ${finalAction} | ${tableCell(actionMemoryDisplay(row.actionMemory))} | ${tableCell(reratingPathDisplay(row))} | ${tableCell(row.recommendationGateResult)} | ${row.researchStatus === "not_researched_today" ? "Not researched today" : "Researched"} |`;
+}
+
+function actionMemoryDisplay(memory) {
+  if (!memory) return "Unavailable — no comparable action memory";
+  const transition = memory.previousAction && memory.previousAction !== "Unavailable"
+    ? `${memory.previousAction} → ${memory.finalAction}`
+    : `Initial → ${memory.finalAction}`;
+  if (memory.status === "model_only_change_blocked") return `${transition}; proposed ${memory.modelAction} blocked — ${memory.reason}`;
+  if (memory.status === "unchanged") return `${transition}; unchanged`;
+  return `${transition}; ${memory.reason}`;
+}
+
+function reratingPathDisplay(row) {
+  const path = String(row?.reratingPath ?? "").trim();
+  if (!path || path === "Unavailable" || !["1Q", "2Q"].includes(row?.reratingHorizon)) return "Unavailable";
+  return `${row.reratingHorizon ?? "horizon unavailable"} — ${path}`;
 }
 
 function targetAuditDisplay(target) {
@@ -2630,7 +2915,7 @@ function parseMarkdownTable(section) {
 }
 
 function validateWatchlistTable(section, compact, errors) {
-  const expectedHeaders = ["Symbol", "Price", "Daily Change", "52-Week Position", "Valuation", "Trailing 5Y Percentile", "Implied Value (Bear/Base/Bull)", "Base Upside / Bear-Case Return", "Valuation Threshold", "Suggested Buy Target / Buy Zone", "Valuation Signal", "Catalyst", "Risk", "Final Action", "Recommendation Gate Result", "Research Status"];
+  const expectedHeaders = ["Symbol", "Price", "Daily Change", "52-Week Position", "Valuation", "Trailing 5Y Percentile", "Implied Value (Bear/Base/Bull)", "Base Upside / Bear-Case Return", "Valuation Threshold", "Suggested Buy Target / Buy Zone", "Valuation Signal", "Catalyst", "Risk", "Final Action", "Action Change / Reason", "Rerating Path", "Recommendation Gate Result", "Research Status"];
   const table = parseMarkdownTable(section);
   const normalizedHeaders = table.headers.map(normalizeCell);
   for (const header of expectedHeaders) if (!normalizedHeaders.includes(normalizeCell(header))) errors.push(`Watchlist missing column: ${header}`);
@@ -2657,6 +2942,12 @@ function validateWatchlistTable(section, compact, errors) {
     }
     if (expected.recommendationGateResult && normalizeCell(row[normalizedHeaders.indexOf(normalizeCell("Recommendation Gate Result"))]) !== normalizeCell(expected.recommendationGateResult)) {
       errors.push(`Watchlist changed Recommendation Gate Result: ${expected.symbol}`);
+    }
+    if (normalizeCell(row[normalizedHeaders.indexOf(normalizeCell("Action Change / Reason"))]) !== normalizeCell(actionMemoryDisplay(expected.actionMemory))) {
+      errors.push(`Watchlist changed Action Change / Reason: ${expected.symbol}`);
+    }
+    if (normalizeCell(row[normalizedHeaders.indexOf(normalizeCell("Rerating Path"))]) !== normalizeCell(reratingPathDisplay(expected))) {
+      errors.push(`Watchlist changed Rerating Path: ${expected.symbol}`);
     }
     const expectedCatalyst = expected.catalystState ? catalystFor(expected.catalystState) : expected.catalyst;
     if (expectedCatalyst && normalizeCell(row[normalizedHeaders.indexOf(normalizeCell("Catalyst"))]) !== normalizeCell(expectedCatalyst)) {
