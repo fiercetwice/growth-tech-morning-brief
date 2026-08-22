@@ -56,43 +56,133 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-      # v0.5.11.2: deployment verification must never generate or deliver a report.
-      # Calling /run-report here caused an additional production report generation and
-      # Discord delivery on every push to main. Keep deploy verification read-only.
-      - name: Verify deployed Worker health
+      - name: Run post-deploy report test
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
+          RUN_TOKEN: ${{ secrets.RUN_TOKEN }}
           WORKER_URL: https://growth-tech-morning-brief.ck-market-tools.workers.dev
         run: |
+          if [ -z "$RUN_TOKEN" ]; then
+            echo "::error::The RUN_TOKEN GitHub Actions secret is not configured."
+            exit 1
+          fi
+
           expected_version="$(jq -r '.version' package.json)"
           expected_build_revision="$(jq -r '.buildRevision' package.json)"
-
           for attempt in $(seq 1 24); do
             health="$(curl --fail --silent --show-error \
               --connect-timeout 10 \
               --max-time 30 \
               "$WORKER_URL/health" || true)"
-
             deployed_version="$(jq -r '.version // empty' <<< "$health" 2>/dev/null || true)"
             deployed_build_revision="$(jq -r '.buildRevision // empty' <<< "$health" 2>/dev/null || true)"
-
             if [ "$deployed_version" = "$expected_version" ] && [ "$deployed_build_revision" = "$expected_build_revision" ]; then
-              echo "Worker health check passed: v$deployed_version build $deployed_build_revision"
-              {
-                echo "### Post-deploy smoke test"
-                echo "- ✅ Worker health endpoint is active."
-                echo "- ✅ Version: $deployed_version"
-                echo "- ✅ Build revision: $deployed_build_revision"
-                echo "- ✅ No report generation or Discord delivery was triggered by deployment."
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
+              break
             fi
-
             if [ "$attempt" = "24" ]; then
               echo "::error::Worker v$expected_version build $expected_build_revision did not become active before the smoke-test deadline."
-              echo "Last health response: $health"
               exit 1
             fi
-
             sleep 5
           done
+
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          report_url="$WORKER_URL/run-report/v$expected_version/build/$expected_build_revision"
+          http_status=""
+          for attempt in $(seq 1 24); do
+            if ! http_status="$(curl --silent --show-error \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              --connect-timeout 15 \
+              --max-time 300 \
+              --request POST \
+              --url "$report_url" \
+              --header "Authorization: Bearer $RUN_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data '{
+                "regenerateOnBuildMismatch": true,
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "reportMode": "verbose"
+              }')"; then
+              echo "::error::The build-specific /run-report request failed before receiving an HTTP response."
+              exit 1
+            fi
+            if [ "$http_status" = "404" ] && [ "$attempt" != "24" ]; then
+              sleep 5
+              continue
+            fi
+            break
+          done
+
+          if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+            echo "::error::The build-specific /run-report request failed (HTTP ${http_status:-unknown})."
+            if jq -e . "$response_file" > /dev/null 2>&1; then
+              jq '{ error, message, reportError: .report.error, webhook: .report.webhook }' "$response_file"
+            else
+              echo "The Worker returned a non-JSON response ($(wc -c < "$response_file") bytes)."
+            fi
+            exit 1
+          fi
+
+          if ! jq -e . "$response_file" > /dev/null 2>&1; then
+            echo "::error::The build-specific /run-report request returned invalid JSON (HTTP $http_status, $(wc -c < "$response_file") bytes)."
+            exit 1
+          fi
+          response="$(< "$response_file")"
+
+          summary="$(jq '{
+            date: .report.date,
+            generated: .report.generated,
+            stored: .report.stored,
+            aiProvider: .report.aiProvider,
+            aiModel: .report.aiModel,
+            reportMode: .report.reportMode,
+            reportEngineVersion: .report.reportEngineVersion,
+            reportBuildRevision: .report.reportBuildRevision,
+            reportId: .report.reportId,
+            contentHash: .report.contentHash,
+            validation: .report.generation.validation,
+            research: .report.research,
+            discoveryFundamentals: .snapshot.discovery.fundamentalsCoverage,
+            eventLedger: {schemaVersion: .snapshot.eventLedger.schemaVersion, events: (.snapshot.eventLedger.events | length), new: (.snapshot.eventLedger.delta.new | length)},
+            storage: .report.storage,
+            webhook: .report.webhook
+          }' <<< "$response")"
+          echo "$summary"
+          {
+            echo "### Post-deploy report smoke test"
+            echo '```json'
+            echo "$summary"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failures="$(jq -r --arg expected_version "$expected_version" --arg expected_build_revision "$expected_build_revision" '
+            if (.report.generated != true and .report.reused != true) then
+              ["Report generation did not complete: \(.report.error // "no error reported"); storage and Discord delivery were not attempted"]
+            else [
+              if .report.stored == true then empty else "Generated report was not stored" end,
+              if .report.aiProvider == "deepseek" then empty else "Unexpected AI provider: \(.report.aiProvider // "missing")" end,
+              if .report.aiModel == "deepseek-v4-flash" then empty else "Unexpected AI model: \(.report.aiModel // "missing")" end,
+              if .report.reportMode == "verbose" then empty else "Unexpected report mode: \(.report.reportMode // "missing")" end,
+              if .report.reportEngineVersion == $expected_version then empty else "Stale report engine: expected \($expected_version), received \(.report.reportEngineVersion // "missing")" end,
+              if .report.reportBuildRevision == $expected_build_revision then empty else "Stale report build: expected \($expected_build_revision), received \(.report.reportBuildRevision // "missing")" end,
+              if .report.generation.validation == "passed" then empty else "Report validation failed: \(.report.generation.validation // "missing")" end,
+              if .snapshot.eventLedger.schemaVersion == "event-ledger-v1" then empty else "Event ledger was not stored in the snapshot contract" end,
+              if .report.reused == true or ((.report.research.admitted == (.report.research.researched + .report.research.incomplete)) and (.report.research.admitted == (.report.research.recommendedActions + .report.research.rejectedOrWatch)) and (.report.research.gateQualified >= .report.research.recommendedActions)) then empty else "Research funnel invariant failed: \(.report.research)" end,
+              if (.snapshot.discovery.fundamentalsCoverage.total == ((.snapshot.discovery.fundamentalsCoverage.available // 0) + (.snapshot.discovery.fundamentalsCoverage.unavailable // 0) + (.snapshot.discovery.fundamentalsCoverage.sourceFailures // 0) + (.snapshot.discovery.fundamentalsCoverage.mappingMissing // 0))) then empty else "Discovery fundamental coverage totals are inconsistent" end,
+              if .report.webhook.sent == true or (.report.webhook.skipped == true and .report.webhook.reason == "discord_already_delivered") then empty else "Discord delivery incomplete: \(.report.webhook.chunks.delivered // 0)/\(.report.webhook.chunks.expected // "unknown") deliveries completed; \(.report.webhook.error // .report.webhook.reason // "no error reported")" end,
+              if (.report.contentHash == .report.storage.contentHash) and (.report.contentHash == (.report.webhook.fingerprint // .report.webhook.receipt.fingerprint)) then empty else "Report identity mismatch across generation, R2, and Discord: generated=\(.report.contentHash // "missing") stored=\(.report.storage.contentHash // "missing") delivered=\(.report.webhook.fingerprint // .report.webhook.receipt.fingerprint // "missing")" end
+            ] end | .[]' <<< "$response")"
+
+          if [ -n "$failures" ]; then
+            while IFS= read -r failure; do
+              echo "::error::$failure"
+              echo "- ❌ $failure" >> "$GITHUB_STEP_SUMMARY"
+            done <<< "$failures"
+            exit 1
+          fi
+
+          echo "Post-deploy report test passed."
+          echo "- ✅ All generation, storage, schema, and delivery checks passed." >> "$GITHUB_STEP_SUMMARY"
