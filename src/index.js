@@ -11,7 +11,7 @@ const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
 const SERVICE_VERSION = "0.5.11.1";
-const BUILD_REVISION = "0.5.11.1";
+const BUILD_REVISION = "0.5.11.1-hf1";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -3004,7 +3004,7 @@ function validateWatchlistTable(section, compact, errors) {
       errors.push(`Watchlist changed Rerating Path: ${expected.symbol}`);
     }
     const expectedCatalyst = expected.catalystState ? catalystFor(expected.catalystState) : expected.catalyst;
-    if (expectedCatalyst && normalizeCell(row[normalizedHeaders.indexOf(normalizeCell("Catalyst"))]) !== normalizeCell(expectedCatalyst)) {
+    if (expectedCatalyst && normalizeCell(row[normalizedHeaders.indexOf(normalizeCell("Catalyst"))]) !== normalizeCell(tableCell(expectedCatalyst))) {
       errors.push(`Watchlist changed deterministic catalyst state: ${expected.symbol}`);
     }
     validateRenderedTarget(row, normalizedHeaders, expected, errors);
