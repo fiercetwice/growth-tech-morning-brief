@@ -11,7 +11,7 @@ const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEFAULT_AI_PROVIDER = "gemini";
 const SERVICE_VERSION = "0.5.11.1";
-const BUILD_REVISION = "0.5.11.1-hf1";
+const BUILD_REVISION = "0.5.11.1-hf2";
 const RESEND_EMAILS = "https://api.resend.com/emails";
 const HISTORY_YEARS = 5;
 const REQUIRED_REPORT_SECTIONS = [
@@ -149,12 +149,13 @@ export default {
         const options = await request.json().catch(() => ({}));
         const routeOverride = requestedAiRoute(options);
         const reportMode = requestedReportMode(options);
-        if ((routeOverride || reportMode) && options?.forceRegenerate !== true) {
-          return json({ error: "force_regenerate_required", message: "provider/model/reportMode overrides require forceRegenerate=true" }, 400);
+        if ((routeOverride || reportMode) && options?.forceRegenerate !== true && options?.regenerateOnBuildMismatch !== true) {
+          return json({ error: "regeneration_policy_required", message: "provider/model/reportMode overrides require forceRegenerate=true or regenerateOnBuildMismatch=true" }, 400);
         }
         return json(await runReportNow(env, new Date(), {
           forceDelivery: options?.forceDelivery === true,
           forceRegenerate: options?.forceRegenerate === true,
+          regenerateOnBuildMismatch: options?.regenerateOnBuildMismatch === true,
           aiRoute: routeOverride,
           reportMode,
         }));
@@ -183,6 +184,7 @@ export async function runReportNow(env, now = new Date(), options = {}) {
   const report = await generateOrDeliverReport(env, now, {
     forceDelivery: options.forceDelivery === true,
     forceRegenerate: options.forceRegenerate === true,
+    regenerateOnBuildMismatch: options.regenerateOnBuildMismatch === true,
     aiRoute: options.aiRoute,
     reportMode: options.reportMode,
   });
@@ -197,15 +199,33 @@ async function generateOrDeliverReport(env, now, options = {}) {
   const reportResults = { date: reportDate, engineVersion: SERVICE_VERSION, buildRevision: BUILD_REVISION, generated: false, stored: false, storage: null, email: null, webhook: null };
   try {
     let reportMarkdown;
-    if (reportObject && !options.forceRegenerate) {
+    const storedMetadata = reportObject?.customMetadata ?? {};
+    const storedIdentityMatches = reportObjectMatchesRequest(storedMetadata, options);
+    const regenerateForMismatch = options.regenerateOnBuildMismatch === true && !storedIdentityMatches;
+    const shouldRegenerate = options.forceRegenerate === true || regenerateForMismatch;
+    if (reportObject && !shouldRegenerate) {
       reportMarkdown = await reportObject.text();
       reportResults.reused = true;
-      reportResults.reportMode = reportObject.customMetadata?.reportMode ?? "unknown";
-      reportResults.reportEngineVersion = reportObject.customMetadata?.engineVersion ?? "unknown";
-      reportResults.reportBuildRevision = reportObject.customMetadata?.buildRevision ?? "unknown";
-      reportResults.reportId = reportObject.customMetadata?.reportId ?? "unknown";
-      reportResults.contentHash = reportObject.customMetadata?.contentHash ?? "unknown";
+      reportResults.reportMode = storedMetadata.reportMode ?? "unknown";
+      reportResults.reportEngineVersion = storedMetadata.engineVersion ?? "unknown";
+      reportResults.reportBuildRevision = storedMetadata.buildRevision ?? "unknown";
+      reportResults.reportId = storedMetadata.reportId ?? "unknown";
+      reportResults.contentHash = storedMetadata.contentHash ?? "unknown";
       reportResults.stored = true;
+      if (options.regenerateOnBuildMismatch === true) {
+        reportResults.aiProvider = storedMetadata.aiProvider ?? "unknown";
+        reportResults.aiModel = storedMetadata.aiModel ?? "unknown";
+        reportResults.generation = { validation: storedMetadata.validation ?? "unknown", reused: true };
+        reportResults.storage = {
+          stored: true,
+          reused: true,
+          datedKey: `reports/${reportDate}.md`,
+          latestKey: "reports/latest.md",
+          reportId: reportResults.reportId,
+          contentHash: reportResults.contentHash,
+          buildRevision: reportResults.reportBuildRevision,
+        };
+      }
     } else {
       const latestObject = await env.BRIEF_BUCKET.get("snapshots/latest.json");
       if (!latestObject) throw new Error("snapshots/latest.json was not found after snapshot creation");
@@ -225,12 +245,12 @@ async function generateOrDeliverReport(env, now, options = {}) {
       reportResults.generated = true;
       reportResults.storage = await storeReport(env, reportDate, reportMarkdown, generatedReport.metadata);
       reportResults.stored = reportResults.storage.stored === true;
-      if (options.forceRegenerate) {
+      if (shouldRegenerate) {
         reportResults.replaced = Boolean(reportObject);
         await resetDeliveryReceipt(env, reportDate, generatedReport.metadata);
       }
     }
-    if (!reportObject || options.forceRegenerate) {
+    if (!reportObject || shouldRegenerate) {
       reportResults.email = await settleDelivery(() => sendReportEmail(env, reportDate, reportMarkdown));
     }
     reportResults.webhook = await deliverReportWebhookOnce(env, reportDate, reportMarkdown, {
@@ -259,6 +279,14 @@ async function generateOrDeliverReport(env, now, options = {}) {
     console.error(error);
   }
   return reportResults;
+}
+
+function reportObjectMatchesRequest(metadata, options = {}) {
+  if (metadata.engineVersion !== SERVICE_VERSION || metadata.buildRevision !== BUILD_REVISION) return false;
+  if (options.reportMode && metadata.reportMode !== options.reportMode) return false;
+  if (options.aiRoute?.provider && metadata.aiProvider !== options.aiRoute.provider) return false;
+  if (options.aiRoute?.model && metadata.aiModel !== options.aiRoute.model) return false;
+  return true;
 }
 
 export async function buildSnapshot(env, now = new Date(), options = {}) {

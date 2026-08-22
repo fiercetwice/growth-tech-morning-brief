@@ -40,11 +40,11 @@ test("Worker accepts a trailing slash on the GPT read route", async () => {
 test("health exposes the deployed release for propagation-safe smoke tests", async () => {
   const response = await worker.fetch(new Request("https://example.test/health"), {});
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.11.1", buildRevision: "0.5.11.1-hf1" });
+  assert.deepEqual(await response.json(), { ok: true, service: "growth-tech-morning-brief", version: "0.5.11.1", buildRevision: "0.5.11.1-hf2" });
 });
 
 test("build-specific report route rejects same-engine old builds without starting generation", async () => {
-  const current = await worker.fetch(new Request("https://example.test/run-report/v0.5.11.1/build/0.5.11.1-hf1", {
+  const current = await worker.fetch(new Request("https://example.test/run-report/v0.5.11.1/build/0.5.11.1-hf2", {
     method: "POST",
   }), { RUN_TOKEN_REQUIRED: "true", RUN_TOKEN: "smoke-token" });
   assert.equal(current.status, 401);
@@ -66,6 +66,9 @@ test("post-deploy smoke test retries only the build-specific route while an old 
   assert.match(deployWorkflow, /report_url="\$WORKER_URL\/run-report\/v\$expected_version\/build\/\$expected_build_revision"/);
   assert.match(deployWorkflow, /deployed_build_revision/);
   assert.match(deployWorkflow, /Report identity mismatch across generation, R2, and Discord/);
+  assert.match(deployWorkflow, /"regenerateOnBuildMismatch": true/);
+  assert.doesNotMatch(deployWorkflow, /"forceDelivery": true/);
+  assert.doesNotMatch(deployWorkflow, /"forceRegenerate": true/);
   assert.match(deployWorkflow, /if \[ "\$http_status" = "404" \] && \[ "\$attempt" != "24" \]/);
   assert.doesNotMatch(deployWorkflow, /report_url="\$WORKER_URL\/run-report\/v\$expected_version"\s*$/m);
 });
