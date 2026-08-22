@@ -67,8 +67,11 @@ test("post-deploy smoke test retries only the build-specific route while an old 
   assert.match(deployWorkflow, /deployed_build_revision/);
   assert.match(deployWorkflow, /Report identity mismatch across generation, R2, and Discord/);
   assert.match(deployWorkflow, /"regenerateOnBuildMismatch": true/);
-  assert.doesNotMatch(deployWorkflow, /"forceDelivery": true/);
   assert.doesNotMatch(deployWorkflow, /"forceRegenerate": true/);
+  assert.match(deployWorkflow, /webhook_reason="\$\(jq -r '\.report\.webhook\.reason \/\/ empty'/);
+  assert.match(deployWorkflow, /if \[ "\$webhook_reason" = "delivery_retry_not_requested" \]; then/);
+  assert.match(deployWorkflow, /"forceDelivery": true/);
+  assert.equal((deployWorkflow.match(/"forceDelivery": true/g) ?? []).length, 1);
   assert.match(deployWorkflow, /if \[ "\$http_status" = "404" \] && \[ "\$attempt" != "24" \]/);
   assert.doesNotMatch(deployWorkflow, /report_url="\$WORKER_URL\/run-report\/v\$expected_version"\s*$/m);
 });
