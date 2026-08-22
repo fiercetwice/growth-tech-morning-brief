@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# Only one deploy/report delivery run for a ref may be active at a time.
+# This prevents overlapping push/rerun jobs from racing the R2 delivery receipt.
+concurrency:
+  group: growth-tech-worker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Test
@@ -89,9 +95,28 @@ jobs:
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
           report_url="$WORKER_URL/run-report/v$expected_version/build/$expected_build_revision"
-          http_status=""
-          for attempt in $(seq 1 24); do
-            if ! http_status="$(curl --silent --show-error \
+
+          call_report() {
+            local force_delivery="$1"
+            local payload
+            if [ "$force_delivery" = "true" ]; then
+              payload='{
+                "regenerateOnBuildMismatch": true,
+                "forceDelivery": true,
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "reportMode": "verbose"
+              }'
+            else
+              payload='{
+                "regenerateOnBuildMismatch": true,
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "reportMode": "verbose"
+              }'
+            fi
+
+            curl --silent --show-error \
               --output "$response_file" \
               --write-out '%{http_code}' \
               --connect-timeout 15 \
@@ -100,12 +125,12 @@ jobs:
               --url "$report_url" \
               --header "Authorization: Bearer $RUN_TOKEN" \
               --header "Content-Type: application/json" \
-              --data '{
-                "regenerateOnBuildMismatch": true,
-                "provider": "deepseek",
-                "model": "deepseek-v4-flash",
-                "reportMode": "verbose"
-              }')"; then
+              --data "$payload"
+          }
+
+          http_status=""
+          for attempt in $(seq 1 24); do
+            if ! http_status="$(call_report false)"; then
               echo "::error::The build-specific /run-report request failed before receiving an HTTP response."
               exit 1
             fi
@@ -130,6 +155,29 @@ jobs:
             echo "::error::The build-specific /run-report request returned invalid JSON (HTTP $http_status, $(wc -c < "$response_file") bytes)."
             exit 1
           fi
+
+          # A regenerated report deliberately resets its R2 Discord receipt to pending.
+          # The Worker refuses a pending retry unless explicitly requested. For the
+          # post-deploy path, retry exactly once with forceDelivery only when that
+          # specific pending state is returned. Already-delivered reports remain skipped.
+          webhook_reason="$(jq -r '.report.webhook.reason // empty' "$response_file")"
+          if [ "$webhook_reason" = "delivery_retry_not_requested" ]; then
+            echo "Pending Discord receipt detected; retrying this stored report delivery once."
+            if ! http_status="$(call_report true)"; then
+              echo "::error::Pending Discord delivery retry failed before receiving an HTTP response."
+              exit 1
+            fi
+            if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+              echo "::error::Pending Discord delivery retry failed (HTTP ${http_status:-unknown})."
+              jq '{ error, message, reportError: .report.error, webhook: .report.webhook }' "$response_file" 2>/dev/null || true
+              exit 1
+            fi
+            if ! jq -e . "$response_file" > /dev/null 2>&1; then
+              echo "::error::Pending Discord delivery retry returned invalid JSON."
+              exit 1
+            fi
+          fi
+
           response="$(< "$response_file")"
 
           summary="$(jq '{
@@ -185,4 +233,4 @@ jobs:
           fi
 
           echo "Post-deploy report test passed."
-          echo "- ✅ All generation, storage, schema, and delivery checks passed." >> "$GITHUB_STEP_SUMMARY"
+          echo "- ✅ Generation/storage checks passed and Discord is sent once or already delivered." >> "$GITHUB_STEP_SUMMARY"
