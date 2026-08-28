@@ -65,8 +65,8 @@ jobs:
           jq 'to_entries | map({key: .key, value: {ticker: .key, cik_str: (.value | tonumber), title: ""}}) | from_entries' \
             /tmp/ticker_to_cik.json > /tmp/company_tickers.json
           jq -e 'length > 1000 and .AAPL.cik_str == 320193 and .MSFT.cik_str == 789019' /tmp/company_tickers.json >/dev/null
-          npx wrangler r2 object put 'stock-research-mcp-data/sec/ticker-map.json' --file=/tmp/company_tickers.json
-          echo 'Ticker-to-CIK resolver mirror seeded into R2'
+          npx wrangler r2 object put 'stock-research-mcp-data/sec/ticker-map.json' --file=/tmp/company_tickers.json --remote
+          echo 'Ticker-to-CIK resolver mirror seeded into remote R2'
 
       - name: Deploy MCP Worker
         working-directory: mcp
