@@ -1,6 +1,6 @@
 {
   "name": "stock-research-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,8 +9,8 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.4",
-    "agents": "^0.2.24",
+    "@modelcontextprotocol/server": "2.0.0",
+    "agents": "^0.20.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
