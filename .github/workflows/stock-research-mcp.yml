@@ -88,15 +88,16 @@ jobs:
         env:
           WORKER_URL: https://stock-research-mcp.ck-market-tools.workers.dev
         run: |
+          expected_version="$(jq -r '.version' mcp/package.json)"
           for attempt in $(seq 1 24); do
             if health="$(curl --fail --silent --show-error --max-time 20 "$WORKER_URL/health" 2>/dev/null)"; then
               version="$(jq -r '.version // empty' <<< "$health")"
-              if [ "$version" = "0.2.0" ]; then
+              if [ "$version" = "$expected_version" ]; then
                 echo "$health"
                 exit 0
               fi
             fi
             sleep 5
           done
-          echo 'MCP health endpoint did not report v0.2.0'
+          echo "MCP health endpoint did not report v$expected_version"
           exit 1
