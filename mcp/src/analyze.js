@@ -1,33 +1,55 @@
 import { getYahooChart, summarizeOneMonth, chartRows, extractSplits } from './sources/yahoo.js';
-import { getCompanyFacts, extractCoreFundamentals } from './sources/sec.js';
+import { getCompanyFacts, extractCoreFundamentals, getRecentFilings } from './sources/sec.js';
 import { buildPointInTimeValuation } from './engines/valuation.js';
 import { buildTargetModel } from './engines/target.js';
 import { callAiProvider } from './providers/ai.js';
+
+const ANALYSIS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+async function readCachedAnalysis(symbol, env, includeAi) {
+  if (!env.RESEARCH_BUCKET || includeAi) return null;
+  const key = `analysis/v0.3/${symbol}.json`;
+  const obj = await env.RESEARCH_BUCKET.get(key);
+  if (!obj) return null;
+  const uploaded = new Date(obj.uploaded || 0).getTime();
+  if (!Number.isFinite(uploaded) || Date.now() - uploaded > ANALYSIS_CACHE_TTL_MS) return null;
+  return await obj.json();
+}
+
+async function writeCachedAnalysis(symbol, env, result, includeAi) {
+  if (!env.RESEARCH_BUCKET || includeAi) return;
+  await env.RESEARCH_BUCKET.put(`analysis/v0.3/${symbol}.json`, JSON.stringify(result));
+}
 
 export async function analyzeStock(ticker, env, options = {}) {
   const symbol = String(ticker || '').trim().toUpperCase();
   if (!symbol) throw new Error('ticker_required');
   const includeAi = options.includeAi !== false;
 
-  const [monthChart, fiveYearChart, companyFacts] = await Promise.all([
+  const cached = await readCachedAnalysis(symbol, env, includeAi);
+  if (cached) return { ...cached, cache: { hit: true } };
+
+  const [monthChart, fiveYearChart, companyFacts, recentFilings] = await Promise.all([
     getYahooChart(symbol, { range: '1mo', interval: '1d' }),
     getYahooChart(symbol, { range: '5y', interval: '1d' }),
     getCompanyFacts(symbol, env),
+    getRecentFilings(symbol, env, { forms: ['8-K','10-Q','10-K','6-K','20-F'], limit: 20 }).catch(() => []),
   ]);
 
   const price = summarizeOneMonth(monthChart);
   const splits = extractSplits(fiveYearChart);
   const fundamentals = extractCoreFundamentals(companyFacts, splits);
   const historyRows = chartRows(fiveYearChart);
+  const valuationVintages = fundamentals.ttmVintages?.length >= 4 ? fundamentals.ttmVintages : fundamentals.annualVintages || [];
   const valuation = buildPointInTimeValuation({
     priceRows: historyRows,
-    filingVintages: fundamentals.annualVintages || [],
+    filingVintages: valuationVintages,
     splits,
   });
   const target = buildTargetModel({
     lastPrice: price.lastPrice,
     valuation,
-    fundamentals,
+    fundamentals: { ...fundamentals, latestAnnual: fundamentals.latestTtm || fundamentals.latestAnnual },
   });
 
   const deterministic = {
@@ -44,13 +66,17 @@ export async function analyzeStock(ticker, env, options = {}) {
       avgVolume1m: price.avgVolume,
     },
     fundamentals,
-    valuation,
+    valuation: { ...valuation, basis: fundamentals.ttmVintages?.length >= 4 ? 'ttm_quarterly' : 'annual_fallback' },
     target,
+    recentFilings,
     dataQuality: {
       completeOneMonth: price.observations >= 18,
       fiveYearPriceObservations: historyRows.length,
       secAvailable: Boolean(companyFacts),
+      quarterlyVintageCount: fundamentals.quarterlyVintages?.length || 0,
+      ttmVintageCount: fundamentals.ttmVintages?.length || 0,
       filingVintageCount: valuation.filingVintageCount,
+      recentFilingCount: recentFilings.length,
       targetAvailable: Boolean(target?.available),
     },
   };
@@ -62,19 +88,22 @@ export async function analyzeStock(ticker, env, options = {}) {
         'You are a stock research extraction component.',
         'Return only evidence-grounded structured JSON.',
         'Do not invent analyst targets, prices, earnings dates, or catalysts.',
-        'Treat deterministic price, SEC, valuation, and target fields as authoritative inputs.',
+        'Treat deterministic price, SEC, valuation, target, and filing fields as authoritative inputs.',
         'Extract catalysts, conflicting evidence, risks, and rerating conditions; do not override deterministic calculations.',
       ].join(' '),
       input: JSON.stringify({ ticker: symbol, deterministic }),
     });
   }
 
-  return {
-    version: '0.2.2',
+  const result = {
+    version: '0.3.0',
     asOf: new Date().toISOString(),
     ...deterministic,
     research,
+    cache: { hit: false },
   };
+  await writeCachedAnalysis(symbol, env, result, includeAi);
+  return result;
 }
 
 export async function analyzeWatchlist(tickers, env, options = {}) {
@@ -98,7 +127,7 @@ export async function analyzeWatchlist(tickers, env, options = {}) {
 
   await Promise.all(Array.from({ length: Math.min(concurrency, symbols.length) }, () => worker()));
   return {
-    version: '0.2.2',
+    version: '0.3.0',
     asOf: new Date().toISOString(),
     requested: symbols.length,
     succeeded: results.filter(x => x?.ok).length,
