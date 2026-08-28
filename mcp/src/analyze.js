@@ -7,6 +7,7 @@ import { callAiProvider } from './providers/ai.js';
 const ANALYSIS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const DEGRADED_SEC_CACHE_TTL_MS = 10 * 60 * 1000;
 const ANALYSIS_CACHE_VERSION = 'v0.4.1';
+const SEC_MIRROR_MANIFEST_KEY = 'sec/companyfacts-manifest.json';
 
 async function readCachedAnalysis(symbol, env, includeAi) {
   if (!env.RESEARCH_BUCKET || includeAi) return null;
@@ -15,10 +16,14 @@ async function readCachedAnalysis(symbol, env, includeAi) {
   if (!obj) return null;
   const uploaded = new Date(obj.uploaded || 0).getTime();
   if (!Number.isFinite(uploaded)) return null;
+
+  // A freshly published SEC mirror invalidates older analysis immediately. This
+  // prevents a degraded SEC=false packet from masking new CompanyFacts until TTL.
+  const manifest = await env.RESEARCH_BUCKET.head(SEC_MIRROR_MANIFEST_KEY).catch(() => null);
+  const mirrorUploaded = manifest ? new Date(manifest.uploaded || 0).getTime() : null;
+  if (Number.isFinite(mirrorUploaded) && mirrorUploaded > uploaded) return null;
+
   const cached = await obj.json();
-  // SEC-unavailable packets are deliberately short-lived. A nightly R2 mirror can
-  // appear at any time, so stale degraded analysis must not mask newly available
-  // CompanyFacts for the full six-hour normal analysis TTL.
   const ttl = cached?.dataQuality?.secAvailable === false
     ? DEGRADED_SEC_CACHE_TTL_MS
     : ANALYSIS_CACHE_TTL_MS;
@@ -53,9 +58,6 @@ export async function analyzeStock(ticker, env, options = {}) {
   const cached = await readCachedAnalysis(symbol, env, includeAi);
   if (cached) return { ...cached, cache: { hit: true } };
 
-  // Price history is the hard dependency for entry setup. SEC is intentionally soft:
-  // if SEC blocks a Worker egress IP, return a usable price packet with explicit
-  // data-quality flags instead of failing the entire watchlist scan.
   const [monthChart, fiveYearChart, secFactsResult, filingsResult] = await Promise.all([
     getYahooChart(symbol, { range: '1mo', interval: '1d' }),
     getYahooChart(symbol, { range: '5y', interval: '1d' }),
