@@ -104,29 +104,9 @@ jobs:
             sleep 5
           done
 
-      - name: Smoke test MCP tools list
+      - name: Smoke test MCP with official client
+        working-directory: mcp
         env:
           WORKER_URL: https://stock-research-mcp.ck-market-tools.workers.dev
           RUN_TOKEN: ${{ secrets.RUN_TOKEN }}
-        run: |
-          if [ -z "$RUN_TOKEN" ]; then
-            echo 'RUN_TOKEN GitHub secret is required for MCP protocol smoke test.'
-            exit 1
-          fi
-          response="$(curl --fail --silent --show-error --max-time 30 \
-            --request POST \
-            --url "$WORKER_URL/mcp" \
-            --header "Authorization: Bearer $RUN_TOKEN" \
-            --header 'Content-Type: application/json' \
-            --header 'Accept: application/json, text/event-stream' \
-            --header 'MCP-Protocol-Version: 2026-07-28' \
-            --header 'Mcp-Method: tools/list' \
-            --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/clientInfo":{"name":"github-smoke","version":"1.0.0"}}}}')"
-          echo "$response" | head -c 2000
-          for tool in analyze_stock get_stock_snapshot analyze_watchlist get_earnings_calendar; do
-            if ! grep -q "\"$tool\"" <<< "$response"; then
-              echo "Missing expected MCP tool: $tool"
-              exit 1
-            fi
-          done
-          echo 'MCP tools/list smoke test passed.'
+        run: npm run smoke:mcp
