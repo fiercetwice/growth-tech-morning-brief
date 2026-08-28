@@ -5,7 +5,7 @@ import { analyzeStock, analyzeWatchlist } from './analyze.js';
 import { getNasdaqEarningsCalendar } from './sources/nasdaq.js';
 
 function buildServer(env) {
-  const server = new McpServer({ name: 'stock-research-mcp', version: '0.2.1' });
+  const server = new McpServer({ name: 'stock-research-mcp', version: '0.2.2' });
 
   server.registerTool('analyze_stock', {
     description: 'Analyze a stock with 1M price action, SEC fundamentals, 5Y point-in-time valuation, deterministic target model, and optional AI research.',
@@ -56,7 +56,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/health') {
-      return Response.json({ ok: true, service: 'stock-research-mcp', version: '0.2.1' });
+      return Response.json({ ok: true, service: 'stock-research-mcp', version: '0.2.2' });
     }
     if (env.RUN_TOKEN_REQUIRED === 'true') {
       const auth = request.headers.get('authorization') || '';
