@@ -4,9 +4,12 @@ import { z } from 'zod';
 import { analyzeStock, analyzeWatchlist } from './analyze.js';
 import { buildEntrySetup, buildWatchlistPacket } from './radar.js';
 import { getNasdaqEarningsCalendar } from './sources/nasdaq.js';
+import { handlePublicApi } from './http-api.js';
+
+const VERSION = '0.4.1';
 
 function buildServer(env) {
-  const server = new McpServer({ name: 'stock-research-mcp', version: '0.4.0' });
+  const server = new McpServer({ name: 'stock-research-mcp', version: VERSION });
 
   server.registerTool('analyze_stock', {
     description: 'Analyze one stock with 1M price action, SEC TTM fundamentals, 5Y point-in-time valuation, recent SEC filings, deterministic target model, and optional AI research.',
@@ -50,7 +53,16 @@ function buildServer(env) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname === '/health') return Response.json({ ok: true, service: 'stock-research-mcp', version: '0.4.0' });
+    if (url.pathname === '/health') return Response.json({ ok: true, service: 'stock-research-mcp', version: VERSION });
+
+    // Public read-only research API. It exposes only public market/SEC-derived data.
+    // Account/portfolio data never enters these routes.
+    if (url.pathname.startsWith('/api/v1/')) {
+      const response = await handlePublicApi(request, env);
+      if (response) return response;
+    }
+
+    // MCP remains private behind the Worker bearer token.
     if (env.RUN_TOKEN_REQUIRED === 'true') {
       const auth = request.headers.get('authorization') || '';
       if (!env.RUN_TOKEN || auth !== `Bearer ${env.RUN_TOKEN}`) return new Response('Unauthorized', { status: 401 });
