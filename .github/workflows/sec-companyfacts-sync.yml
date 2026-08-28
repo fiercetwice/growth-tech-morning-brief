@@ -27,6 +27,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       SEC_BULK_URL: https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip
       CIK_MAP_URL: https://raw.githubusercontent.com/jadchaar/sec-cik-mapper/main/mappings/stocks/ticker_to_cik.json
+      SEC_USER_AGENT: stock-research-mcp contact@ck-market-tools.workers.dev
 
     steps:
       - name: Checkout repository
@@ -52,7 +53,9 @@ jobs:
           echo "Downloading $SEC_BULK_URL"
           curl --fail --location --show-error \
             --retry 4 --retry-all-errors --connect-timeout 30 --max-time 1800 \
-            -H 'User-Agent: stock-research-mcp https://github.com/fiercetwice/growth-tech-morning-brief' \
+            -H "User-Agent: $SEC_USER_AGENT" \
+            -H 'From: contact@ck-market-tools.workers.dev' \
+            -H 'Accept: application/zip, application/octet-stream;q=0.9, */*;q=0.1' \
             -H 'Accept-Encoding: gzip, deflate' --compressed \
             "$SEC_BULK_URL" -o /tmp/companyfacts.zip
           test -s /tmp/companyfacts.zip
