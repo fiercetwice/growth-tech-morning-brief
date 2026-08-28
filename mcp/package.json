@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node --test"
+    "test": "node --test",
+    "smoke:mcp": "node scripts/smoke-mcp.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
@@ -14,6 +15,7 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
     "wrangler": "^4.33.1"
   }
 }
