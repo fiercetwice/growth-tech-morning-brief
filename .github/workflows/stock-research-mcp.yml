@@ -108,12 +108,22 @@ jobs:
         env:
           WORKER_URL: https://stock-research-mcp.ck-market-tools.workers.dev
         run: |
-          entry="$(curl --fail --silent --show-error --max-time 60 "$WORKER_URL/api/v1/entry?ticker=AAPL")"
-          jq -e '.ok == true and .data.ticker == "AAPL" and (.data.buyNowDataGate | type == "boolean")' <<< "$entry" >/dev/null
+          entry_file="$(mktemp)"
+          entry_code="$(curl --silent --show-error --max-time 60 -o "$entry_file" -w '%{http_code}' "$WORKER_URL/api/v1/entry?ticker=AAPL")"
+          echo "entry HTTP $entry_code"
+          cat "$entry_file"
+          echo
+          [ "$entry_code" = "200" ]
+          jq -e '.ok == true and .data.ticker == "AAPL" and (.data.buyNowDataGate | type == "boolean")' "$entry_file" >/dev/null
           echo "entry endpoint ok"
 
-          packet="$(curl --fail --silent --show-error --max-time 120 "$WORKER_URL/api/v1/watchlist?tickers=AAPL,MSFT")"
-          jq -e '.ok == true and .data.requested == 2 and (.data.rows | length) >= 1' <<< "$packet" >/dev/null
+          packet_file="$(mktemp)"
+          packet_code="$(curl --silent --show-error --max-time 120 -o "$packet_file" -w '%{http_code}' "$WORKER_URL/api/v1/watchlist?tickers=AAPL,MSFT")"
+          echo "watchlist HTTP $packet_code"
+          cat "$packet_file"
+          echo
+          [ "$packet_code" = "200" ]
+          jq -e '.ok == true and .data.requested == 2 and (.data.rows | length) >= 1' "$packet_file" >/dev/null
           echo "watchlist endpoint ok"
 
       - name: Smoke test MCP with official client
