@@ -1,0 +1,130 @@
+name: Sync SEC CompanyFacts to R2
+
+on:
+  push:
+    branches:
+      - stock-research-mcp-v0.1
+    paths:
+      - '.github/workflows/sec-companyfacts-sync.yml'
+      - 'mcp/config/radar-tickers.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '15 10 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sec-companyfacts-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SEC_BULK_URL: https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip
+      CIK_MAP_URL: https://raw.githubusercontent.com/jadchaar/sec-cik-mapper/main/mappings/stocks/ticker_to_cik.json
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Wrangler dependencies
+        working-directory: mcp
+        run: npm install
+
+      - name: Download ticker-to-CIK resolver mirror
+        run: |
+          curl --fail --silent --show-error --retry 3 --retry-all-errors --max-time 60 \
+            "$CIK_MAP_URL" -o /tmp/ticker_to_cik.json
+          jq -e 'length > 1000 and .AAPL == "0000320193"' /tmp/ticker_to_cik.json >/dev/null
+
+      - name: Download official SEC CompanyFacts bulk archive
+        run: |
+          echo "Downloading $SEC_BULK_URL"
+          curl --fail --location --show-error \
+            --retry 4 --retry-all-errors --connect-timeout 30 --max-time 1800 \
+            -H 'User-Agent: stock-research-mcp https://github.com/fiercetwice/growth-tech-morning-brief' \
+            -H 'Accept-Encoding: gzip, deflate' --compressed \
+            "$SEC_BULK_URL" -o /tmp/companyfacts.zip
+          test -s /tmp/companyfacts.zip
+          unzip -tq /tmp/companyfacts.zip
+          ls -lh /tmp/companyfacts.zip
+
+      - name: Extract Radar universe CompanyFacts
+        run: |
+          python - <<'PY'
+          import json, pathlib, zipfile, datetime
+
+          tickers = [x.strip().upper() for x in pathlib.Path('mcp/config/radar-tickers.txt').read_text().splitlines() if x.strip() and not x.startswith('#')]
+          cik_map = json.loads(pathlib.Path('/tmp/ticker_to_cik.json').read_text())
+          out = pathlib.Path('/tmp/companyfacts-selected')
+          out.mkdir(parents=True, exist_ok=True)
+          manifest = {
+              'generatedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'source': 'SEC companyfacts.zip',
+              'requestedTickers': len(tickers),
+              'resolvedTickers': [],
+              'missingTickerMap': [],
+              'missingInArchive': [],
+          }
+          with zipfile.ZipFile('/tmp/companyfacts.zip') as zf:
+              names = set(zf.namelist())
+              for ticker in tickers:
+                  cik = cik_map.get(ticker)
+                  if not cik:
+                      manifest['missingTickerMap'].append(ticker)
+                      continue
+                  cik = str(cik).zfill(10)
+                  name = f'CIK{cik}.json'
+                  if name not in names:
+                      manifest['missingInArchive'].append({'ticker': ticker, 'cik': cik})
+                      continue
+                  target = out / name
+                  if not target.exists():
+                      target.write_bytes(zf.read(name))
+                  manifest['resolvedTickers'].append({'ticker': ticker, 'cik': cik, 'file': name})
+          manifest['uniqueCompanyFiles'] = len(list(out.glob('CIK*.json')))
+          pathlib.Path('/tmp/companyfacts-manifest.json').write_text(json.dumps(manifest, indent=2))
+          print(json.dumps(manifest, indent=2))
+          if manifest['uniqueCompanyFiles'] < 20:
+              raise SystemExit('Too few CompanyFacts files extracted; refusing to publish mirror')
+          PY
+
+      - name: Upload selected CompanyFacts to remote R2
+        working-directory: mcp
+        run: |
+          for file in /tmp/companyfacts-selected/CIK*.json; do
+            base="$(basename "$file")"
+            cik="${base#CIK}"
+            cik="${cik%.json}"
+            npx wrangler r2 object put "stock-research-mcp-data/sec/companyfacts/${cik}.json" --file="$file" --remote >/dev/null
+          done
+          npx wrangler r2 object put 'stock-research-mcp-data/sec/companyfacts-manifest.json' \
+            --file=/tmp/companyfacts-manifest.json --remote >/dev/null
+          echo 'CompanyFacts mirror uploaded to remote R2'
+
+      - name: Verify mirrored AAPL object exists
+        working-directory: mcp
+        run: |
+          npx wrangler r2 object get 'stock-research-mcp-data/sec/companyfacts/0000320193.json' \
+            --file=/tmp/aapl-companyfacts.json --remote >/dev/null
+          jq -e '.cik == 320193 or .cik == "0000320193" or .cik == "320193"' /tmp/aapl-companyfacts.json >/dev/null
+          jq -e '.facts | type == "object"' /tmp/aapl-companyfacts.json >/dev/null
+          echo 'AAPL CompanyFacts mirror verified'
+
+      - name: Verify live Radar endpoint sees SEC data
+        env:
+          WORKER_URL: https://stock-research-mcp.ck-market-tools.workers.dev
+        run: |
+          response="$(curl --fail --silent --show-error --max-time 90 "$WORKER_URL/api/v1/entry?ticker=AAPL")"
+          echo "$response" | jq '{ok, ticker:.data.ticker, secAvailable:.data.secAvailable, targetAvailable:.data.targetAvailable, ttmAvailable:.data.ttmAvailable, valuationBasis:.data.valuationBasis}'
+          jq -e '.ok == true and .data.ticker == "AAPL" and .data.secAvailable == true' <<< "$response" >/dev/null
