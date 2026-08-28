@@ -1,0 +1,19 @@
+{
+  "name": "stock-research-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.4",
+    "agents": "^0.2.24",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "wrangler": "^4.33.1"
+  }
+}
