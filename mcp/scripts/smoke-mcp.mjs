@@ -1,5 +1,4 @@
-import { Client } from '@modelcontextprotocol/client';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client/streamableHttp.js';
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 
 const url = process.env.WORKER_URL;
 const token = process.env.RUN_TOKEN;
