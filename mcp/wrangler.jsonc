@@ -2,13 +2,13 @@
   "$schema": "../node_modules/wrangler/config-schema.json",
   "name": "stock-research-mcp",
   "main": "src/index.js",
-  "compatibility_date": "2026-08-27",
+  "compatibility_date": "2026-08-28",
   "vars": {
     "AI_PROVIDER": "gemini",
     "GEMINI_MODEL": "gemini-3.5-flash",
     "DEEPSEEK_MODEL": "deepseek-v4-flash",
     "RUN_TOKEN_REQUIRED": "true",
-    "SEC_USER_AGENT": "stock-research-mcp/0.1 contact@example.com"
+    "SEC_USER_AGENT": "stock-research-mcp/0.2 research-service"
   },
   "r2_buckets": [
     {
