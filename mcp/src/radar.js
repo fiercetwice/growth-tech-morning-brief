@@ -29,6 +29,8 @@ export function buildEntrySetup(analysis) {
     targetUpside: t.baseUpside ?? t.upside ?? null,
     targetConfidence: t.confidence ?? null,
     completeOneMonth: Boolean(q.completeOneMonth),
+    secAvailable: Boolean(q.secAvailable),
+    targetAvailable: Boolean(q.targetAvailable),
     ttmAvailable: (q.ttmVintageCount || 0) > 0,
     recentFilingCount: q.recentFilingCount || 0,
     extensionFlags: {
@@ -60,7 +62,7 @@ export function buildWatchlistPacket(batch) {
     });
   }
   return {
-    version: '0.4.0',
+    version: '0.4.1',
     asOf: batch?.asOf || new Date().toISOString(),
     requested: batch?.requested || rows.length + failures.length,
     succeeded: rows.length,
