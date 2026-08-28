@@ -8,7 +8,7 @@
     "GEMINI_MODEL": "gemini-3.5-flash",
     "DEEPSEEK_MODEL": "deepseek-v4-flash",
     "RUN_TOKEN_REQUIRED": "true",
-    "SEC_USER_AGENT": "stock-research-mcp/0.4.1 https://github.com/fiercetwice/growth-tech-morning-brief"
+    "SEC_USER_AGENT": "stock-research-mcp contact@ck-market-tools.workers.dev"
   },
   "r2_buckets": [
     {
