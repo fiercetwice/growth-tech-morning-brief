@@ -52,6 +52,22 @@ jobs:
             exit "$status"
           fi
 
+      - name: Seed SEC ticker map into R2
+        working-directory: mcp
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          curl --fail --silent --show-error --retry 3 --max-time 60 \
+            -H 'User-Agent: stock-research-mcp https://github.com/fiercetwice/growth-tech-morning-brief' \
+            -H 'Accept-Encoding: gzip, deflate' \
+            --compressed \
+            'https://www.sec.gov/files/company_tickers.json' \
+            -o /tmp/company_tickers.json
+          jq -e 'length > 1000' /tmp/company_tickers.json >/dev/null
+          npx wrangler r2 object put 'stock-research-mcp-data/sec/ticker-map.json' --file=/tmp/company_tickers.json
+          echo 'SEC ticker map seeded into R2'
+
       - name: Deploy MCP Worker
         working-directory: mcp
         env:
