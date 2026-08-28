@@ -2,10 +2,11 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { createMcpHandler } from 'agents/mcp/server';
 import { z } from 'zod';
 import { analyzeStock, analyzeWatchlist } from './analyze.js';
+import { buildEntrySetup, buildWatchlistPacket } from './radar.js';
 import { getNasdaqEarningsCalendar } from './sources/nasdaq.js';
 
 function buildServer(env) {
-  const server = new McpServer({ name: 'stock-research-mcp', version: '0.3.0' });
+  const server = new McpServer({ name: 'stock-research-mcp', version: '0.4.0' });
 
   server.registerTool('analyze_stock', {
     description: 'Analyze one stock with 1M price action, SEC TTM fundamentals, 5Y point-in-time valuation, recent SEC filings, deterministic target model, and optional AI research.',
@@ -17,10 +18,26 @@ function buildServer(env) {
     inputSchema: { ticker: z.string().min(1) },
   }, async ({ ticker }) => ({ content: [{ type: 'text', text: JSON.stringify(await analyzeStock(ticker, env, { includeAi: false })) }] }));
 
+  server.registerTool('get_entry_setup', {
+    description: 'Return a compact single-stock entry packet with the fields needed by Stock Entry Radar BUY/STARTER gates.',
+    inputSchema: { ticker: z.string().min(1) },
+  }, async ({ ticker }) => {
+    const analysis = await analyzeStock(ticker, env, { includeAi: false });
+    return { content: [{ type: 'text', text: JSON.stringify(buildEntrySetup(analysis)) }] };
+  });
+
   server.registerTool('analyze_watchlist', {
     description: 'Deep-analyze every supplied unique ticker; failures are isolated per symbol and deterministic results use R2 caching.',
     inputSchema: { tickers: z.array(z.string().min(1)).min(1).max(100), include_ai: z.boolean().optional(), concurrency: z.number().int().min(1).max(5).optional() },
   }, async ({ tickers, include_ai, concurrency }) => ({ content: [{ type: 'text', text: JSON.stringify(await analyzeWatchlist(tickers, env, { includeAi: include_ai !== false, concurrency: concurrency || 3 })) }] }));
+
+  server.registerTool('get_watchlist_packet', {
+    description: 'Return a compact full-watchlist packet for Stock Entry Radar, including entry setup, valuation context, latest SEC filing hint, cache state, and per-symbol failures.',
+    inputSchema: { tickers: z.array(z.string().min(1)).min(1).max(100), concurrency: z.number().int().min(1).max(5).optional() },
+  }, async ({ tickers, concurrency }) => {
+    const batch = await analyzeWatchlist(tickers, env, { includeAi: false, concurrency: concurrency || 3 });
+    return { content: [{ type: 'text', text: JSON.stringify(buildWatchlistPacket(batch)) }] };
+  });
 
   server.registerTool('get_earnings_calendar', {
     description: 'Return normalized Nasdaq public earnings-calendar rows for a date.',
@@ -33,7 +50,7 @@ function buildServer(env) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname === '/health') return Response.json({ ok: true, service: 'stock-research-mcp', version: '0.3.0' });
+    if (url.pathname === '/health') return Response.json({ ok: true, service: 'stock-research-mcp', version: '0.4.0' });
     if (env.RUN_TOKEN_REQUIRED === 'true') {
       const auth = request.headers.get('authorization') || '';
       if (!env.RUN_TOKEN || auth !== `Bearer ${env.RUN_TOKEN}`) return new Response('Unauthorized', { status: 401 });
