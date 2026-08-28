@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { analyzeStock, analyzeWatchlist } from './analyze.js';
+import { getNasdaqEarningsCalendar } from './sources/nasdaq.js';
 
 function buildServer(env) {
   const server = new McpServer({ name: 'stock-research-mcp', version: '0.2.0' });
@@ -30,6 +31,13 @@ function buildServer(env) {
       concurrency: concurrency || 3,
     });
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+  });
+
+  server.tool('get_earnings_calendar', 'Return normalized Nasdaq public earnings-calendar rows for a date.', {
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  }, async ({ date }) => {
+    const rows = await getNasdaqEarningsCalendar(date, env);
+    return { content: [{ type: 'text', text: JSON.stringify({ date, rows }) }] };
   });
 
   return server;
