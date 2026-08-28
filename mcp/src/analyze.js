@@ -5,10 +5,11 @@ import { buildTargetModel } from './engines/target.js';
 import { callAiProvider } from './providers/ai.js';
 
 const ANALYSIS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const ANALYSIS_CACHE_VERSION = 'v0.4.1';
 
 async function readCachedAnalysis(symbol, env, includeAi) {
   if (!env.RESEARCH_BUCKET || includeAi) return null;
-  const key = `analysis/v0.3/${symbol}.json`;
+  const key = `analysis/${ANALYSIS_CACHE_VERSION}/${symbol}.json`;
   const obj = await env.RESEARCH_BUCKET.get(key);
   if (!obj) return null;
   const uploaded = new Date(obj.uploaded || 0).getTime();
@@ -18,7 +19,21 @@ async function readCachedAnalysis(symbol, env, includeAi) {
 
 async function writeCachedAnalysis(symbol, env, result, includeAi) {
   if (!env.RESEARCH_BUCKET || includeAi) return;
-  await env.RESEARCH_BUCKET.put(`analysis/v0.3/${symbol}.json`, JSON.stringify(result));
+  await env.RESEARCH_BUCKET.put(`analysis/${ANALYSIS_CACHE_VERSION}/${symbol}.json`, JSON.stringify(result));
+}
+
+function emptyFundamentals() {
+  return {
+    revenue: null,
+    dilutedEps: null,
+    cash: null,
+    debt: null,
+    annualVintages: [],
+    quarterlyVintages: [],
+    ttmVintages: [],
+    latestAnnual: null,
+    latestTtm: null,
+  };
 }
 
 export async function analyzeStock(ticker, env, options = {}) {
@@ -29,18 +44,29 @@ export async function analyzeStock(ticker, env, options = {}) {
   const cached = await readCachedAnalysis(symbol, env, includeAi);
   if (cached) return { ...cached, cache: { hit: true } };
 
-  const [monthChart, fiveYearChart, companyFacts, recentFilings] = await Promise.all([
+  // Price history is the hard dependency for entry setup. SEC is intentionally soft:
+  // if SEC blocks a Worker egress IP, return a usable price packet with explicit
+  // data-quality flags instead of failing the entire watchlist scan.
+  const [monthChart, fiveYearChart, secFactsResult, filingsResult] = await Promise.all([
     getYahooChart(symbol, { range: '1mo', interval: '1d' }),
     getYahooChart(symbol, { range: '5y', interval: '1d' }),
-    getCompanyFacts(symbol, env),
-    getRecentFilings(symbol, env, { forms: ['8-K','10-Q','10-K','6-K','20-F'], limit: 20 }).catch(() => []),
+    getCompanyFacts(symbol, env)
+      .then(data => ({ ok: true, data }))
+      .catch(error => ({ ok: false, error: String(error?.message || error) })),
+    getRecentFilings(symbol, env, { forms: ['8-K','10-Q','10-K','6-K','20-F'], limit: 20 })
+      .then(data => ({ ok: true, data }))
+      .catch(error => ({ ok: false, error: String(error?.message || error), data: [] })),
   ]);
 
   const price = summarizeOneMonth(monthChart);
   const splits = extractSplits(fiveYearChart);
-  const fundamentals = extractCoreFundamentals(companyFacts, splits);
+  const companyFacts = secFactsResult.ok ? secFactsResult.data : null;
+  const recentFilings = filingsResult.ok ? filingsResult.data : [];
+  const fundamentals = companyFacts ? extractCoreFundamentals(companyFacts, splits) : emptyFundamentals();
   const historyRows = chartRows(fiveYearChart);
-  const valuationVintages = fundamentals.ttmVintages?.length >= 4 ? fundamentals.ttmVintages : fundamentals.annualVintages || [];
+  const valuationVintages = fundamentals.ttmVintages?.length >= 4
+    ? fundamentals.ttmVintages
+    : fundamentals.annualVintages || [];
   const valuation = buildPointInTimeValuation({
     priceRows: historyRows,
     filingVintages: valuationVintages,
@@ -51,6 +77,12 @@ export async function analyzeStock(ticker, env, options = {}) {
     valuation,
     fundamentals: { ...fundamentals, latestAnnual: fundamentals.latestTtm || fundamentals.latestAnnual },
   });
+
+  const valuationBasis = fundamentals.ttmVintages?.length >= 4
+    ? 'ttm_quarterly'
+    : fundamentals.annualVintages?.length
+      ? 'annual_fallback'
+      : 'unavailable';
 
   const deterministic = {
     ticker: symbol,
@@ -66,13 +98,16 @@ export async function analyzeStock(ticker, env, options = {}) {
       avgVolume1m: price.avgVolume,
     },
     fundamentals,
-    valuation: { ...valuation, basis: fundamentals.ttmVintages?.length >= 4 ? 'ttm_quarterly' : 'annual_fallback' },
+    valuation: { ...valuation, basis: valuationBasis },
     target,
     recentFilings,
     dataQuality: {
       completeOneMonth: price.observations >= 18,
       fiveYearPriceObservations: historyRows.length,
       secAvailable: Boolean(companyFacts),
+      secFactsError: secFactsResult.ok ? null : secFactsResult.error,
+      secFilingsAvailable: filingsResult.ok,
+      secFilingsError: filingsResult.ok ? null : filingsResult.error,
       quarterlyVintageCount: fundamentals.quarterlyVintages?.length || 0,
       ttmVintageCount: fundamentals.ttmVintages?.length || 0,
       filingVintageCount: valuation.filingVintageCount,
@@ -96,7 +131,7 @@ export async function analyzeStock(ticker, env, options = {}) {
   }
 
   const result = {
-    version: '0.3.0',
+    version: '0.4.1',
     asOf: new Date().toISOString(),
     ...deterministic,
     research,
@@ -127,7 +162,7 @@ export async function analyzeWatchlist(tickers, env, options = {}) {
 
   await Promise.all(Array.from({ length: Math.min(concurrency, symbols.length) }, () => worker()));
   return {
-    version: '0.3.0',
+    version: '0.4.1',
     asOf: new Date().toISOString(),
     requested: symbols.length,
     succeeded: results.filter(x => x?.ok).length,
