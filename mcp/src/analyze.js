@@ -70,7 +70,7 @@ export async function analyzeStock(ticker, env, options = {}) {
   }
 
   return {
-    version: '0.2.0',
+    version: '0.2.1',
     asOf: new Date().toISOString(),
     ...deterministic,
     research,
@@ -98,7 +98,7 @@ export async function analyzeWatchlist(tickers, env, options = {}) {
 
   await Promise.all(Array.from({ length: Math.min(concurrency, symbols.length) }, () => worker()));
   return {
-    version: '0.2.0',
+    version: '0.2.1',
     asOf: new Date().toISOString(),
     requested: symbols.length,
     succeeded: results.filter(x => x?.ok).length,
