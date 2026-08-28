@@ -5,6 +5,7 @@ import { buildTargetModel } from './engines/target.js';
 import { callAiProvider } from './providers/ai.js';
 
 const ANALYSIS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const DEGRADED_SEC_CACHE_TTL_MS = 10 * 60 * 1000;
 const ANALYSIS_CACHE_VERSION = 'v0.4.1';
 
 async function readCachedAnalysis(symbol, env, includeAi) {
@@ -13,8 +14,16 @@ async function readCachedAnalysis(symbol, env, includeAi) {
   const obj = await env.RESEARCH_BUCKET.get(key);
   if (!obj) return null;
   const uploaded = new Date(obj.uploaded || 0).getTime();
-  if (!Number.isFinite(uploaded) || Date.now() - uploaded > ANALYSIS_CACHE_TTL_MS) return null;
-  return await obj.json();
+  if (!Number.isFinite(uploaded)) return null;
+  const cached = await obj.json();
+  // SEC-unavailable packets are deliberately short-lived. A nightly R2 mirror can
+  // appear at any time, so stale degraded analysis must not mask newly available
+  // CompanyFacts for the full six-hour normal analysis TTL.
+  const ttl = cached?.dataQuality?.secAvailable === false
+    ? DEGRADED_SEC_CACHE_TTL_MS
+    : ANALYSIS_CACHE_TTL_MS;
+  if (Date.now() - uploaded > ttl) return null;
+  return cached;
 }
 
 async function writeCachedAnalysis(symbol, env, result, includeAi) {
