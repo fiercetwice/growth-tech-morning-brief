@@ -23,7 +23,7 @@ function futureSplitFactor(filedMs, splits = []) {
 
 export function buildPointInTimeValuation({ priceRows, filingVintages, splits = [] }) {
   const vintages = filingVintages
-    .filter(v => v?.filed && Number.isFinite(v?.epsPerShare) || Number.isFinite(v?.revenuePerShare))
+    .filter(v => v?.filed && (Number.isFinite(v?.epsPerShare) || Number.isFinite(v?.revenuePerShare)))
     .map(v => {
       const filedMs = Date.parse(v.filed);
       const factor = futureSplitFactor(filedMs, splits);
