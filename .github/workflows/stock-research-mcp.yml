@@ -120,6 +120,17 @@ jobs:
             sleep 5
           done
 
+      - name: Smoke test Custom GPT OpenAPI schema
+        env:
+          WORKER_URL: https://stock-research-mcp.ck-market-tools.workers.dev
+        run: |
+          schema_file="$(mktemp)"
+          curl --fail --silent --show-error --max-time 30 "$WORKER_URL/openapi.json" -o "$schema_file"
+          jq -e '.openapi == "3.1.0"' "$schema_file" >/dev/null
+          jq -e '.paths["/api/v1/watchlist"].get.operationId == "getWatchlistPacket"' "$schema_file" >/dev/null
+          jq -e '.servers[0].url == "https://stock-research-mcp.ck-market-tools.workers.dev"' "$schema_file" >/dev/null
+          echo 'OpenAPI schema ok'
+
       - name: Smoke test public Radar HTTP API
         env:
           WORKER_URL: https://stock-research-mcp.ck-market-tools.workers.dev
