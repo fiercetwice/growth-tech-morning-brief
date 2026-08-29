@@ -7,7 +7,7 @@ import { getNasdaqEarningsCalendar } from './sources/nasdaq.js';
 import { handlePublicApi } from './http-api.js';
 import { OPENAPI_SPEC } from './openapi.js';
 
-const VERSION = '0.4.1';
+const VERSION = '0.4.2';
 
 function buildServer(env) {
   const server = new McpServer({ name: 'stock-research-mcp', version: VERSION });
@@ -65,14 +65,11 @@ export default {
       });
     }
 
-    // Public read-only research API. It exposes only public market/SEC-derived data.
-    // Account/portfolio data never enters these routes.
     if (url.pathname.startsWith('/api/v1/')) {
       const response = await handlePublicApi(request, env);
       if (response) return response;
     }
 
-    // MCP remains private behind the Worker bearer token.
     if (env.RUN_TOKEN_REQUIRED === 'true') {
       const auth = request.headers.get('authorization') || '';
       if (!env.RUN_TOKEN || auth !== `Bearer ${env.RUN_TOKEN}`) return new Response('Unauthorized', { status: 401 });
