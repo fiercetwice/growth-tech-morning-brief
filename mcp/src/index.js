@@ -5,6 +5,7 @@ import { analyzeStock, analyzeWatchlist } from './analyze.js';
 import { buildEntrySetup, buildWatchlistPacket } from './radar.js';
 import { getNasdaqEarningsCalendar } from './sources/nasdaq.js';
 import { handlePublicApi } from './http-api.js';
+import { OPENAPI_SPEC } from './openapi.js';
 
 const VERSION = '0.4.1';
 
@@ -54,6 +55,15 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/health') return Response.json({ ok: true, service: 'stock-research-mcp', version: VERSION });
+    if (url.pathname === '/openapi.json') {
+      if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+      return Response.json(OPENAPI_SPEC, {
+        headers: {
+          'cache-control': 'public, max-age=300, s-maxage=300',
+          'x-content-type-options': 'nosniff',
+        },
+      });
+    }
 
     // Public read-only research API. It exposes only public market/SEC-derived data.
     // Account/portfolio data never enters these routes.
