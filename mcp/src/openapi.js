@@ -2,7 +2,7 @@ export const OPENAPI_SPEC = {
   openapi: '3.1.0',
   info: {
     title: 'Stock Research Radar API',
-    version: '0.1.0',
+    version: '0.2.0',
     description: 'Read-only deterministic stock research packets for ChatGPT Actions. No brokerage or account data is exposed.'
   },
   servers: [
@@ -21,12 +21,7 @@ export const OPENAPI_SPEC = {
             in: 'query',
             required: true,
             description: 'Comma-separated unique ticker symbols. Example: AAPL,MSFT,NVDA. Maximum 75 symbols.',
-            schema: {
-              type: 'string',
-              minLength: 1,
-              maxLength: 1200,
-              pattern: '^[A-Za-z0-9.,-]+$'
-            }
+            schema: { type: 'string', minLength: 1, maxLength: 1200, pattern: '^[A-Za-z0-9.,-]+$' }
           }
         ],
         responses: {
@@ -48,45 +43,8 @@ export const OPENAPI_SPEC = {
                         requested: { type: 'integer' },
                         succeeded: { type: 'integer' },
                         failed: { type: 'integer' },
-                        rows: {
-                          type: 'array',
-                          items: {
-                            type: 'object',
-                            additionalProperties: true,
-                            properties: {
-                              ticker: { type: 'string' },
-                              last: { type: ['number', 'null'] },
-                              observations1m: { type: ['integer', 'null'] },
-                              return5d: { type: ['number', 'null'] },
-                              return1m: { type: ['number', 'null'] },
-                              monthHigh: { type: ['number', 'null'] },
-                              monthLow: { type: ['number', 'null'] },
-                              drawdownFromMonthHigh: { type: ['number', 'null'] },
-                              distanceFromMonthLow: { type: ['number', 'null'] },
-                              avgVolume1m: { type: ['number', 'null'] },
-                              valuationBasis: { type: ['string', 'null'] },
-                              pePercentile: { type: ['number', 'null'] },
-                              psPercentile: { type: ['number', 'null'] },
-                              targetBase: { type: ['number', 'null'] },
-                              targetUpside: { type: ['number', 'null'] },
-                              targetConfidence: { type: ['string', 'null'] },
-                              completeOneMonth: { type: 'boolean' },
-                              secAvailable: { type: 'boolean' },
-                              targetAvailable: { type: 'boolean' },
-                              ttmAvailable: { type: 'boolean' },
-                              recentFilingCount: { type: 'integer' },
-                              buyNowDataGate: { type: 'boolean' },
-                              cacheHit: { type: 'boolean' }
-                            }
-                          }
-                        },
-                        failures: {
-                          type: 'array',
-                          items: {
-                            type: 'object',
-                            additionalProperties: true
-                          }
-                        }
+                        rows: { type: 'array', items: { type: 'object', additionalProperties: true } },
+                        failures: { type: 'array', items: { type: 'object', additionalProperties: true } }
                       }
                     }
                   }
@@ -94,34 +52,87 @@ export const OPENAPI_SPEC = {
               }
             }
           },
-          '400': {
-            description: 'Invalid ticker list',
+          '400': { description: 'Invalid ticker list' },
+          '502': { description: 'Upstream research source failure' }
+        }
+      }
+    },
+    '/api/v1/entry': {
+      get: {
+        operationId: 'getEntrySetup',
+        summary: 'Get the deterministic entry setup for one stock or ETF ticker',
+        description: 'Returns the compact one-symbol packet used by Stock Entry Radar, including one-month setup, historical valuation context, modeled target fields, and data-quality gates.',
+        'x-openai-isConsequential': false,
+        parameters: [
+          {
+            name: 'ticker',
+            in: 'query',
+            required: true,
+            description: 'Ticker symbol, for example AAPL.',
+            schema: { type: 'string', minLength: 1, maxLength: 16, pattern: '^[A-Za-z0-9.-]+$' }
+          }
+        ],
+        responses: {
+          '200': {
+            description: 'Single-stock entry setup',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
+                  required: ['ok', 'data'],
                   properties: {
                     ok: { type: 'boolean' },
-                    error: { type: 'string' }
+                    data: { type: 'object', additionalProperties: true }
                   }
                 }
               }
             }
           },
-          '502': {
-            description: 'Upstream research source failure',
+          '400': { description: 'Invalid ticker' },
+          '502': { description: 'Upstream research source failure' }
+        }
+      }
+    },
+    '/api/v1/earnings': {
+      get: {
+        operationId: 'getEarningsCalendar',
+        summary: 'Get the Nasdaq public earnings calendar for a date',
+        description: 'Returns normalized public earnings-calendar rows for the requested YYYY-MM-DD date. This endpoint is read-only.',
+        'x-openai-isConsequential': false,
+        parameters: [
+          {
+            name: 'date',
+            in: 'query',
+            required: true,
+            description: 'Calendar date in YYYY-MM-DD format.',
+            schema: { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' }
+          }
+        ],
+        responses: {
+          '200': {
+            description: 'Earnings calendar rows',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
+                  required: ['ok', 'data'],
                   properties: {
                     ok: { type: 'boolean' },
-                    error: { type: 'string' }
+                    data: {
+                      type: 'object',
+                      required: ['date', 'rows'],
+                      properties: {
+                        date: { type: 'string' },
+                        rows: { type: 'array', items: { type: 'object', additionalProperties: true } }
+                      }
+                    }
                   }
                 }
               }
             }
-          }
+          },
+          '400': { description: 'Invalid date' },
+          '502': { description: 'Upstream earnings-calendar source failure' }
         }
       }
     }
