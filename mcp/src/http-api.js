@@ -1,7 +1,9 @@
 import { analyzeStock, analyzeWatchlist } from './analyze.js';
 import { buildEntrySetup, buildWatchlistPacket } from './radar.js';
+import { getNasdaqEarningsCalendar } from './sources/nasdaq.js';
 
 const SYMBOL_RE = /^[A-Z0-9.\-]{1,16}$/;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function json(data, status = 200, maxAge = 300) {
   return Response.json(data, {
@@ -28,6 +30,12 @@ function tickersParam(url) {
   return tickers;
 }
 
+function dateParam(url) {
+  const date = String(url.searchParams.get('date') || '').trim();
+  if (!DATE_RE.test(date)) throw new Error('invalid_date');
+  return date;
+}
+
 export async function handlePublicApi(request, env) {
   const url = new URL(request.url);
   if (request.method !== 'GET') return json({ ok: false, error: 'method_not_allowed' }, 405, 0);
@@ -51,10 +59,16 @@ export async function handlePublicApi(request, env) {
       return json({ ok: true, data: buildWatchlistPacket(batch) }, 200, 300);
     }
 
+    if (url.pathname === '/api/v1/earnings') {
+      const date = dateParam(url);
+      const rows = await getNasdaqEarningsCalendar(date, env);
+      return json({ ok: true, data: { date, rows } }, 200, 300);
+    }
+
     return null;
   } catch (error) {
     const message = String(error?.message || error);
-    const badRequest = message === 'invalid_ticker' || message === 'invalid_tickers';
+    const badRequest = message === 'invalid_ticker' || message === 'invalid_tickers' || message === 'invalid_date';
     return json({ ok: false, error: message }, badRequest ? 400 : 502, 0);
   }
 }
