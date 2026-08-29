@@ -128,6 +128,8 @@ jobs:
           curl --fail --silent --show-error --max-time 30 "$WORKER_URL/openapi.json" -o "$schema_file"
           jq -e '.openapi == "3.1.0"' "$schema_file" >/dev/null
           jq -e '.paths["/api/v1/watchlist"].get.operationId == "getWatchlistPacket"' "$schema_file" >/dev/null
+          jq -e '.paths["/api/v1/entry"].get.operationId == "getEntrySetup"' "$schema_file" >/dev/null
+          jq -e '.paths["/api/v1/earnings"].get.operationId == "getEarningsCalendar"' "$schema_file" >/dev/null
           jq -e '.servers[0].url == "https://stock-research-mcp.ck-market-tools.workers.dev"' "$schema_file" >/dev/null
           echo 'OpenAPI schema ok'
 
@@ -152,6 +154,16 @@ jobs:
           [ "$packet_code" = "200" ]
           jq -e '.ok == true and .data.requested == 2 and (.data.rows | length) >= 1' "$packet_file" >/dev/null
           echo "watchlist endpoint ok"
+
+          earnings_file="$(mktemp)"
+          earnings_date="$(date -u +%F)"
+          earnings_code="$(curl --silent --show-error --max-time 60 -o "$earnings_file" -w '%{http_code}' "$WORKER_URL/api/v1/earnings?date=$earnings_date")"
+          echo "earnings HTTP $earnings_code"
+          cat "$earnings_file"
+          echo
+          [ "$earnings_code" = "200" ]
+          jq -e --arg d "$earnings_date" '.ok == true and .data.date == $d and (.data.rows | type == "array")' "$earnings_file" >/dev/null
+          echo "earnings endpoint ok"
 
       - name: Smoke test MCP with official client
         working-directory: mcp
