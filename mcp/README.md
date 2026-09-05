@@ -99,9 +99,19 @@ Compatible with the existing Morning Brief environment names:
 
 Worker secrets are scoped to each Worker. Reusing the old AI account still requires adding the same secret to this new Worker.
 
+## Public unauthenticated MCP endpoint (`/mcp-public`)
+
+`/mcp` requires the `RUN_TOKEN` bearer header, which some MCP clients (e.g. Claude's built-in connector UI) can't currently supply. `/mcp-public` is a second, unauthenticated Streamable HTTP endpoint on the same Worker for exactly those clients. It reuses the same `analyzeStock` / `analyzeWatchlist` / `buildEntrySetup` / `buildWatchlistPacket` / `getNasdaqEarningsCalendar` implementations as `/mcp` and `/api/v1/*` — no business logic is duplicated — but registers only:
+
+- `get_entry_setup`
+- `get_watchlist_packet` (capped at 25 tickers, vs. 100 on `/mcp`)
+- `get_earnings_calendar`
+
+`analyze_stock`, `get_stock_snapshot`, and `analyze_watchlist` are never registered on this endpoint, so it cannot invoke the AI provider and cannot be used to run an unbounded/expensive batch. Ticker input is validated against the same symbol pattern as the REST API. `/mcp` is unchanged and still requires `RUN_TOKEN`.
+
 ## Security
 
-v0.2 uses a bearer `RUN_TOKEN` gate for public workers.dev deployment. The service is read-only and contains no brokerage credentials or trade-execution capability. OAuth can replace bearer auth later.
+v0.2 uses a bearer `RUN_TOKEN` gate for public workers.dev deployment. The service is read-only and contains no brokerage credentials or trade-execution capability. OAuth can replace bearer auth later. `/mcp-public` (see above) is intentionally unauthenticated but restricted to a small, deterministic, read-only tool subset; if it sees abuse, the next step would be Cloudflare rate limiting rules or a lightweight KV/Durable-Object token-bucket in front of it, before reaching for full OAuth.
 
 ## Tests
 
