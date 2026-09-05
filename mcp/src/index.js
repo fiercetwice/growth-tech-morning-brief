@@ -122,7 +122,7 @@ export default {
     // checked before the RUN_TOKEN_REQUIRED gate below so it never requires
     // auth; buildPublicServer() itself limits which tools are registered.
     if (url.pathname === '/mcp-public') {
-      return createMcpHandler(() => buildPublicServer(env))(request, env, ctx);
+      return createMcpHandler(() => buildPublicServer(env), { route: '/mcp-public' })(request, env, ctx);
     }
 
     if (env.RUN_TOKEN_REQUIRED === 'true') {

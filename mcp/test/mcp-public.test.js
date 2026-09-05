@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createMcpHandler } from 'agents/mcp/server';
 import { buildPublicServer } from '../src/index.js';
 
 // buildPublicServer() never needs live env for this test: we only inspect
@@ -48,4 +49,35 @@ test('public ticker schema rejects malformed symbols', () => {
   assert.equal(schema.safeParse('AAPL').success, true);
   assert.equal(schema.safeParse('DROP TABLE').success, false);
   assert.equal(schema.safeParse('').success, false);
+});
+
+// Regression test for a real deploy bug: createMcpHandler's underlying
+// createStatelessMcpHandler defaults its internal `route` option to "/mcp"
+// and 404s any request whose pathname doesn't match that route - regardless
+// of which path index.js itself dispatched on. Without passing
+// { route: '/mcp-public' } explicitly, every request to /mcp-public was
+// silently 404'd by the MCP library itself, even though our own routing in
+// index.js was correct. This test calls the handler exactly as index.js
+// does (including the route option) and checks it does NOT reflexively 404
+// its own path, and DOES 404 a path it wasn't configured for.
+test('mcp-public handler is reachable at its own path (route option wired correctly)', async () => {
+  const handler = createMcpHandler(() => buildPublicServer({}), { route: '/mcp-public' });
+  const req = new Request('https://example.com/mcp-public', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+  });
+  const res = await handler(req, {}, {});
+  assert.notEqual(res.status, 404, 'handler must not 404 requests to the path it was configured with');
+});
+
+test('mcp-public handler 404s a path it was not configured for', async () => {
+  const handler = createMcpHandler(() => buildPublicServer({}), { route: '/mcp-public' });
+  const req = new Request('https://example.com/some-other-path', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+  });
+  const res = await handler(req, {}, {});
+  assert.equal(res.status, 404);
 });
