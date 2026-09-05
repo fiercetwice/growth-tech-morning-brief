@@ -3,12 +3,16 @@
   "name": "stock-research-mcp",
   "main": "src/index.js",
   "compatibility_date": "2026-08-28",
+  "rules": [
+    { "type": "Text", "globs": ["**/*.txt"], "fallthrough": true }
+  ],
   "vars": {
     "AI_PROVIDER": "gemini",
     "GEMINI_MODEL": "gemini-3.5-flash",
     "DEEPSEEK_MODEL": "deepseek-v4-flash",
     "RUN_TOKEN_REQUIRED": "true",
-    "SEC_USER_AGENT": "stock-research-mcp contact@ck-market-tools.workers.dev"
+    "SEC_USER_AGENT": "stock-research-mcp contact@ck-market-tools.workers.dev",
+    "ANTHROPIC_EGRESS_CIDRS": "160.79.104.0/21"
   },
   "r2_buckets": [
     {

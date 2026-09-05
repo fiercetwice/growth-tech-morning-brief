@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createMcpHandler } from 'agents/mcp/server';
-import { buildPublicServer } from '../src/index.js';
+import worker, { buildPublicServer } from '../src/index.js';
 
 // buildPublicServer() never needs live env for this test: we only inspect
 // which tools got registered and how they validate input, we don't invoke
@@ -20,10 +20,14 @@ function fieldSchema(server, toolName, field) {
   return schema;
 }
 
-test('public MCP server exposes exactly the three restricted radar tools', () => {
+test('public MCP server exposes exactly the four allowed radar tools', () => {
   const server = buildPublicServer({});
   const names = registeredToolNames(server);
-  assert.deepEqual(names, ['get_earnings_calendar', 'get_entry_setup', 'get_watchlist_packet']);
+  // get_watchlist_tickers added deliberately: it only returns ticker symbols
+  // (no analysis, no account data), sourced from the same static config file
+  // the SEC sync workflow already reads, so it keeps the daily-monitor task
+  // in sync with radar-tickers.txt without hardcoding the list into a prompt.
+  assert.deepEqual(names, ['get_earnings_calendar', 'get_entry_setup', 'get_watchlist_packet', 'get_watchlist_tickers']);
 });
 
 test('public MCP server never registers AI-enabled or write-capable tools', () => {
@@ -80,4 +84,70 @@ test('mcp-public handler 404s a path it was not configured for', async () => {
   });
   const res = await handler(req, {}, {});
   assert.equal(res.status, 404);
+});
+
+// --- Full default-export fetch handler: /mcp-public gated by IP allowlist ---
+// These exercise export default { fetch } directly, the way the real Worker
+// dispatches, rather than calling createMcpHandler in isolation - this is
+// what actually caught the missing-route-option bug in the first place, so
+// the routing layer itself needs its own coverage independent of
+// buildPublicServer()'s tool list.
+
+function baseEnv(overrides = {}) {
+  return {
+    RUN_TOKEN_REQUIRED: 'true',
+    RUN_TOKEN: 'unit-test-run-token',
+    ...overrides,
+  };
+}
+
+test('fetch: /mcp-public reaches the public MCP server when no IP allowlist is configured', async () => {
+  const env = baseEnv({ ANTHROPIC_EGRESS_CIDRS: undefined });
+  const req = new Request('https://example.com/mcp-public', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+  });
+  const res = await worker.fetch(req, env, {});
+  assert.notEqual(res.status, 401);
+  assert.notEqual(res.status, 403);
+  assert.notEqual(res.status, 404);
+});
+
+test('fetch: /mcp-public is blocked by IP allowlist when caller IP is outside it', async () => {
+  const env = baseEnv({ ANTHROPIC_EGRESS_CIDRS: '160.79.104.0/21' });
+  const req = new Request('https://example.com/mcp-public', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cf-connecting-ip': '8.8.8.8' },
+    body: '{}',
+  });
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 403);
+});
+
+test('fetch: /mcp-public with an allowlisted IP reaches the public MCP server', async () => {
+  const env = baseEnv({ ANTHROPIC_EGRESS_CIDRS: '160.79.104.0/21' });
+  const req = new Request('https://example.com/mcp-public', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'cf-connecting-ip': '160.79.105.10' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+  });
+  const res = await worker.fetch(req, env, {});
+  assert.notEqual(res.status, 403);
+  assert.notEqual(res.status, 401);
+  assert.notEqual(res.status, 404);
+});
+
+test('fetch: /mcp (private, Bearer-protected) behavior is unchanged by the public-endpoint work', async () => {
+  const env = baseEnv();
+  const unauthed = await worker.fetch(new Request('https://example.com/mcp', { method: 'POST', body: '{}' }), env, {});
+  assert.equal(unauthed.status, 401);
+
+  const authed = await worker.fetch(new Request('https://example.com/mcp', {
+    method: 'POST',
+    headers: { authorization: 'Bearer unit-test-run-token', 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+  }), env, {});
+  assert.notEqual(authed.status, 401);
+  assert.notEqual(authed.status, 404);
 });

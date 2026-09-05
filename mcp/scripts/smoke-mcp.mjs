@@ -12,7 +12,7 @@ const client = new Client({ name: 'stock-research-mcp-smoke', version: '1.0.0' }
 await client.connect(transport);
 const result = await client.listTools();
 const names = (result.tools || []).map(x => x.name).sort();
-const expected = ['analyze_stock','analyze_watchlist','get_earnings_calendar','get_entry_setup','get_stock_snapshot','get_watchlist_packet'];
+const expected = ['analyze_stock', 'analyze_watchlist', 'get_earnings_calendar', 'get_entry_setup', 'get_stock_snapshot', 'get_watchlist_packet', 'get_watchlist_tickers'];
 for (const name of expected) if (!names.includes(name)) throw new Error(`missing_tool:${name}`);
 await client.close();
 
@@ -20,25 +20,25 @@ await client.close();
 const unauthedMcp = await fetch(`${url}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
 if (unauthedMcp.status !== 401) throw new Error(`expected_401_on_bare_mcp_got:${unauthedMcp.status}`);
 
-// 3. /mcp-public: no auth header, restricted tool set only.
-const publicTransport = new StreamableHTTPClientTransport(new URL(`${url}/mcp-public`));
-const publicClient = new Client({ name: 'stock-research-mcp-smoke-public', version: '1.0.0' });
-await publicClient.connect(publicTransport);
-const publicResult = await publicClient.listTools();
-const publicNames = (publicResult.tools || []).map(x => x.name).sort();
-const expectedPublic = ['get_earnings_calendar', 'get_entry_setup', 'get_watchlist_packet'];
-if (publicNames.join(',') !== expectedPublic.join(',')) {
-  throw new Error(`unexpected_public_tool_set:${publicNames.join(',')}`);
-}
-for (const forbidden of ['analyze_stock', 'analyze_watchlist', 'get_stock_snapshot']) {
-  if (publicNames.includes(forbidden)) throw new Error(`forbidden_tool_exposed_publicly:${forbidden}`);
-}
-await publicClient.close();
+// 3. /mcp-public is gated by an IP allowlist (env.ANTHROPIC_EGRESS_CIDRS),
+// not a Bearer token or path secret. GitHub Actions runners are not in
+// Anthropic's published egress range, so a correctly configured deployment
+// MUST reject this call with 403 - this proves the IP allowlist is actually
+// live in production, it is not a test failure. If Anthropic ever
+// allowlists GitHub Actions runner ranges this assumption breaks; revisit
+// only then. (See mcp/src/ip-allowlist.js unit tests for the actual
+// allow/deny logic coverage - this smoke test only proves it's wired up.)
+const publicRes = await fetch(`${url}/mcp-public`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+});
+if (publicRes.status !== 403) throw new Error(`expected_403_ip_block_on_public_mcp_from_ci_got:${publicRes.status}`);
 
 console.log(JSON.stringify({
   ok: true,
   era: 'modern',
   server: { name: 'stock-research-mcp', version: '0.4.3' },
   tools: names,
-  publicTools: publicNames,
+  publicEndpointIpAllowlistEnforced: true,
 }));

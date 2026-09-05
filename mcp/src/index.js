@@ -5,6 +5,8 @@ import { analyzeStock, analyzeWatchlist } from './analyze.js';
 import { buildEntrySetup, buildWatchlistPacket } from './radar.js';
 import { getNasdaqEarningsCalendar } from './sources/nasdaq.js';
 import { handlePublicApi } from './http-api.js';
+import { getConfiguredTickers } from './watchlist.js';
+import { isAllowedIp } from './ip-allowlist.js';
 import { OPENAPI_SPEC } from './openapi.js';
 
 const VERSION = '0.4.3';
@@ -55,6 +57,14 @@ function registerCoreTools(server, env) {
     description: 'Return normalized Nasdaq public earnings-calendar rows for a date.',
     inputSchema: { date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) },
   }, async ({ date }) => ({ content: [{ type: 'text', text: JSON.stringify({ date, rows: await getNasdaqEarningsCalendar(date, env) }) }] }));
+
+  server.registerTool('get_watchlist_tickers', {
+    description: 'Return the currently configured Stock Entry Radar watchlist tickers (single source of truth, same file the SEC sync pipeline reads).',
+    inputSchema: {},
+  }, async () => {
+    const tickers = getConfiguredTickers();
+    return { content: [{ type: 'text', text: JSON.stringify({ tickers, count: tickers.length }) }] };
+  });
 }
 
 function buildServer(env) {
@@ -95,6 +105,14 @@ export function buildPublicServer(env) {
     inputSchema: { date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) },
   }, async ({ date }) => ({ content: [{ type: 'text', text: JSON.stringify({ date, rows: await getNasdaqEarningsCalendar(date, env) }) }] }));
 
+  server.registerTool('get_watchlist_tickers', {
+    description: 'Return the currently configured Stock Entry Radar watchlist tickers (single source of truth, same file the SEC sync pipeline reads). Use this to avoid hardcoding the ticker list elsewhere - call get_watchlist_packet in batches of at most 25 tickers each against the result.',
+    inputSchema: {},
+  }, async () => {
+    const tickers = getConfiguredTickers();
+    return { content: [{ type: 'text', text: JSON.stringify({ tickers, count: tickers.length }) }] };
+  });
+
   return server;
 }
 
@@ -117,11 +135,27 @@ export default {
       if (response) return response;
     }
 
-    // Unauthenticated, restricted MCP surface for clients (e.g. the Claude
-    // connector UI) that can't attach a custom Bearer token. Deliberately
-    // checked before the RUN_TOKEN_REQUIRED gate below so it never requires
-    // auth; buildPublicServer() itself limits which tools are registered.
+    // Unauthenticated (in the OAuth/Bearer sense) MCP surface for clients
+    // that can't send a custom Bearer token (Claude's connector UI). Gated
+    // solely by IP allowlist rather than a path secret: a path secret is a
+    // per-endpoint credential, but the actual security boundary Claude's
+    // hosted infrastructure gives us is "traffic genuinely came from
+    // Anthropic's connector infrastructure" (CF-Connecting-IP against
+    // ANTHROPIC_EGRESS_CIDRS) - a secret path adds an extra per-caller
+    // credential on top of that, which this deployment has decided isn't
+    // needed. Deliberately checked before the RUN_TOKEN_REQUIRED gate below
+    // so it never requires a Bearer header either.
     if (url.pathname === '/mcp-public') {
+      // workers.dev can't use Cloudflare's zone-level WAF Custom Rules (that
+      // only applies to zones in this account, and workers.dev is
+      // Cloudflare's own zone), so the IP check happens here instead,
+      // against the CF-Connecting-IP header Cloudflare's edge sets (not
+      // client-controlled). Skipped entirely (allow-all) when
+      // ANTHROPIC_EGRESS_CIDRS is unset - see isAllowedIp().
+      const clientIp = request.headers.get('cf-connecting-ip');
+      if (!isAllowedIp(clientIp, env.ANTHROPIC_EGRESS_CIDRS)) {
+        return new Response('Forbidden', { status: 403 });
+      }
       return createMcpHandler(() => buildPublicServer(env), { route: '/mcp-public' })(request, env, ctx);
     }
 

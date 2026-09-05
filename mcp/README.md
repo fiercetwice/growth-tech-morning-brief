@@ -99,19 +99,26 @@ Compatible with the existing Morning Brief environment names:
 
 Worker secrets are scoped to each Worker. Reusing the old AI account still requires adding the same secret to this new Worker.
 
-## Public unauthenticated MCP endpoint (`/mcp-public`)
+## IP-allowlisted public MCP endpoint (`/mcp-public`)
 
-`/mcp` requires the `RUN_TOKEN` bearer header, which some MCP clients (e.g. Claude's built-in connector UI) can't currently supply. `/mcp-public` is a second, unauthenticated Streamable HTTP endpoint on the same Worker for exactly those clients. It reuses the same `analyzeStock` / `analyzeWatchlist` / `buildEntrySetup` / `buildWatchlistPacket` / `getNasdaqEarningsCalendar` implementations as `/mcp` and `/api/v1/*` — no business logic is duplicated — but registers only:
+`/mcp` requires the `RUN_TOKEN` bearer header. Claude's hosted connector UI (individual Pro/Max accounts) has no field for a static Bearer token today - only OAuth, and Claude's OAuth-connector flow has open, actively-reported reliability issues (token issued successfully but never attached to subsequent MCP requests). Rather than build and maintain a full OAuth authorization server for a single-user project, `/mcp-public` stays `none`-auth from MCP's perspective (fully supported, no OAuth-connector bugs) but is gated by an IP allowlist: it only accepts requests whose `CF-Connecting-IP` (set by Cloudflare's edge, not client-controlled) falls inside `env.ANTHROPIC_EGRESS_CIDRS` (currently `160.79.104.0/21`, Anthropic's published outbound range for Claude's hosted connector traffic across Claude.ai, Desktop, mobile, and Cowork - see `https://platform.claude.com/docs/en/api/ip-addresses`, and re-verify occasionally since Anthropic may change it). Requests from outside that range get a `403`.
+
+Because this Worker runs on a `*.workers.dev` subdomain rather than a custom domain in this Cloudflare account, zone-level WAF Custom Rules do not apply here (`workers.dev` is Cloudflare's own zone, not one in this account) - so the check happens in the Worker's own code instead (`src/ip-allowlist.js`). The allowlist is skipped entirely (allow-all) when `ANTHROPIC_EGRESS_CIDRS` is unset or blank, so a missing config fails open rather than locking the endpoint out - deliberate, since this is the *only* gate on `/mcp-public` (no path secret, no Bearer token). Note this allows any caller whose traffic happens to originate from Anthropic's shared connector IP range, not specifically this project's owner - it is not equivalent to a per-user credential, and was chosen anyway given the tool set behind it is limited to deterministic ticker-symbol reads with no AI, no account data, and no write behavior.
+
+It reuses the same `analyzeStock` / `analyzeWatchlist` / `buildEntrySetup` / `buildWatchlistPacket` / `getNasdaqEarningsCalendar` / `getConfiguredTickers` implementations as `/mcp` and `/api/v1/*` — no business logic is duplicated — but registers only:
 
 - `get_entry_setup`
 - `get_watchlist_packet` (capped at 25 tickers, vs. 100 on `/mcp`)
 - `get_earnings_calendar`
+- `get_watchlist_tickers` - returns the current `radar-tickers.txt` list (ticker symbols only, no analysis) so callers don't have to hardcode the watchlist; bundled into the Worker via the `Text` module rule in `wrangler.jsonc`
 
 `analyze_stock`, `get_stock_snapshot`, and `analyze_watchlist` are never registered on this endpoint, so it cannot invoke the AI provider and cannot be used to run an unbounded/expensive batch. Ticker input is validated against the same symbol pattern as the REST API. `/mcp` is unchanged and still requires `RUN_TOKEN`.
 
+Because GitHub Actions runners are not in Anthropic's published range, the CI smoke test intentionally asserts a `403` when it calls `/mcp-public` - that is proof the allowlist is live in production, not a test failure.
+
 ## Security
 
-v0.2 uses a bearer `RUN_TOKEN` gate for public workers.dev deployment. The service is read-only and contains no brokerage credentials or trade-execution capability. OAuth can replace bearer auth later. `/mcp-public` (see above) is intentionally unauthenticated but restricted to a small, deterministic, read-only tool subset; if it sees abuse, the next step would be Cloudflare rate limiting rules or a lightweight KV/Durable-Object token-bucket in front of it, before reaching for full OAuth.
+v0.2 uses a bearer `RUN_TOKEN` gate for public workers.dev deployment. The service is read-only and contains no brokerage credentials or trade-execution capability. `/mcp-public` (see above) uses an IP allowlist rather than full OAuth - OAuth was considered and rejected for this single-user project both due to the implementation/maintenance burden of running an authorization server and due to Claude's own documented OAuth-connector reliability bugs. If the IP-allowlist approach ever proves insufficient (e.g. Anthropic's range gets reused in a way that matters, or the tool set behind it grows more sensitive), a path secret or rate limiting would be reasonable next layers before reconsidering full OAuth.
 
 ## Tests
 
