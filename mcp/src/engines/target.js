@@ -1,3 +1,13 @@
+// Independent of the MAX_SANE_MULTIPLE guard in valuation.js (which cleans
+// the historical percentile distribution), this catches the other half of
+// the same failure mode: the CURRENT period's per-share figure being the
+// near-zero one. selected.base = currentPerShare * historicalP50 - if
+// currentPerShare is degenerate, even a perfectly clean historical
+// percentile still produces a nonsense target. Real fundamentals-reversion
+// targets essentially never imply a move this large; when the math says
+// otherwise, it means the inputs broke, not that the signal is real.
+const MAX_PLAUSIBLE_RETURN_MAGNITUDE = 5; // 500%
+
 export function buildTargetModel({ lastPrice, valuation, fundamentals }) {
   const candidates = [];
 
@@ -21,6 +31,11 @@ export function buildTargetModel({ lastPrice, valuation, fundamentals }) {
   const baseUpside = selected.base / lastPrice - 1;
   const bearReturn = selected.bear / lastPrice - 1;
   const bullUpside = selected.bull / lastPrice - 1;
+
+  if ([baseUpside, bearReturn, bullUpside].some(x => Math.abs(x) > MAX_PLAUSIBLE_RETURN_MAGNITUDE)) {
+    return { available: false, reason: 'implausible_multiple_result', method: selected.method };
+  }
+
   const preferredEntry = selected.base / 1.20;
   const downside = Math.max(0, lastPrice - selected.bear);
   const upside = Math.max(0, selected.base - lastPrice);

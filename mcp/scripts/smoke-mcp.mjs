@@ -38,7 +38,7 @@ if (publicRes.status !== 403) throw new Error(`expected_403_ip_block_on_public_m
 console.log(JSON.stringify({
   ok: true,
   era: 'modern',
-  server: { name: 'stock-research-mcp', version: '0.4.3' },
+  server: { name: 'stock-research-mcp', version: '0.4.4' },
   tools: names,
   publicEndpointIpAllowlistEnforced: true,
 }));

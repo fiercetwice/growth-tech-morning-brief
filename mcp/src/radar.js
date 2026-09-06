@@ -62,7 +62,7 @@ export function buildWatchlistPacket(batch) {
     });
   }
   return {
-    version: '0.4.1',
+    version: '0.4.4',
     asOf: batch?.asOf || new Date().toISOString(),
     requested: batch?.requested || rows.length + failures.length,
     succeeded: rows.length,

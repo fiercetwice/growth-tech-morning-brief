@@ -89,23 +89,47 @@ export function extractCoreFundamentals(companyFacts, splits = []) {
   };
 }
 
+// Some issuers (e.g. multi-class share structures like Visa's Class A/B/C
+// common stock) don't tag a single undimensioned EarningsPerShareDiluted
+// fact at all - GAAP requires EPS presented per class, and the SEC
+// companyfacts API only surfaces undimensioned facts, so the concept can be
+// entirely absent even though the company is a completely ordinary,
+// standard 10-K/10-Q filer. Rather than lose fundamentals coverage for
+// every such issuer, fall back to a blended EPS computed directly from net
+// income and diluted weighted-average shares - both of which those
+// companies do still report on an undimensioned, company-wide basis, and
+// which is arguably the more correct denominator for a market-price-based
+// P/E anyway (the traded price reflects the whole company, not one class).
+function deriveEpsFromNetIncome(netIncomeVal, dilutedSharesVal) {
+  if (!Number.isFinite(netIncomeVal) || !Number.isFinite(dilutedSharesVal) || dilutedSharesVal <= 0) return null;
+  return netIncomeVal / dilutedSharesVal;
+}
+
 export function extractAnnualVintages(usgaap, splits = []) {
   const revFact = usgaap.Revenues || usgaap.RevenueFromContractWithCustomerExcludingAssessedTax;
   const epsFact = usgaap.EarningsPerShareDiluted;
   const sharesFact = usgaap.WeightedAverageNumberOfDilutedSharesOutstanding;
+  const netIncomeFact = usgaap.NetIncomeLoss || usgaap.ProfitLoss;
   const revenues = annualRows(revFact);
   const eps = annualRows(epsFact);
   const shares = annualRows(sharesFact);
-  const years = new Set([...revenues, ...eps, ...shares].map(r => r.fy).filter(Number.isFinite));
+  const netIncome = annualRows(netIncomeFact);
+  const years = new Set([...revenues, ...eps, ...shares, ...netIncome].map(r => r.fy).filter(Number.isFinite));
   const out = [];
   for (const fy of [...years].sort((a,b) => a-b)) {
-    const r = latestForFy(revenues, fy), e = latestForFy(eps, fy), s = latestForFy(shares, fy);
-    const filed = [r?.filed, e?.filed, s?.filed].filter(Boolean).sort().at(-1);
+    const r = latestForFy(revenues, fy), e = latestForFy(eps, fy), s = latestForFy(shares, fy), ni = latestForFy(netIncome, fy);
+    let epsPerShare = e?.val ?? null;
+    let epsDerived = false;
+    if (!Number.isFinite(epsPerShare) && s) {
+      const derived = deriveEpsFromNetIncome(ni?.val, s.val);
+      if (Number.isFinite(derived)) { epsPerShare = derived; epsDerived = true; }
+    }
+    const filed = [r?.filed, e?.filed, s?.filed, epsDerived ? ni?.filed : null].filter(Boolean).sort().at(-1);
     if (!filed) continue;
     const splitFactor = futureSplitFactor(Date.parse(filed), splits);
-    const revenue = r?.val ?? null, epsPerShare = e?.val ?? null, dilutedShares = s?.val ?? null;
+    const revenue = r?.val ?? null, dilutedShares = s?.val ?? null;
     const revenuePerShare = Number.isFinite(revenue) && Number.isFinite(dilutedShares) && dilutedShares > 0 ? revenue / dilutedShares : null;
-    out.push({ fy, filed, end: r?.end || e?.end || s?.end || null, revenue, dilutedShares, epsPerShare, revenuePerShare,
+    out.push({ fy, filed, end: r?.end || e?.end || s?.end || null, revenue, dilutedShares, epsPerShare, epsDerived, revenuePerShare,
       splitFactorToPresent: splitFactor,
       epsPerShareAdjusted: Number.isFinite(epsPerShare) ? epsPerShare / splitFactor : null,
       revenuePerShareAdjusted: Number.isFinite(revenuePerShare) ? revenuePerShare / splitFactor : null,
@@ -118,10 +142,12 @@ export function extractQuarterlyVintages(usgaap, splits = []) {
   const revenueFact = usgaap.Revenues || usgaap.RevenueFromContractWithCustomerExcludingAssessedTax;
   const epsFact = usgaap.EarningsPerShareDiluted;
   const sharesFact = usgaap.WeightedAverageNumberOfDilutedSharesOutstanding;
+  const netIncomeFact = usgaap.NetIncomeLoss || usgaap.ProfitLoss;
   const revenues = metricQuarterRows(revenueFact);
   const eps = metricQuarterRows(epsFact);
   const shares = metricQuarterRows(sharesFact, { deriveQ4: false });
-  const keys = new Set([...revenues, ...eps, ...shares].map(r => `${r.fy}|${r.fp}|${r.end || ''}`));
+  const netIncome = metricQuarterRows(netIncomeFact);
+  const keys = new Set([...revenues, ...eps, ...shares, ...netIncome].map(r => `${r.fy}|${r.fp}|${r.end || ''}`));
   const out = [];
   for (const key of keys) {
     const [fyText, fp, end] = key.split('|');
@@ -129,12 +155,19 @@ export function extractQuarterlyVintages(usgaap, splits = []) {
     const r = latestForQuarter(revenues, fy, fp, end);
     const e = latestForQuarter(eps, fy, fp, end);
     const s = latestForQuarter(shares, fy, fp, end) || nearestShares(shares, fy, end);
-    const filed = [r?.filed, e?.filed, s?.filed].filter(Boolean).sort().at(-1);
+    const ni = latestForQuarter(netIncome, fy, fp, end);
+    let epsPerShare = e?.val ?? null;
+    let epsDerived = false;
+    if (!Number.isFinite(epsPerShare) && s) {
+      const derived = deriveEpsFromNetIncome(ni?.val, s.val);
+      if (Number.isFinite(derived)) { epsPerShare = derived; epsDerived = true; }
+    }
+    const filed = [r?.filed, e?.filed, s?.filed, epsDerived ? ni?.filed : null].filter(Boolean).sort().at(-1);
     if (!filed) continue;
     const splitFactor = futureSplitFactor(Date.parse(filed), splits);
-    const revenue = r?.val ?? null, epsPerShare = e?.val ?? null, dilutedShares = s?.val ?? null;
+    const revenue = r?.val ?? null, dilutedShares = s?.val ?? null;
     out.push({
-      fy, fp, end: end || r?.end || e?.end || s?.end || null, filed, revenue, dilutedShares, epsPerShare,
+      fy, fp, end: end || r?.end || e?.end || s?.end || null, filed, revenue, dilutedShares, epsPerShare, epsDerived,
       splitFactorToPresent: splitFactor,
       dilutedSharesAdjusted: Number.isFinite(dilutedShares) ? dilutedShares * splitFactor : null,
       epsPerShareAdjusted: Number.isFinite(epsPerShare) ? epsPerShare / splitFactor : null,

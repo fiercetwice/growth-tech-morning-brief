@@ -9,7 +9,7 @@ import { getConfiguredTickers } from './watchlist.js';
 import { isAllowedIp } from './ip-allowlist.js';
 import { OPENAPI_SPEC } from './openapi.js';
 
-const VERSION = '0.4.3';
+const VERSION = '0.4.4';
 
 // Symbols allowed through the unauthenticated public MCP endpoint. Same shape
 // as SYMBOL_RE in http-api.js, duplicated here (not imported) since it is not

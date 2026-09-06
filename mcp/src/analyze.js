@@ -6,7 +6,14 @@ import { callAiProvider } from './providers/ai.js';
 
 const ANALYSIS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const DEGRADED_SEC_CACHE_TTL_MS = 10 * 60 * 1000;
-const ANALYSIS_CACHE_VERSION = 'v0.4.1';
+// Bumped from v0.4.1: the valuation/target engines changed (MAX_SANE_MULTIPLE
+// filtering in valuation.js, the implausible-result guard in target.js, and
+// the net-income-derived EPS fallback in sec.js). Any cache entry written
+// under the old version reflects the pre-fix, sometimes-wrong output (e.g.
+// the real MARA/SMCI 5,849%/2,009% "upside" bug) - bumping the version key
+// forces every symbol to recompute fresh rather than serving stale bad
+// numbers for up to the remaining TTL after this deploy.
+const ANALYSIS_CACHE_VERSION = 'v0.4.4';
 const SEC_MIRROR_MANIFEST_KEY = 'sec/companyfacts-manifest.json';
 
 async function readCachedAnalysis(symbol, env, includeAi) {
@@ -142,7 +149,7 @@ export async function analyzeStock(ticker, env, options = {}) {
   }
 
   const result = {
-    version: '0.4.1',
+    version: '0.4.4',
     asOf: new Date().toISOString(),
     ...deterministic,
     research,
@@ -173,7 +180,7 @@ export async function analyzeWatchlist(tickers, env, options = {}) {
 
   await Promise.all(Array.from({ length: Math.min(concurrency, symbols.length) }, () => worker()));
   return {
-    version: '0.4.1',
+    version: '0.4.4',
     asOf: new Date().toISOString(),
     requested: symbols.length,
     succeeded: results.filter(x => x?.ok).length,
