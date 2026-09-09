@@ -6,7 +6,6 @@ import { buildEntrySetup, buildWatchlistPacket } from './radar.js';
 import { getNasdaqEarningsCalendar } from './sources/nasdaq.js';
 import { handlePublicApi } from './http-api.js';
 import { getConfiguredTickers } from './watchlist.js';
-import { isAllowedIp } from './ip-allowlist.js';
 import { OPENAPI_SPEC } from './openapi.js';
 
 const VERSION = '0.4.4';
@@ -19,7 +18,7 @@ const PUBLIC_TICKER_SCHEMA = z.string().min(1).max(16).regex(PUBLIC_SYMBOL_RE, '
 // Lower than the internal /mcp cap (100) and the REST cap (75): this endpoint
 // has no auth and no rate limiting yet, so batch size is the main throttle.
 const PUBLIC_MAX_TICKERS = 25;
-const PUBLIC_CONCURRENCY = 3;
+const PUBLIC_CONCURRENCY = 2; // lowered from 3: see analyze.js's analyzeWatchlist comment - reduces simultaneous outbound connections/request-rate pressure that plausibly caused the real 2026-09-08 'Too many subrequests' batch failures
 
 function registerCoreTools(server, env) {
   server.registerTool('analyze_stock', {
@@ -43,13 +42,13 @@ function registerCoreTools(server, env) {
   server.registerTool('analyze_watchlist', {
     description: 'Deep-analyze every supplied unique ticker; failures are isolated per symbol and deterministic results use R2 caching.',
     inputSchema: { tickers: z.array(z.string().min(1)).min(1).max(100), include_ai: z.boolean().optional(), concurrency: z.number().int().min(1).max(5).optional() },
-  }, async ({ tickers, include_ai, concurrency }) => ({ content: [{ type: 'text', text: JSON.stringify(await analyzeWatchlist(tickers, env, { includeAi: include_ai !== false, concurrency: concurrency || 3 })) }] }));
+  }, async ({ tickers, include_ai, concurrency }) => ({ content: [{ type: 'text', text: JSON.stringify(await analyzeWatchlist(tickers, env, { includeAi: include_ai !== false, concurrency: concurrency || 2 })) }] }));
 
   server.registerTool('get_watchlist_packet', {
     description: 'Return a compact full-watchlist packet for Stock Entry Radar, including entry setup, valuation context, latest SEC filing hint, cache state, and per-symbol failures.',
     inputSchema: { tickers: z.array(z.string().min(1)).min(1).max(100), concurrency: z.number().int().min(1).max(5).optional() },
   }, async ({ tickers, concurrency }) => {
-    const batch = await analyzeWatchlist(tickers, env, { includeAi: false, concurrency: concurrency || 3 });
+    const batch = await analyzeWatchlist(tickers, env, { includeAi: false, concurrency: concurrency || 2 });
     return { content: [{ type: 'text', text: JSON.stringify(buildWatchlistPacket(batch)) }] };
   });
 
@@ -136,26 +135,20 @@ export default {
     }
 
     // Unauthenticated (in the OAuth/Bearer sense) MCP surface for clients
-    // that can't send a custom Bearer token (Claude's connector UI). Gated
-    // solely by IP allowlist rather than a path secret: a path secret is a
-    // per-endpoint credential, but the actual security boundary Claude's
-    // hosted infrastructure gives us is "traffic genuinely came from
-    // Anthropic's connector infrastructure" (CF-Connecting-IP against
-    // ANTHROPIC_EGRESS_CIDRS) - a secret path adds an extra per-caller
-    // credential on top of that, which this deployment has decided isn't
-    // needed. Deliberately checked before the RUN_TOKEN_REQUIRED gate below
-    // so it never requires a Bearer header either.
+    // that can't send a custom Bearer token (Claude's connector UI). No IP
+    // allowlist as of 2026-09-08 (deliberately removed - see git history and
+    // README for the earlier tradeoff discussion if reinstating this is ever
+    // worth revisiting): the endpoint needs to be reachable by any MCP
+    // client, not only ones whose traffic happens to originate from a
+    // specific vendor's egress range. The only remaining protections are the
+    // ones on the tool surface itself: buildPublicServer() only registers
+    // deterministic, read-only, non-AI tools (no analyze_stock,
+    // analyze_watchlist, or get_stock_snapshot - see buildPublicServer's own
+    // comment), get_watchlist_packet caps batches at PUBLIC_MAX_TICKERS, and
+    // every ticker input is validated against PUBLIC_TICKER_SCHEMA. This
+    // route is checked before the RUN_TOKEN_REQUIRED gate below so it never
+    // requires a Bearer header either.
     if (url.pathname === '/mcp-public') {
-      // workers.dev can't use Cloudflare's zone-level WAF Custom Rules (that
-      // only applies to zones in this account, and workers.dev is
-      // Cloudflare's own zone), so the IP check happens here instead,
-      // against the CF-Connecting-IP header Cloudflare's edge sets (not
-      // client-controlled). Skipped entirely (allow-all) when
-      // ANTHROPIC_EGRESS_CIDRS is unset - see isAllowedIp().
-      const clientIp = request.headers.get('cf-connecting-ip');
-      if (!isAllowedIp(clientIp, env.ANTHROPIC_EGRESS_CIDRS)) {
-        return new Response('Forbidden', { status: 403 });
-      }
       return createMcpHandler(() => buildPublicServer(env), { route: '/mcp-public' })(request, env, ctx);
     }
 

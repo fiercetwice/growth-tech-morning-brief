@@ -55,7 +55,7 @@ export async function handlePublicApi(request, env) {
 
     if (url.pathname === '/api/v1/watchlist') {
       const tickers = tickersParam(url);
-      const batch = await analyzeWatchlist(tickers, env, { includeAi: false, concurrency: 3 });
+      const batch = await analyzeWatchlist(tickers, env, { includeAi: false, concurrency: 2 });
       return json({ ok: true, data: buildWatchlistPacket(batch) }, 200, 300);
     }
 

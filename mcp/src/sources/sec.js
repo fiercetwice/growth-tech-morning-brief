@@ -1,26 +1,48 @@
 const TICKER_MAP_URL = 'https://www.sec.gov/files/company_tickers.json';
 
-export async function resolveCik(ticker, env) {
+// sharedCache is an optional per-batch memoization object (created once by
+// analyzeWatchlist and passed to every ticker's analyzeStock call). Without
+// it, getCompanyFacts() and getRecentFilings() each independently call
+// resolveCik() for the SAME ticker, and every ticker in a batch redundantly
+// re-fetches the exact same ticker-map JSON - a real, measured source of
+// wasted subrequests in a 25-ticker batch (up to 50 duplicate R2/origin
+// requests for data that's identical across the whole batch). Memoizing the
+// in-flight Promise (not just the resolved value) also collapses concurrent
+// callers under Promise.all/worker-pool concurrency onto a single fetch,
+// rather than each kicking off its own duplicate request.
+export async function resolveCik(ticker, env, sharedCache) {
   const cacheKey = 'sec/ticker-map.json';
-  let data = null;
-  if (env.RESEARCH_BUCKET) {
-    const cached = await env.RESEARCH_BUCKET.get(cacheKey);
-    if (cached) data = await cached.json();
+  const fetchTickerMap = () => (async () => {
+    let data = null;
+    if (env.RESEARCH_BUCKET) {
+      const cached = await env.RESEARCH_BUCKET.get(cacheKey);
+      if (cached) data = await cached.json();
+    }
+    if (!data) {
+      const res = await fetch(TICKER_MAP_URL, { headers: secHeaders(env) });
+      if (!res.ok) throw new Error(`sec_ticker_map_http_${res.status}`);
+      data = await res.json();
+      if (env.RESEARCH_BUCKET) await env.RESEARCH_BUCKET.put(cacheKey, JSON.stringify(data));
+    }
+    return data;
+  })();
+
+  let dataPromise;
+  if (sharedCache) {
+    if (!sharedCache.tickerMapPromise) sharedCache.tickerMapPromise = fetchTickerMap();
+    dataPromise = sharedCache.tickerMapPromise;
+  } else {
+    dataPromise = fetchTickerMap();
   }
-  if (!data) {
-    const res = await fetch(TICKER_MAP_URL, { headers: secHeaders(env) });
-    if (!res.ok) throw new Error(`sec_ticker_map_http_${res.status}`);
-    data = await res.json();
-    if (env.RESEARCH_BUCKET) await env.RESEARCH_BUCKET.put(cacheKey, JSON.stringify(data));
-  }
+  const data = await dataPromise;
   const upper = ticker.toUpperCase();
   const row = Object.values(data).find(x => String(x.ticker || '').toUpperCase() === upper);
   if (!row) throw new Error(`sec_cik_not_found:${ticker}`);
   return String(row.cik_str).padStart(10, '0');
 }
 
-export async function getCompanyFacts(ticker, env) {
-  const cik = await resolveCik(ticker, env);
+export async function getCompanyFacts(ticker, env, sharedCache) {
+  const cik = await resolveCik(ticker, env, sharedCache);
   const key = `sec/companyfacts/${cik}.json`;
   if (env.RESEARCH_BUCKET) {
     const cached = await env.RESEARCH_BUCKET.get(key);
@@ -36,8 +58,8 @@ export async function getCompanyFacts(ticker, env) {
   return data;
 }
 
-export async function getRecentFilings(ticker, env, { forms = ['8-K', '10-Q', '10-K'], limit = 20 } = {}) {
-  const cik = await resolveCik(ticker, env);
+export async function getRecentFilings(ticker, env, { forms = ['8-K', '10-Q', '10-K'], limit = 20 } = {}, sharedCache) {
+  const cik = await resolveCik(ticker, env, sharedCache);
   const key = `sec/submissions/${cik}.json`;
   let data = null;
   if (env.RESEARCH_BUCKET) {

@@ -86,7 +86,7 @@ test('mcp-public handler 404s a path it was not configured for', async () => {
   assert.equal(res.status, 404);
 });
 
-// --- Full default-export fetch handler: /mcp-public gated by IP allowlist ---
+// --- Full default-export fetch handler: /mcp-public is open (no IP allowlist) ---
 // These exercise export default { fetch } directly, the way the real Worker
 // dispatches, rather than calling createMcpHandler in isolation - this is
 // what actually caught the missing-route-option bug in the first place, so
@@ -101,40 +101,16 @@ function baseEnv(overrides = {}) {
   };
 }
 
-test('fetch: /mcp-public reaches the public MCP server when no IP allowlist is configured', async () => {
-  const env = baseEnv({ ANTHROPIC_EGRESS_CIDRS: undefined });
+test('fetch: /mcp-public reaches the public MCP server for any caller (no IP allowlist)', async () => {
+  const env = baseEnv();
   const req = new Request('https://example.com/mcp-public', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'cf-connecting-ip': '8.8.8.8' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
   });
   const res = await worker.fetch(req, env, {});
   assert.notEqual(res.status, 401);
   assert.notEqual(res.status, 403);
-  assert.notEqual(res.status, 404);
-});
-
-test('fetch: /mcp-public is blocked by IP allowlist when caller IP is outside it', async () => {
-  const env = baseEnv({ ANTHROPIC_EGRESS_CIDRS: '160.79.104.0/21' });
-  const req = new Request('https://example.com/mcp-public', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'cf-connecting-ip': '8.8.8.8' },
-    body: '{}',
-  });
-  const res = await worker.fetch(req, env, {});
-  assert.equal(res.status, 403);
-});
-
-test('fetch: /mcp-public with an allowlisted IP reaches the public MCP server', async () => {
-  const env = baseEnv({ ANTHROPIC_EGRESS_CIDRS: '160.79.104.0/21' });
-  const req = new Request('https://example.com/mcp-public', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'cf-connecting-ip': '160.79.105.10' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
-  });
-  const res = await worker.fetch(req, env, {});
-  assert.notEqual(res.status, 403);
-  assert.notEqual(res.status, 401);
   assert.notEqual(res.status, 404);
 });
 
